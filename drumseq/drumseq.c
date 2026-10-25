@@ -6,8 +6,10 @@
  *   gcc -O2 -Wall -o drumseq drumseq.c $(pkg-config --cflags --libs sdl2 jack) -lm
  *
  * Run:
- *   ./drumseq [target_jack_midi_port] [midi_channel 1-16]
- *   e.g. ./drumseq drumsynth:midi_in
+ *   ./drumseq [target_jack_midi_port] [midi_channel 1-16] [clock_target_port]
+ *   e.g. ./drumseq drumsynth:midi_in 1 otherapp:midi_in
+ *
+ * Ports: drumseq:midi_out (notes), drumseq:clock_out (MIDI clock + start/stop)
  *
  * Controls:
  *   Left click / drag    toggle steps (normal velocity)
@@ -60,6 +62,7 @@ static int midi_channel = 0;             /* 0-based */
 /* ------------------------------------------------------------------ */
 static jack_client_t *client;
 static jack_port_t   *out_port;
+static jack_port_t   *clock_port;   /* MIDI clock / start / stop, 24 PPQN */
 
 static int process(jack_nframes_t nframes, void *arg)
 {
@@ -67,11 +70,14 @@ static int process(jack_nframes_t nframes, void *arg)
     static int    tick = -1;                   /* global 16th parity (swing) */
     static int    ch_step[NUM_CH];
     static double next_cd = 0.0;               /* frames until next step */
+    static double clk_cd  = 0.0;               /* frames until next MIDI clock */
     static long   off_cd[NUM_CH];              /* frames until note-off  */
     (void)arg;
 
     void *buf = jack_port_get_buffer(out_port, nframes);
     jack_midi_clear_buffer(buf);
+    void *cbuf = jack_port_get_buffer(clock_port, nframes);
+    jack_midi_clear_buffer(cbuf);
 
     const double sr = jack_get_sample_rate(client);
     const int play  = atomic_load(&playing);
@@ -81,7 +87,10 @@ static int process(jack_nframes_t nframes, void *arg)
             tick = -1;
             for (int c = 0; c < NUM_CH; c++) ch_step[c] = -1;
             next_cd = 0.0;
+            clk_cd = 0.0;
+            { unsigned char m = 0xFA; jack_midi_event_write(cbuf, 0, &m, 1); } /* Start */
         } else {
+            { unsigned char m = 0xFC; jack_midi_event_write(cbuf, 0, &m, 1); } /* Stop */
             for (int c = 0; c < NUM_CH; c++) {
                 if (off_cd[c] > 0) {
                     unsigned char m[3] = { 0x80 | midi_channel, CH_NOTE[c], 0 };
@@ -108,6 +117,16 @@ static int process(jack_nframes_t nframes, void *arg)
         }
 
         if (!play) continue;
+
+        /* MIDI clock: straight 24 PPQN (swing is not applied to the clock).
+         * Starts on the same frame as step 1, so even steps line up with
+         * every 12th clock pulse. */
+        if (clk_cd <= 0.0) {
+            unsigned char m = 0xF8;
+            jack_midi_event_write(cbuf, i, &m, 1);
+            clk_cd += sr * 60.0 / (double)atomic_load(&bpm) / 24.0;
+        }
+        clk_cd -= 1.0;
 
         if (next_cd <= 0.0) {
             tick = (tick + 1) & 1;
@@ -342,6 +361,8 @@ int main(int argc, char **argv)
     if (!client) { fprintf(stderr, "Could not connect to JACK\n"); return 1; }
     out_port = jack_port_register(client, "midi_out", JACK_DEFAULT_MIDI_TYPE,
                                   JackPortIsOutput, 0);
+    clock_port = jack_port_register(client, "clock_out", JACK_DEFAULT_MIDI_TYPE,
+                                    JackPortIsOutput, 0);
     jack_set_process_callback(client, process, NULL);
     if (jack_activate(client)) { fprintf(stderr, "Cannot activate JACK client\n"); return 1; }
 
@@ -350,6 +371,13 @@ int main(int argc, char **argv)
             fprintf(stderr, "Could not connect to %s\n", argv[1]);
         else
             printf("Connected to %s\n", argv[1]);
+    }
+
+    if (argc > 3) {
+        if (jack_connect(client, jack_port_name(clock_port), argv[3]))
+            fprintf(stderr, "Could not connect clock to %s\n", argv[3]);
+        else
+            printf("Clock connected to %s\n", argv[3]);
     }
 
     /* SDL */
