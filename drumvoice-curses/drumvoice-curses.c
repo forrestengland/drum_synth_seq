@@ -66,9 +66,9 @@ static volatile float P[NV][NP];
 static atomic_int trig[NV];      /* UI -> audio: velocity (1..127) */
 static atomic_int hit[NV];       /* audio -> UI: voice was triggered */
 static atomic_int quit_flag;
-static int midi_note[NV] = { 36, 38, 42, 46 };
-static int cc_map[NP]    = { -1, -1, -1, -1, -1 };   /* CC number per param, -1 = unmapped */
-static int sel_note[NV]  = { -1, -1, -1, -1 };       /* note that selects each voice       */
+static int midi_note[NV] = { 30, 31, 32, 33 };
+static int cc_map[NP]    = { 7,12,13,14,15 };   /* CC number per param, -1 = unmapped */
+static int sel_note[NV]  = { 34,35,36,37 };       /* note that selects each voice       */
 static atomic_int sel_voice;                          /* voice the CC knobs control         */
 
 /* lock-free single-producer/single-consumer queue: audio thread -> UI thread
