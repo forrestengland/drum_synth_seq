@@ -1,1 +1,1 @@
-./drumvoice -C 12,13,14,15,7 -S 34,35,36,37
+SDL_RENDER_DRIVER=software SDL_VIDEO_X11_NODIRECTCOLOR=1 ./drumvoice
