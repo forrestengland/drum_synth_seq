@@ -1,0 +1,62 @@
+[
+  {
+    "added_include_path": "/home/forrest/.arduino15/packages/esp32/hardware/esp32/3.3.12/cores/esp32"
+  },
+  {
+    "added_include_path": "/home/forrest/.arduino15/packages/esp32/hardware/esp32/3.3.12/variants/esp32"
+  },
+  {
+    "compile": {
+      "source_path": "/home/forrest/programming_2026/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged",
+      "depfile_path": "/home/forrest/programming_2026/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged.libsdetect.d"
+    },
+    "compile_task": {
+      "args": [
+        "/home/forrest/.arduino15/packages/esp32/tools/esp-x32/2601/bin/xtensa-esp32-elf-g++",
+        "-c",
+        "@/home/forrest/.arduino15/packages/esp32/tools/esp32-libs/3.3.12/flags/cpp_flags",
+        "-w",
+        "-Os",
+        "-Werror=return-type",
+        "-w",
+        "-x",
+        "c++",
+        "-E",
+        "-CC",
+        "-DF_CPU=240000000L",
+        "-DARDUINO=10607",
+        "-DARDUINO_ESP32_DEV",
+        "-DARDUINO_ARCH_ESP32",
+        "-DARDUINO_BOARD=\"ESP32_DEV\"",
+        "-DARDUINO_VARIANT=\"esp32\"",
+        "-DARDUINO_PARTITION_default",
+        "-DARDUINO_HOST_OS=\"linux\"",
+        "-DARDUINO_FQBN=\"esp32:esp32:esp32\"",
+        "-DESP32=ESP32",
+        "-DCORE_DEBUG_LEVEL=0",
+        "-DARDUINO_RUNNING_CORE=1",
+        "-DARDUINO_EVENT_RUNNING_CORE=1",
+        "-DARDUINO_USB_CDC_ON_BOOT=0",
+        "@/home/forrest/.arduino15/packages/esp32/tools/esp32-libs/3.3.12/flags/defines",
+        "-I/home/forrest/programming_2026/esp32_vadrum",
+        "-iprefix",
+        "/home/forrest/.arduino15/packages/esp32/tools/esp32-libs/3.3.12/include/",
+        "@/home/forrest/.arduino15/packages/esp32/tools/esp32-libs/3.3.12/flags/includes",
+        "-I/home/forrest/.arduino15/packages/esp32/tools/esp32-libs/3.3.12/qio_qspi/include",
+        "-I/home/forrest/.arduino15/packages/esp32/hardware/esp32/3.3.12/cores/esp32",
+        "-I/home/forrest/.arduino15/packages/esp32/hardware/esp32/3.3.12/variants/esp32",
+        "@/home/forrest/programming_2026/esp32_vadrum/build/build_opt.h",
+        "@/home/forrest/programming_2026/esp32_vadrum/build/file_opts",
+        "/home/forrest/programming_2026/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged",
+        "-o",
+        "/dev/null",
+        "-MMD",
+        "-MF",
+        "/home/forrest/programming_2026/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged.libsdetect.d"
+      ]
+    }
+  },
+  {
+    "missing_include_h": ""
+  }
+]

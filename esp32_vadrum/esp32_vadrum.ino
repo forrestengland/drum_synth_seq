@@ -1,0 +1,256 @@
+#include <Arduino.h>
+#include "driver/i2s_std.h"
+#include <math.h>
+
+// ---------- MIDI input ----------
+static constexpr int MIDI_RX_PIN = 16;
+HardwareSerial MIDI(2);
+
+// ---------- PCM5102A I2S pins ----------
+static constexpr int I2S_BCLK = 26;
+static constexpr int I2S_LRCK = 25;
+static constexpr int I2S_DOUT = 27;
+
+static constexpr int SAMPLE_RATE = 44100;
+static constexpr int BLOCK_FRAMES = 128;
+static constexpr float PI_F = 3.14159265358979323846f;
+
+// ---------- Audio ----------
+static i2s_chan_handle_t i2sTx = nullptr;
+
+static portMUX_TYPE noteMux = portMUX_INITIALIZER_UNLOCKED;
+static int currentNote = -1;
+static float currentVelocity = 0.0f;
+
+// MIDI parser state
+static uint8_t midiStatus = 0;
+static uint8_t midiData[2];
+static uint8_t midiDataCount = 0;
+static uint8_t midiExpected = 0;
+
+float midiNoteFrequency(int note)
+{
+    return 440.0f * powf(2.0f, (note - 69) / 12.0f);
+}
+
+void handleMidiMessage(uint8_t status, uint8_t note, uint8_t velocity)
+{
+    uint8_t command = status & 0xF0;
+
+    if (command == 0x90 && velocity > 0) {
+        // Note on
+        portENTER_CRITICAL(&noteMux);
+        currentNote = note;
+        currentVelocity = velocity / 127.0f;
+        portEXIT_CRITICAL(&noteMux);
+
+        Serial.printf("NOTE ON  note=%u velocity=%u\n", note, velocity);
+    }
+    else if (command == 0x80 ||
+             (command == 0x90 && velocity == 0)) {
+        // Note off; don't silence a different currently held note.
+        portENTER_CRITICAL(&noteMux);
+        if (currentNote == note) {
+            currentNote = -1;
+            currentVelocity = 0.0f;
+        }
+        portEXIT_CRITICAL(&noteMux);
+
+        Serial.printf("NOTE OFF note=%u\n", note);
+    }
+}
+
+void readMidi()
+{
+    while (MIDI.available()) {
+        uint8_t b = MIDI.read();
+
+        // Ignore MIDI real-time messages.
+        if (b >= 0xF8) {
+            continue;
+        }
+
+        if (b & 0x80) {
+            midiStatus = b;
+            midiDataCount = 0;
+
+            uint8_t command = midiStatus & 0xF0;
+
+            if (command == 0x80 || command == 0x90 ||
+                command == 0xA0 || command == 0xB0 ||
+                command == 0xE0) {
+                midiExpected = 2;
+            }
+            else if (command == 0xC0 || command == 0xD0) {
+                midiExpected = 1;
+            }
+            else {
+                midiExpected = 0;
+            }
+
+            continue;
+        }
+
+        if (midiExpected == 0) {
+            continue;
+        }
+
+        midiData[midiDataCount++] = b;
+
+        if (midiDataCount >= midiExpected) {
+            uint8_t command = midiStatus & 0xF0;
+
+            if (command == 0x80 || command == 0x90) {
+                handleMidiMessage(
+                    midiStatus, midiData[0], midiData[1]);
+            }
+
+            // Preserve running status for subsequent messages.
+            midiDataCount = 0;
+        }
+    }
+}
+
+void audioTask(void *parameter)
+{
+    int16_t samples[BLOCK_FRAMES * 2];
+
+    float phase = 0.0f;
+    float amplitude = 0.0f;
+    float frequency = 0.0f;
+
+    // Keep peak amplitude conservative for initial testing.
+    const float MAX_AMPLITUDE = 0.20f;
+
+    while (true) {
+        int note;
+        float velocity;
+
+        portENTER_CRITICAL(&noteMux);
+        note = currentNote;
+        velocity = currentVelocity;
+        portEXIT_CRITICAL(&noteMux);
+
+        float targetAmplitude =
+            (note >= 0) ? MAX_AMPLITUDE * velocity : 0.0f;
+
+        if (note >= 0) {
+            frequency = midiNoteFrequency(note);
+        }
+
+        // Smooth changes to avoid abrupt amplitude clicks.
+        const float ramp = 0.004f;
+
+        for (int i = 0; i < BLOCK_FRAMES; i++) {
+            amplitude += (targetAmplitude - amplitude) * ramp;
+
+            float sample = 0.0f;
+
+            if (frequency > 0.0f && amplitude > 0.00001f) {
+                sample = sinf(phase) * amplitude;
+
+                phase += 2.0f * PI_F * frequency / SAMPLE_RATE;
+
+                if (phase >= 2.0f * PI_F) {
+                    phase -= 2.0f * PI_F;
+                }
+            }
+
+            int16_t out = (int16_t)(sample * 32767.0f);
+
+            // Stereo: same sine wave on left and right.
+            samples[i * 2]     = out;
+            samples[i * 2 + 1] = out;
+        }
+
+        size_t bytesWritten = 0;
+        i2s_channel_write(
+            i2sTx,
+            samples,
+            sizeof(samples),
+            &bytesWritten,
+            portMAX_DELAY
+        );
+    }
+}
+
+void setup()
+{
+    Serial.begin(115200);
+    delay(500);
+
+    MIDI.begin(31250, SERIAL_8N1, MIDI_RX_PIN, -1);
+    Serial.println("DIN MIDI input started on GPIO16");
+
+    // Create I2S TX channel.		
+    i2s_chan_config_t chanConfig =
+        I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+
+		esp_err_t err = i2s_new_channel(
+																		&chanConfig,
+																		&i2sTx,   // TX channel handle
+																		nullptr   // No RX channel
+																		);
+
+    if (err != ESP_OK) {
+        Serial.printf("I2S channel creation failed: %d\n", err);
+        while (true) delay(1000);
+    }
+
+    i2s_std_config_t stdConfig = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+            I2S_DATA_BIT_WIDTH_16BIT,
+            I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = (gpio_num_t)I2S_BCLK,
+            .ws = (gpio_num_t)I2S_LRCK,
+            .dout = (gpio_num_t)I2S_DOUT,
+            .din = I2S_GPIO_UNUSED,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false
+            }
+        }
+    };
+
+    err = i2s_channel_init_std_mode(i2sTx, &stdConfig);
+
+    if (err != ESP_OK) {
+        Serial.printf("I2S initialization failed: %d\n", err);
+        while (true) delay(1000);
+    }
+
+    err = i2s_channel_enable(i2sTx);
+
+    if (err != ESP_OK) {
+        Serial.printf("I2S enable failed: %d\n", err);
+        while (true) delay(1000);
+    }
+
+    // Keep audio generation separate from MIDI processing.
+    BaseType_t taskResult = xTaskCreatePinnedToCore(
+        audioTask,
+        "AudioTask",
+        4096,
+        nullptr,
+        3,
+        nullptr,
+        0
+    );
+
+    if (taskResult != pdPASS) {
+        Serial.println("Failed to create audio task");
+        while (true) delay(1000);
+    }
+
+    Serial.println("PCM5102A ready. Play a MIDI key.");
+}
+
+void loop()
+{
+    readMidi();
+    delay(1);
+}

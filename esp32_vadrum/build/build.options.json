@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:esp32",
+  "hardwareFolders": "/home/forrest/.arduino15/packages/esp32/hardware/esp32/3.3.12,/home/forrest/.arduino15/packages/esp32/hardware/esp32/3.3.12",
+  "otherLibrariesFolders": "/home/forrest/Arduino/libraries",
+  "sketchLocation": "/home/forrest/programming_2026/esp32_vadrum"
+}
