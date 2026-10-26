@@ -1,18 +1,55 @@
 // Arduino Mega 2560 MIDI Out via Serial1 (TX1 = Pin 18)
+const int stepPinCount = 16;
+const int stepPins[stepPinCount] = {22,23,24,25,26,27,28,29,
+				    30,31,32,33,34,35,36,37};
+int stepPinStates[stepPinCount] = {0,0,0,0,0,0,0,0,
+				   0,0,0,0,0,0,0,0};
+const int ledPinCount = 16;
+const int ledPins[ledPinCount] = {38,39,40,41,42,43,44,45,
+				  46,47,48,49,51,50,52,53};
 
 void setup() {
   // Set the MIDI standard baud rate
   Serial1.begin(31250);
+  
+  Serial.begin(115200);
+  Serial.println("it works");
+
+  for (int sp = 0; sp < stepPinCount; sp++) {
+    pinMode(stepPins[sp], INPUT_PULLUP);
+  }
+
+  for (int lp = 0; lp < ledPinCount; lp++) {
+    pinMode(ledPins[lp], OUTPUT);
+    digitalWrite(ledPins[lp], LOW);
+  }
 }
 
 void loop() {
   // Play Note On (Middle C, Note number 60, Velocity 100)
-  noteOn(0x90, 60, 100);
-  delay(1000);
+  //  noteOn(0x90, 60, 100);
+  //  delay(1000);
 
   // Play Note Off (Middle C, Note number 60, Velocity 0)
-  noteOff(0x80, 60, 0);
-  delay(1000);
+  //  noteOff(0x80, 60, 0);
+  //  delay(1000);
+
+  for (int sp=0; sp<stepPinCount; sp++) {
+
+    int pinState = digitalRead(stepPins[sp]);
+        
+    if (pinState != stepPinStates[sp]) {
+      stepPinStates[sp] = pinState;
+      char str[255];
+      sprintf(str, "stepPin state: %d = %d\n", sp, pinState);
+      Serial.print(str);
+      if (sp < ledPinCount) {
+	digitalWrite(ledPins[sp], pinState);
+      }
+    }
+  }
+
+  delay(100);
 }
 
 // Send a MIDI Note On message
