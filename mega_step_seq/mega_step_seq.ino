@@ -6,10 +6,11 @@
 // Controls (step buttons 1-16 = index 0-15):
 //   none      : toggle step in viewed bank (current channel)
 //   Shift A   : 1-8 channel, 9-12 bank 1-4, 13-16 spare
-//   Shift B   : 1-8 pattern, 9-16 spare
+//   Shift B   : 1-8 pattern, 9-15 spare, 16 (hold 1 s) = save to EEPROM
 //   A + B     : set last step of current channel = bank*16 + button
 
 #include <Arduino.h>
+#include <EEPROM.h>
 
 // ---------- Pins ----------
 const uint8_t STEP_BTN[16] = {22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37};
@@ -32,7 +33,7 @@ uint8_t lastStep[8][8];      // [pattern][channel] -> 0..63 (loop length - 1)
 uint8_t curPat = 0, curCh = 0, viewBank = 0;
 
 // ---------- Transport ----------
-bool running = true;
+bool running = false;
 uint32_t stepCounter = 0;
 uint32_t gridTime = 0, fireTime = 0;             // micros
 uint32_t stepLenUs = 125000;
@@ -141,6 +142,74 @@ void runClock() {
   }
 }
 
+// ---------- Save / load (EEPROM) ----------
+// Layout: magic(4) | steps(512) | lastStep(64) | checksum(2) = 582 bytes
+const uint32_t SAVE_MAGIC = 0x53455132UL;       // change this to invalidate old saves
+const int EE_MAGIC = 0;
+const int EE_STEPS = EE_MAGIC + sizeof(SAVE_MAGIC);
+const int EE_LAST  = EE_STEPS + sizeof(steps);
+const int EE_SUM   = EE_LAST + sizeof(lastStep);
+
+uint32_t flashUntil = 0;                        // all LEDs on until this time (save confirmation)
+
+uint16_t dataChecksum() {
+  uint16_t sum = 0;
+  const uint8_t *p = (const uint8_t *)steps;
+  for (size_t i = 0; i < sizeof(steps); i++) sum = ((sum << 1) | (sum >> 15)) ^ p[i];
+  p = (const uint8_t *)lastStep;
+  for (size_t i = 0; i < sizeof(lastStep); i++) sum = ((sum << 1) | (sum >> 15)) ^ p[i];
+  return sum;
+}
+
+void initDefaults() {
+  memset(steps, 0, sizeof(steps));
+  memset(lastStep, 15, sizeof(lastStep));       // default 16-step loops
+}
+
+bool loadState() {
+  uint32_t magic;
+  uint16_t stored;
+  EEPROM.get(EE_MAGIC, magic);
+  if (magic != SAVE_MAGIC) return false;
+  EEPROM.get(EE_STEPS, steps);
+  EEPROM.get(EE_LAST, lastStep);
+  EEPROM.get(EE_SUM, stored);
+  if (stored != dataChecksum()) {               // corrupt or partial save
+    initDefaults();
+    return false;
+  }
+  return true;
+}
+
+void saveState() {
+  allNotesOff();                                // writes block for a moment
+  EEPROM.put(EE_STEPS, steps);                  // put() only writes bytes that changed
+  EEPROM.put(EE_LAST, lastStep);
+  EEPROM.put(EE_SUM, dataChecksum());
+  EEPROM.put(EE_MAGIC, SAVE_MAGIC);             // magic last, so a partial save is never valid
+  if (running) {                                // resync clock after the blocking write
+    gridTime = micros();
+    computeFireTime();
+  }
+  flashUntil = millis() + 400;
+}
+
+// Shift B + step 16 held for 1 second = save
+void checkSaveCombo() {
+  static uint32_t holdStart = 0;
+  static bool done = false;
+  if (shiftB.down && !shiftA.down && stepB[15].down) {
+    if (holdStart == 0) holdStart = millis();
+    else if (!done && millis() - holdStart >= 1000) {
+      saveState();
+      done = true;
+    }
+  } else {
+    holdStart = 0;
+    done = false;
+  }
+}
+
 // ---------- UI ----------
 void handleButtons() {
   pressed(shiftA);                              // keep shift state current
@@ -167,6 +236,10 @@ void handleButtons() {
 }
 
 void updateLeds() {
+  if ((int32_t)(millis() - flashUntil) < 0) {   // save confirmation: all on
+    for (uint8_t i = 0; i < 16; i++) digitalWrite(STEP_LED[i], HIGH);
+    return;
+  }
   bool a = shiftA.down, b = shiftB.down;
   uint8_t last = lastStep[curPat][curCh];
 
@@ -202,19 +275,21 @@ void setup() {
   initBtn(shiftB, SHIFT_B_PIN);
   initBtn(playB, PLAY_PIN);
 
-  for (uint8_t p = 0; p < 8; p++)
-    for (uint8_t c = 0; c < 8; c++)
-      lastStep[p][c] = 15;                      // default 16-step loops
+  initDefaults();
+  loadState();                                  // restore last save if present
 
   tempoF = tempoVal = analogRead(TEMPO_POT);
   swingF = swingVal = analogRead(SWING_POT);
   readPots();
+
+  startSeq();
 }
 
 void loop() {
   static uint32_t potT = 0;
   runClock();                                   // timing first
   handleButtons();
+  checkSaveCombo();
   if (millis() - potT >= 5) { potT = millis(); readPots(); }
   updateLeds();
 }
