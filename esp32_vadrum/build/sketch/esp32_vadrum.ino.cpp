@@ -1,4 +1,4 @@
-#line 1 "/home/forrest/programming_2026/esp32_vadrum/esp32_vadrum.ino"
+#line 1 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 #include <Arduino.h>
 #include "driver/i2s_std.h"
 #include <math.h>
@@ -29,19 +29,32 @@ static uint8_t midiData[2];
 static uint8_t midiDataCount = 0;
 static uint8_t midiExpected = 0;
 
-#line 31 "/home/forrest/programming_2026/esp32_vadrum/esp32_vadrum.ino"
+// Encoder 1
+#define ENC1_A  18
+#define ENC1_B  19
+#define ENC1_SW 13
+
+volatile int encoder1Position = 0;
+
+int lastEncoder1Position = 0;
+int lastEncoder1ButtonState = HIGH;
+
+// Quadrature decoder state
+int lastEncoder1A;
+
+#line 44 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 float midiNoteFrequency(int note);
-#line 36 "/home/forrest/programming_2026/esp32_vadrum/esp32_vadrum.ino"
+#line 49 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 void handleMidiMessage(uint8_t status, uint8_t note, uint8_t velocity);
-#line 63 "/home/forrest/programming_2026/esp32_vadrum/esp32_vadrum.ino"
+#line 76 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 void readMidi();
-#line 114 "/home/forrest/programming_2026/esp32_vadrum/esp32_vadrum.ino"
+#line 127 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 void audioTask(void *parameter);
-#line 177 "/home/forrest/programming_2026/esp32_vadrum/esp32_vadrum.ino"
+#line 190 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 void setup();
-#line 252 "/home/forrest/programming_2026/esp32_vadrum/esp32_vadrum.ino"
+#line 274 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 void loop();
-#line 31 "/home/forrest/programming_2026/esp32_vadrum/esp32_vadrum.ino"
+#line 44 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 float midiNoteFrequency(int note)
 {
     return 440.0f * powf(2.0f, (note - 69) / 12.0f);
@@ -261,11 +274,53 @@ void setup()
     }
 
     Serial.println("PCM5102A ready. Play a MIDI key.");
+
+		// Encoder 1 setup
+		pinMode(ENC1_A, INPUT_PULLUP);
+		pinMode(ENC1_B, INPUT_PULLUP);
+		pinMode(ENC1_SW, INPUT_PULLUP);
+
+		lastEncoder1A = digitalRead(ENC1_A);
+
+		Serial.println("Encoder 1 test ready");		
 }
 
 void loop()
 {
     readMidi();
-    delay(1);
+
+		// Read encoder rotation
+		int currentA = digitalRead(ENC1_A);
+
+		if (currentA != lastEncoder1A) {
+			if (currentA == LOW) {
+				if (digitalRead(ENC1_B) != currentA) {
+					encoder1Position++;
+				} else {
+					encoder1Position--;
+				}
+			}
+
+			lastEncoder1A = currentA;
+		}
+
+		// Print position only when it changes
+		if (encoder1Position != lastEncoder1Position) {
+			lastEncoder1Position = encoder1Position;
+
+			Serial.print("Encoder 1 position: ");
+			Serial.println(encoder1Position);
+		}
+
+		// Read push button (active LOW)
+		int buttonState = digitalRead(ENC1_SW);
+
+		if (buttonState == LOW && lastEncoder1ButtonState == HIGH) {
+			Serial.println("Encoder 1 button pressed");
+		}
+
+		lastEncoder1ButtonState = buttonState;
+
+ delay(1);
 }
 

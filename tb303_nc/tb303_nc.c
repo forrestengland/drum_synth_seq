@@ -217,10 +217,10 @@ static void on_jack_shutdown(void *arg) { (void)arg; running = 0; }
 /* ---------- pattern helpers ---------- */
 static void init_pattern(void)
 {
-    static const int n[STEPS] = { 0, 0, 12, 0, 3, 0, 15, 7, 0, 0, 12, 10, 0, 3, 7, 5 };
-    static const int g[STEPS] = { 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0 };
-    static const int a[STEPS] = { 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 1, 0 };
-    static const int s[STEPS] = { 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0 };
+    static const int n[STEPS] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    static const int g[STEPS] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    static const int a[STEPS] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    static const int s[STEPS] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     for (int i = 0; i < STEPS; i++)
         steps[i] = (Step){ n[i], g[i], a[i], s[i] };
 }
@@ -323,7 +323,7 @@ static void draw_params(int focus, int psel)
 
 int main(void)
 {
-    srand(1303);
+  srand((unsigned int)time(NULL));
     init_pattern();
 
     /* JACK */

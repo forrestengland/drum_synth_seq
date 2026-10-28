@@ -7,8 +7,8 @@
   },
   {
     "compile": {
-      "source_path": "/home/forrest/programming_2026/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged",
-      "depfile_path": "/home/forrest/programming_2026/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged.libsdetect.d"
+      "source_path": "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged",
+      "depfile_path": "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged.libsdetect.d"
     },
     "compile_task": {
       "args": [
@@ -38,21 +38,21 @@
         "-DARDUINO_EVENT_RUNNING_CORE=1",
         "-DARDUINO_USB_CDC_ON_BOOT=0",
         "@/home/forrest/.arduino15/packages/esp32/tools/esp32-libs/3.3.12/flags/defines",
-        "-I/home/forrest/programming_2026/esp32_vadrum",
+        "-I/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum",
         "-iprefix",
         "/home/forrest/.arduino15/packages/esp32/tools/esp32-libs/3.3.12/include/",
         "@/home/forrest/.arduino15/packages/esp32/tools/esp32-libs/3.3.12/flags/includes",
         "-I/home/forrest/.arduino15/packages/esp32/tools/esp32-libs/3.3.12/qio_qspi/include",
         "-I/home/forrest/.arduino15/packages/esp32/hardware/esp32/3.3.12/cores/esp32",
         "-I/home/forrest/.arduino15/packages/esp32/hardware/esp32/3.3.12/variants/esp32",
-        "@/home/forrest/programming_2026/esp32_vadrum/build/build_opt.h",
-        "@/home/forrest/programming_2026/esp32_vadrum/build/file_opts",
-        "/home/forrest/programming_2026/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged",
+        "@/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/build_opt.h",
+        "@/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/file_opts",
+        "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged",
         "-o",
         "/dev/null",
         "-MMD",
         "-MF",
-        "/home/forrest/programming_2026/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged.libsdetect.d"
+        "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged.libsdetect.d"
       ]
     }
   },
