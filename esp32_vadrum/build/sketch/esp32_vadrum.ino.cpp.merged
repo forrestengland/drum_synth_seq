@@ -23,6 +23,9 @@
 static constexpr int MIDI_RX_PIN = 16;
 HardwareSerial MIDI(2);
 
+//static constexpr int MIDI_TX_PIN = 2;
+//HardwareSerial MIDI_OUT(1);
+
 static constexpr int I2S_BCLK = 26;
 static constexpr int I2S_LRCK = 25;
 static constexpr int I2S_DOUT = 27;
@@ -304,9 +307,13 @@ static void handleMidiMessage(uint8_t status, uint8_t note, uint8_t velocity)
 
 static void readMidi()
 {
-    while (MIDI.available()) {
-        uint8_t b = MIDI.read();
-        if (b >= 0xF8) continue;            // ignore real-time
+	while (MIDI.available()) {
+    uint8_t b = MIDI.read();
+
+    // Forward every MIDI byte, including real-time messages
+		//    MIDI_OUT.write(b);
+
+    if (b >= 0xF8) continue;            // ignore real-time for synth parser			
 
         if (b & 0x80) {
             midiStatus = b;
@@ -409,6 +416,9 @@ void setup()
 
     MIDI.begin(31250, SERIAL_8N1, MIDI_RX_PIN, -1);
     Serial.println("DIN MIDI input started on GPIO16");
+
+		//		MIDI_OUT.begin(31250, SERIAL_8N1, -1, MIDI_TX_PIN);
+		//		Serial.println("MIDI Thru output started on GPIO2");		
 
     // I2S TX
     i2s_chan_config_t chanConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);

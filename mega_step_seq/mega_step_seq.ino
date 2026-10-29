@@ -1,7 +1,8 @@
 // Arduino Mega 2560 MIDI step sequencer
 // 16 step buttons + 16 LEDs (4 banks x 16 = 64 steps), 2 shift buttons, play/stop, tempo + swing pots
 // 8 "channels" = 8 notes on MIDI channel 0. Per-channel loop length (polyrhythm).
-// MIDI out: Serial1 TX1 (pin 18) @31250 -> DIN-5 (5V-220R-pin4, TX1-220R-pin5, pin2 GND)
+// MIDI out (notes): Serial1 TX1 (pin 18) @31250 -> DIN-5 (5V-220R-pin4, TX1-220R-pin5, pin2 GND)
+// MIDI clock out:   Serial2 TX2 (pin 16) @31250 -> second DIN-5, same circuit (24 PPQN + start/stop)
 //
 // Controls (step buttons 1-16 = index 0-15):
 //   none      : toggle step in viewed bank (current channel)
@@ -25,6 +26,7 @@ const uint8_t SWING_POT = A1;
 const uint8_t MIDI_CH = 0;                       // channel 1 on the wire
 const uint8_t NOTES[8] = {30, 31, 32, 33, 34, 35, 36, 37};
 const uint8_t VELOCITY = 100;
+const uint32_t CLOCK_LEAD_US = 35000;             // clock leads the notes by this much (compensates slaved gear's latency; tune by ear)
 
 // ---------- Data ----------
 uint16_t steps[8][8][4];     // [pattern][channel][bank] -> 16 step bits
@@ -35,7 +37,9 @@ uint8_t curPat = 0, curCh = 0, viewBank = 0;
 // ---------- Transport ----------
 bool running = false;
 uint32_t stepCounter = 0;
-uint32_t gridTime = 0, fireTime = 0;             // micros
+uint32_t tickTime = 0, fireTime = 0;             // micros: next MIDI clock tick, next (swung) step
+uint8_t tickIdx = 0;                             // 0..5: clock tick within a 16th step (24 PPQN)
+bool stepPending = false;                        // step scheduled, waiting for its swung fire time
 uint32_t stepLenUs = 125000;
 uint8_t swingPct = 0;
 
@@ -78,26 +82,50 @@ void allNotesOff() {
 }
 
 // ---------- Pots ----------
-uint16_t tempoF = 0, swingF = 0, tempoVal = 512, swingVal = 0;
+// One ADC read per call (non-blocking), alternating pots. The first read after switching ADC
+// channel is discarded (mux settling), readings are smoothed (EMA), and a deadband stops the
+// final value flipping on noise. Tempo is whole BPM, swing is whole percent.
+int32_t tempoAcc = 0, swingAcc = 0;             // smoothed reading x16
+uint16_t bpm = 120;
+bool potTurn = false;
 
-void readPots() {
-  tempoF += ((int16_t)analogRead(TEMPO_POT) - (int16_t)tempoF) / 4;
-  swingF += ((int16_t)analogRead(SWING_POT) - (int16_t)swingF) / 4;
-  if (abs((int16_t)tempoF - (int16_t)tempoVal) > 3) tempoVal = tempoF;   // hysteresis
-  if (abs((int16_t)swingF - (int16_t)swingVal) > 3) swingVal = swingF;
-  uint16_t bpm = map(tempoVal, 0, 1023, 40, 240);
+float potToUnit(int32_t acc) {                  // 0.0 .. 1.0, dead ends trimmed so extremes are reachable
+  float v = (acc / 16.0f - 8.0f) / 1007.0f;
+  return constrain(v, 0.0f, 1.0f);
+}
+
+void applyPots() {
+  float bpmF = 40.0f + potToUnit(tempoAcc) * 200.0f;
+  if (fabs(bpmF - bpm) > 0.75f) bpm = (uint16_t)(bpmF + 0.5f);       // deadband
+  float swF = potToUnit(swingAcc) * 66.0f;
+  if (fabs(swF - swingPct) > 0.75f) swingPct = (uint8_t)(swF + 0.5f);
   stepLenUs = 15000000UL / bpm;                 // 16th notes
-  swingPct = map(swingVal, 0, 1023, 0, 66);
+}
+
+void readPots() {                               // call every ~2 ms
+  if (potTurn) {
+    analogRead(SWING_POT);                      // discard
+    swingAcc += ((int32_t)analogRead(SWING_POT) * 16 - swingAcc) >> 3;
+  } else {
+    analogRead(TEMPO_POT);                      // discard
+    tempoAcc += ((int32_t)analogRead(TEMPO_POT) * 16 - tempoAcc) >> 3;
+  }
+  potTurn = !potTurn;
+  applyPots();
+}
+
+void initPots() {
+  analogRead(TEMPO_POT);
+  tempoAcc = (int32_t)analogRead(TEMPO_POT) * 16;
+  analogRead(SWING_POT);
+  swingAcc = (int32_t)analogRead(SWING_POT) * 16;
+  bpm = 40 + (uint16_t)(potToUnit(tempoAcc) * 200.0f + 0.5f);
+  swingPct = (uint8_t)(potToUnit(swingAcc) * 66.0f + 0.5f);
+  stepLenUs = 15000000UL / bpm;
 }
 
 // ---------- Sequencer ----------
 inline uint8_t chLen(uint8_t pat, uint8_t ch) { return lastStep[pat][ch] + 1; }
-
-void computeFireTime() {
-  uint32_t off = 0;
-  if (stepCounter & 1) off = (stepLenUs * swingPct) / 100;
-  fireTime = gridTime + off;
-}
 
 void playStep() {
   uint32_t now = micros();
@@ -116,15 +144,21 @@ void playStep() {
 void startSeq() {
   running = true;
   stepCounter = 0;
-  gridTime = micros();
-  fireTime = gridTime;
+  tickIdx = 0;
+  stepPending = false;
+  Serial2.write(0xFA);                          // MIDI start
+  tickTime = micros() + 1000;                   // >= 1 ms between start and first clock
 }
 
 void stopSeq() {
   running = false;
+  stepPending = false;
+  Serial2.write(0xFC);                          // MIDI stop
   allNotesOff();
 }
 
+// The clock tick is the master timeline: 6 ticks per 16th step (24 PPQN).
+// Notes fire on step boundaries, delayed by CLOCK_LEAD_US plus swing on odd steps. The clock itself never swings.
 void runClock() {
   uint32_t now = micros();
   for (uint8_t c = 0; c < 8; c++) {
@@ -134,11 +168,24 @@ void runClock() {
     }
   }
   if (!running) return;
-  if ((int32_t)(now - fireTime) >= 0) {
+
+  if ((int32_t)(now - tickTime) >= 0) {
+    Serial2.write(0xF8);                        // MIDI clock
+    if (tickIdx == 0) {                         // step boundary
+      uint32_t d = CLOCK_LEAD_US + ((stepCounter & 1) ? (stepLenUs * swingPct) / 100 : 0);
+      uint32_t maxD = stepLenUs - stepLenUs / 8;   // must fire before the next step boundary
+      if (d > maxD) d = maxD;
+      fireTime = tickTime + d;
+      stepPending = true;
+    }
+    if (++tickIdx >= 6) tickIdx = 0;
+    tickTime += stepLenUs / 6;
+  }
+
+  if (stepPending && (int32_t)(now - fireTime) >= 0) {
     playStep();
     stepCounter++;
-    gridTime += stepLenUs;
-    computeFireTime();
+    stepPending = false;
   }
 }
 
@@ -187,10 +234,7 @@ void saveState() {
   EEPROM.put(EE_LAST, lastStep);
   EEPROM.put(EE_SUM, dataChecksum());
   EEPROM.put(EE_MAGIC, SAVE_MAGIC);             // magic last, so a partial save is never valid
-  if (running) {                                // resync clock after the blocking write
-    gridTime = micros();
-    computeFireTime();
-  }
+  if (running) tickTime = micros();             // resync clock after the blocking write
   flashUntil = millis() + 400;
 }
 
@@ -266,7 +310,8 @@ void updateLeds() {
 
 // ---------- Setup / loop ----------
 void setup() {
-  Serial1.begin(31250);
+  Serial1.begin(31250);                         // MIDI notes out
+  Serial2.begin(31250);                         // MIDI clock out
   for (uint8_t i = 0; i < 16; i++) {
     initBtn(stepB[i], STEP_BTN[i]);
     pinMode(STEP_LED[i], OUTPUT);
@@ -278,11 +323,7 @@ void setup() {
   initDefaults();
   loadState();                                  // restore last save if present
 
-  tempoF = tempoVal = analogRead(TEMPO_POT);
-  swingF = swingVal = analogRead(SWING_POT);
-  readPots();
-
-  startSeq();
+  initPots();
 }
 
 void loop() {
@@ -290,6 +331,6 @@ void loop() {
   runClock();                                   // timing first
   handleButtons();
   checkSaveCombo();
-  if (millis() - potT >= 5) { potT = millis(); readPots(); }
+  if (millis() - potT >= 2) { potT = millis(); readPots(); }
   updateLeds();
 }

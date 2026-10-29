@@ -23,6 +23,9 @@
 static constexpr int MIDI_RX_PIN = 16;
 HardwareSerial MIDI(2);
 
+//static constexpr int MIDI_TX_PIN = 2;
+//HardwareSerial MIDI_OUT(1);
+
 static constexpr int I2S_BCLK = 26;
 static constexpr int I2S_LRCK = 25;
 static constexpr int I2S_DOUT = 27;
@@ -105,47 +108,47 @@ struct Button {
     uint32_t changed = 0;
 };
 // ---------- Small DSP helpers ----------
-#line 107 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static float clamp01(float x);
-#line 108 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static float expMap(float n, float lo, float hi);
-#line 109 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static float decCoef(float t60, float sr);
 #line 110 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static float tcCoef(float tau, float sr);
+static float clamp01(float x);
+#line 111 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static float expMap(float n, float lo, float hi);
+#line 112 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static float decCoef(float t60, float sr);
 #line 113 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static float tcCoef(float tau, float sr);
+#line 116 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static float fastSin(float p);
-#line 122 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 125 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static float fastTanh(float x);
-#line 133 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 136 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static float noiseGen(Voice &v);
-#line 142 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 145 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static void svf(Voice &v, float in, float g, float k, float &bp, float &hp);
-#line 155 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 158 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static void voiceTrigger(int i, float vel);
-#line 167 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 170 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static void computeParams();
-#line 193 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 196 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static void renderVoice(int i, float *buf);
-#line 251 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 254 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 void audioTask(void *parameter);
-#line 285 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 288 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static void handleMidiMessage(uint8_t status, uint8_t note, uint8_t velocity);
-#line 304 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 307 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static void readMidi();
-#line 341 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 348 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static int encoderPoll(int idx);
-#line 360 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 367 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static bool buttonUpdate(Button &b, bool &pressed);
-#line 378 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 385 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static void printParam(int v, int k);
-#line 391 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static void adjust(int v, int k, int steps);
 #line 398 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static void adjust(int v, int k, int steps);
+#line 405 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 void setup();
-#line 480 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 490 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 void loop();
-#line 107 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 110 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static inline float clamp01(float x) { return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
 static inline float expMap(float n, float lo, float hi) { return lo * powf(hi / lo, n); }
 static inline float decCoef(float t60, float sr) { return expf(-6.9078f / (t60 * sr)); }
@@ -345,9 +348,13 @@ static void handleMidiMessage(uint8_t status, uint8_t note, uint8_t velocity)
 
 static void readMidi()
 {
-    while (MIDI.available()) {
-        uint8_t b = MIDI.read();
-        if (b >= 0xF8) continue;            // ignore real-time
+	while (MIDI.available()) {
+    uint8_t b = MIDI.read();
+
+    // Forward every MIDI byte, including real-time messages
+		//    MIDI_OUT.write(b);
+
+    if (b >= 0xF8) continue;            // ignore real-time for synth parser			
 
         if (b & 0x80) {
             midiStatus = b;
@@ -450,6 +457,9 @@ void setup()
 
     MIDI.begin(31250, SERIAL_8N1, MIDI_RX_PIN, -1);
     Serial.println("DIN MIDI input started on GPIO16");
+
+		//		MIDI_OUT.begin(31250, SERIAL_8N1, -1, MIDI_TX_PIN);
+		//		Serial.println("MIDI Thru output started on GPIO2");		
 
     // I2S TX
     i2s_chan_config_t chanConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
