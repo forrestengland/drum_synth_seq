@@ -8,6 +8,8 @@
 //   none      : toggle step in viewed bank (current channel)
 //   Shift A   : 1-8 channel, 9-12 bank 1-4, 13-16 spare
 //   Shift B   : 1-8 pattern, 9-15 spare, 16 (hold 1 s) = save to EEPROM
+//   Accent held (no shift): step buttons toggle accents for the viewed bank. One accent
+//             track per pattern, shared by all channels (indexed by each lane's own step).
 //   A + B     : set last step of current channel = bank*16 + button
 
 #include <Arduino.h>
@@ -19,17 +21,20 @@ const uint8_t STEP_LED[16] = {38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 51
 const uint8_t SHIFT_A_PIN = 7;
 const uint8_t SHIFT_B_PIN = 6;
 const uint8_t PLAY_PIN = 5;
+const uint8_t ACCENT_PIN = 4;
 const uint8_t TEMPO_POT = A0;
 const uint8_t SWING_POT = A1;
 
 // ---------- MIDI config ----------
 const uint8_t MIDI_CH = 0;                       // channel 1 on the wire
 const uint8_t NOTES[8] = {30, 31, 32, 33, 34, 35, 36, 37};
-const uint8_t VELOCITY = 100;
-const uint32_t CLOCK_LEAD_US = 35000;             // clock leads the notes by this much (compensates slaved gear's latency; tune by ear)
+const uint8_t VELOCITY_NORMAL = 80;
+const uint8_t VELOCITY_ACCENT = 127;
+const uint32_t CLOCK_LEAD_US = 5000;             // clock leads the notes by this much (compensates slaved gear's latency; tune by ear)
 
 // ---------- Data ----------
 uint16_t steps[8][8][4];     // [pattern][channel][bank] -> 16 step bits
+uint16_t accents[8][4];      // [pattern][bank] -> 16 accent bits, shared by all channels
 uint8_t lastStep[8][8];      // [pattern][channel] -> 0..63 (loop length - 1)
 
 uint8_t curPat = 0, curCh = 0, viewBank = 0;
@@ -52,7 +57,7 @@ struct Btn {
   bool down;
   uint32_t t;
 };
-Btn stepB[16], shiftA, shiftB, playB;
+Btn stepB[16], shiftA, shiftB, playB, accentB;
 
 void initBtn(Btn &b, uint8_t pin) {
   b.pin = pin; b.down = false; b.t = 0;
@@ -72,7 +77,7 @@ bool pressed(Btn &b) {
 }
 
 // ---------- MIDI ----------
-inline void midiOn(uint8_t note)  { Serial1.write(0x90 | MIDI_CH); Serial1.write(note); Serial1.write(VELOCITY); }
+inline void midiOn(uint8_t note, uint8_t vel) { Serial1.write(0x90 | MIDI_CH); Serial1.write(note); Serial1.write(vel); }
 inline void midiOff(uint8_t note) { Serial1.write(0x80 | MIDI_CH); Serial1.write(note); Serial1.write((uint8_t)0); }
 
 void allNotesOff() {
@@ -134,7 +139,7 @@ void playStep() {
     uint8_t p = stepCounter % chLen(curPat, c);
     if (steps[curPat][c][p >> 4] & (1u << (p & 15))) {
       if (noteOn[c]) midiOff(NOTES[c]);
-      midiOn(NOTES[c]);
+      midiOn(NOTES[c], (accents[curPat][p >> 4] & (1u << (p & 15))) ? VELOCITY_ACCENT : VELOCITY_NORMAL);
       noteOn[c] = true;
       offTime[c] = now + gate;
     }
@@ -190,12 +195,13 @@ void runClock() {
 }
 
 // ---------- Save / load (EEPROM) ----------
-// Layout: magic(4) | steps(512) | lastStep(64) | checksum(2) = 582 bytes
-const uint32_t SAVE_MAGIC = 0x53455132UL;       // change this to invalidate old saves
+// Layout: magic(4) | steps(512) | lastStep(64) | accents(64) | checksum(2) = 646 bytes
+const uint32_t SAVE_MAGIC = 0x53455133UL;       // change this to invalidate old saves
 const int EE_MAGIC = 0;
 const int EE_STEPS = EE_MAGIC + sizeof(SAVE_MAGIC);
 const int EE_LAST  = EE_STEPS + sizeof(steps);
-const int EE_SUM   = EE_LAST + sizeof(lastStep);
+const int EE_ACC   = EE_LAST + sizeof(lastStep);
+const int EE_SUM   = EE_ACC + sizeof(accents);
 
 uint32_t flashUntil = 0;                        // all LEDs on until this time (save confirmation)
 
@@ -205,11 +211,14 @@ uint16_t dataChecksum() {
   for (size_t i = 0; i < sizeof(steps); i++) sum = ((sum << 1) | (sum >> 15)) ^ p[i];
   p = (const uint8_t *)lastStep;
   for (size_t i = 0; i < sizeof(lastStep); i++) sum = ((sum << 1) | (sum >> 15)) ^ p[i];
+  p = (const uint8_t *)accents;
+  for (size_t i = 0; i < sizeof(accents); i++) sum = ((sum << 1) | (sum >> 15)) ^ p[i];
   return sum;
 }
 
 void initDefaults() {
   memset(steps, 0, sizeof(steps));
+  memset(accents, 0, sizeof(accents));
   memset(lastStep, 15, sizeof(lastStep));       // default 16-step loops
 }
 
@@ -220,6 +229,7 @@ bool loadState() {
   if (magic != SAVE_MAGIC) return false;
   EEPROM.get(EE_STEPS, steps);
   EEPROM.get(EE_LAST, lastStep);
+  EEPROM.get(EE_ACC, accents);
   EEPROM.get(EE_SUM, stored);
   if (stored != dataChecksum()) {               // corrupt or partial save
     initDefaults();
@@ -232,6 +242,7 @@ void saveState() {
   allNotesOff();                                // writes block for a moment
   EEPROM.put(EE_STEPS, steps);                  // put() only writes bytes that changed
   EEPROM.put(EE_LAST, lastStep);
+  EEPROM.put(EE_ACC, accents);
   EEPROM.put(EE_SUM, dataChecksum());
   EEPROM.put(EE_MAGIC, SAVE_MAGIC);             // magic last, so a partial save is never valid
   if (running) tickTime = micros();             // resync clock after the blocking write
@@ -258,6 +269,7 @@ void checkSaveCombo() {
 void handleButtons() {
   pressed(shiftA);                              // keep shift state current
   pressed(shiftB);
+  pressed(accentB);
   bool a = shiftA.down, b = shiftB.down;
 
   for (uint8_t i = 0; i < 16; i++) {
@@ -269,6 +281,8 @@ void handleButtons() {
       else if (i < 12) viewBank = i - 8;
     } else if (b) {                             // pattern
       if (i < 8) curPat = i;
+    } else if (accentB.down) {                  // accent edit (shared track)
+      accents[curPat][viewBank] ^= (1u << i);
     } else {                                    // edit
       steps[curPat][curCh][viewBank] ^= (1u << i);
     }
@@ -301,7 +315,7 @@ void updateLeds() {
     } else if (b) {
       if (i < 8) on = (i == curPat);
     } else {
-      on = steps[curPat][curCh][viewBank] & (1u << i);
+      on = (accentB.down ? accents[curPat][viewBank] : steps[curPat][curCh][viewBank]) & (1u << i);
       if (playPos >= 0 && (playPos >> 4) == viewBank && (playPos & 15) == i) on = !on;
     }
     digitalWrite(STEP_LED[i], on);
@@ -319,6 +333,7 @@ void setup() {
   initBtn(shiftA, SHIFT_A_PIN);
   initBtn(shiftB, SHIFT_B_PIN);
   initBtn(playB, PLAY_PIN);
+  initBtn(accentB, ACCENT_PIN);
 
   initDefaults();
   loadState();                                  // restore last save if present
