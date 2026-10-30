@@ -28,9 +28,9 @@ const uint8_t SWING_POT = A1;
 // ---------- MIDI config ----------
 const uint8_t MIDI_CH = 0;                       // channel 1 on the wire
 const uint8_t NOTES[8] = {30, 31, 32, 33, 34, 35, 36, 37};
-const uint8_t VELOCITY_NORMAL = 80;
+const uint8_t VELOCITY_NORMAL = 60;
 const uint8_t VELOCITY_ACCENT = 127;
-const uint32_t CLOCK_LEAD_US = 5000;             // clock leads the notes by this much (compensates slaved gear's latency; tune by ear)
+const uint32_t CLOCK_LEAD_US = 30000;             // clock leads the notes by this much (compensates slaved gear's latency; tune by ear)
 
 // ---------- Data ----------
 uint16_t steps[8][8][4];     // [pattern][channel][bank] -> 16 step bits
