@@ -3,13 +3,18 @@
  * ESP32 analog-style drum voice synth
  *   DIN MIDI in -> BD / SD / closed hat / open hat -> PCM5102A (I2S)
  *
- * Controls
- *   Normal mode:  encoder 1..4 turn  = volume of BD / SD / CH / OH
+ * Two banks of four voices, chosen by the BANK toggle switch:
+ *   Bank A: BD, SD, closed hat, open hat      Bank B: rim click, clave, cowbell, bongo
+ * (MIDI always triggers all eight voices; the switch only changes what the panel controls.)
+ *
+ * Controls (for the voices of the current bank)
+ *   Normal mode:  encoder 1..4 turn  = volume of voice 1..4
  *                 encoder 1..4 click = preview (trigger) that voice
  *   INST held:    encoder 1..4 turn  = TUNE / DECAY / BEND / TONE of the *selected* voice
- *                 encoder 1..4 click = select voice BD / SD / CH / OH
+ *                 encoder 1..4 click = select voice 1..4 of the current bank
  *
- * TONE meaning per voice: BD = click+drive, SD = noise/tone mix, hats = resonance.
+ * TONE meaning: BD click+drive | SD noise/tone mix | hats resonance |
+ *               rim & clave click | cowbell filter resonance | bongo slap
  *
  * Saved state (flash / NVS): all knob values + selected voice
  *   - auto-saved 3 s after the last change
@@ -17,7 +22,7 @@
  *   - reloaded at power-up
  *   - hold INST while powering on to wipe the saved state and start from defaults
  *
- * MIDI notes: BD 30, SD 31, CH 32, OH 33  (edit midiNote[] below)
+ * MIDI notes: BD 30, SD 31, CH 32, OH 33, rim 34, clave 35, cowbell 36, bongo 37  (edit midiNote[] below)
  */
 
 #include <Arduino.h>
@@ -44,6 +49,7 @@ static const EncPins encPins[4] = {
     { 35, 34, 23 },   // 4 - OH
 };
 static constexpr int INST_SW = 4;
+static constexpr int BANK_SW = 5;     // toggle switch to GND: open = bank A, closed = bank B
 
 // ---------- Tunables ----------
 static constexpr int   SAMPLE_RATE   = 44100;
@@ -57,12 +63,13 @@ static constexpr bool     AUTO_SAVE      = true;   // save a few seconds after t
 static constexpr uint32_t SAVE_DELAY_MS  = 3000;
 static constexpr uint32_t LONG_PRESS_MS  = 2000;   // INST held this long, untouched = save now
 
-static const uint8_t midiNote[4] = { 30, 31, 32, 33 };   // BD, SD, CH, OH
+static const uint8_t midiNote[8] = { 30, 31, 32, 33,      // BD, SD, CH, OH
+                                     34, 35, 36, 37 };    // rim, clave, cowbell, bongo
 
 // ---------- Voice definitions ----------
 enum { P_TUNE, P_DECAY, P_BEND, P_TONE, P_LEVEL, NP };
-enum { V_BD, V_SD, V_CH, V_OH, NV };
-enum { T_BD, T_SD, T_HH };
+enum { V_BD, V_SD, V_CH, V_OH, V_RM, V_CL, V_CB, V_BG, NV };
+enum { T_BD, T_SD, T_HH, T_RIM, T_CLAVE, T_COW, T_BONGO };
 
 struct VoiceDef {
     const char *name, *toneName;
@@ -79,6 +86,11 @@ static const VoiceDef defs[NV] = {
     { "SD", "NOISE", T_SD,  120.f,   400.f, 0.04f, 0.6f, 2.0f, 0.015f, {0.40f, 0.50f, 0.30f, 0.60f, 0.80f} },
     { "CH", "RESO",  T_HH, 3000.f, 14000.f, 0.01f, 0.25f, 1.5f, 0.020f, {0.70f, 0.30f, 0.00f, 0.30f, 0.70f} },
     { "OH", "RESO",  T_HH, 3000.f, 14000.f, 0.10f, 2.0f, 1.5f, 0.020f, {0.70f, 0.50f, 0.00f, 0.30f, 0.70f} },
+    // bank B
+    { "RM", "CLICK", T_RIM,   400.f, 2500.f, 0.01f, 0.12f, 1.0f, 0.004f, {0.55f, 0.40f, 0.10f, 0.50f, 0.70f} },
+    { "CL", "CLICK", T_CLAVE, 1500.f, 3500.f, 0.02f, 0.25f, 0.5f, 0.005f, {0.50f, 0.35f, 0.10f, 0.30f, 0.70f} },
+    { "CB", "RESO",  T_COW,   300.f,  900.f, 0.05f, 0.80f, 0.3f, 0.010f, {0.45f, 0.45f, 0.00f, 0.35f, 0.65f} },
+    { "BG", "SLAP",  T_BONGO, 150.f,  600.f, 0.04f, 0.40f, 3.0f, 0.020f, {0.55f, 0.40f, 0.30f, 0.35f, 0.80f} },
 };
 static const char *paramName[4] = { "TUNE", "DECAY", "BEND", nullptr };
 
@@ -89,6 +101,76 @@ static std::atomic<uint8_t> trigVel[NV];    // pending trigger velocity (1..127)
 // ---------- Types ----------
 // Kept above every function on purpose: the Arduino .ino preprocessor auto-generates
 // prototypes before the first function, so types used in function signatures must already exist.
+// band-limited square (PolyBLEP) for the cowbell oscillators
+#line 104 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static float polyBlep(float t, float dt);
+#line 110 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static float blepSquare(float phase, float dt);
+#line 153 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static float clamp01(float x);
+#line 154 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static float expMap(float n, float lo, float hi);
+#line 155 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static float decCoef(float t60, float sr);
+#line 156 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static float tcCoef(float tau, float sr);
+#line 159 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static float fastSin(float p);
+#line 168 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static float fastTanh(float x);
+#line 179 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static float noiseGen(struct Voice &v);
+#line 188 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static void svf(Voice &v, float in, float g, float k, float &bp, float &hp);
+#line 201 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static void voiceTrigger(int i, float vel);
+#line 213 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static void computeParams();
+#line 243 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static void renderVoice(int i, float *buf);
+#line 337 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+void audioTask(void *parameter);
+#line 371 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static void handleMidiMessage(uint8_t status, uint8_t note, uint8_t velocity);
+#line 390 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static void readMidi();
+#line 428 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static int encoderPoll(int idx);
+#line 447 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static bool buttonUpdate(struct Button &b, bool &pressed);
+#line 474 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static void markDirty();
+#line 480 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static void saveState(bool verbose);
+#line 514 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static bool loadState();
+#line 536 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static void clearSavedState();
+#line 546 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static void applyBank(int newBank, bool verbose);
+#line 558 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static void printParam(int v, int k);
+#line 571 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static void adjust(int v, int k, int steps);
+#line 579 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+void setup();
+#line 680 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+void loop();
+#line 104 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static inline float polyBlep(float t, float dt)
+{
+    if (t < dt)         { t /= dt;          return t + t - t * t - 1.f; }
+    if (t > 1.f - dt)   { t = (t - 1.f) / dt; return t * t + t + t + 1.f; }
+    return 0.f;
+}
+static inline float blepSquare(float phase, float dt)
+{
+    float s = (phase < 0.5f) ? 1.f : -1.f;
+    float p2 = phase + 0.5f;
+    if (p2 >= 1.f) p2 -= 1.f;
+    return s + polyBlep(phase, dt) - polyBlep(p2, dt);
+}
+
 struct Voice {
     bool  active = false, choke = false;
     float phase = 0, phase2 = 0;
@@ -112,7 +194,7 @@ struct SavedState {                      // what goes into flash
     float    p[NV][NP];
 };
 static constexpr uint32_t STATE_MAGIC   = 0x44525653;   // 'DRVS'
-static constexpr uint32_t STATE_VERSION = 1;
+static constexpr uint32_t STATE_VERSION = 2;
 
 struct Encoder {
     int      lastA = HIGH;
@@ -124,55 +206,6 @@ struct Button {
     uint32_t changed = 0;
 };
 // ---------- Small DSP helpers ----------
-#line 126 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static float clamp01(float x);
-#line 127 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static float expMap(float n, float lo, float hi);
-#line 128 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static float decCoef(float t60, float sr);
-#line 129 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static float tcCoef(float tau, float sr);
-#line 132 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static float fastSin(float p);
-#line 141 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static float fastTanh(float x);
-#line 152 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static float noiseGen(Voice &v);
-#line 161 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static void svf(Voice &v, float in, float g, float k, float &bp, float &hp);
-#line 174 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static void voiceTrigger(int i, float vel);
-#line 186 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static void computeParams();
-#line 212 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static void renderVoice(int i, float *buf);
-#line 270 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-void audioTask(void *parameter);
-#line 304 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static void handleMidiMessage(uint8_t status, uint8_t note, uint8_t velocity);
-#line 323 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static void readMidi();
-#line 360 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static int encoderPoll(int idx);
-#line 379 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static bool buttonUpdate(Button &b, bool &pressed);
-#line 405 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static void markDirty();
-#line 411 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static void saveState(bool verbose);
-#line 445 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static bool loadState();
-#line 467 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static void clearSavedState();
-#line 477 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static void printParam(int v, int k);
-#line 490 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static void adjust(int v, int k, int steps);
-#line 498 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-void setup();
-#line 592 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-void loop();
-#line 126 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static inline float clamp01(float x) { return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
 static inline float expMap(float n, float lo, float hi) { return lo * powf(hi / lo, n); }
 static inline float decCoef(float t60, float sr) { return expf(-6.9078f / (t60 * sr)); }
@@ -199,7 +232,7 @@ static inline float fastTanh(float x)
 static Voice vo[NV];
 static MP    mp[NV];
 
-static inline float noiseGen(Voice &v)
+static inline float noiseGen(struct Voice &v)
 {
     v.rng ^= v.rng << 13;
     v.rng ^= v.rng >> 17;
@@ -251,10 +284,14 @@ static void computeParams()
         switch (d.type) {
         case T_BD: m.coef2 = tcCoef(0.002f, sr); break;          // click
         case T_SD: m.coef2 = decCoef(dec * 0.45f, sr); break;    // osc
+        case T_RIM:   m.coef2 = tcCoef(0.0015f, sr); break;      // click burst
+        case T_CLAVE: m.coef2 = tcCoef(0.001f, sr); break;       // click burst
+        case T_COW:   m.coef2 = tcCoef(0.012f, sr); break;       // initial transient
+        case T_BONGO: m.coef2 = tcCoef(0.003f, sr); break;       // slap
         default:   m.coef2 = m.coef; break;
         }
         m.gHp   = tanf(PI_F * 1800.f / sr);
-        m.k     = 1.f / (0.7f + m.tone * 20.f);
+        m.k     = (d.type == T_COW) ? 1.f / (0.8f + m.tone * 5.f) : 1.f / (0.7f + m.tone * 20.f);
         m.sqrtK = sqrtf(m.k);
     }
 }
@@ -271,6 +308,9 @@ static void renderVoice(int i, float *buf)
     float gHat = 0.f;
     if (type == T_HH) {
         float cf = fminf(m.tune * (1.f + m.bend * v.penv), 0.45f * SAMPLE_RATE);
+        gHat = tanf(PI_F * cf * inv);
+    } else if (type == T_COW) {              // cowbell: fixed bandpass relative to the tuning
+        float cf = fminf(m.tune * 4.9f, 0.45f * SAMPLE_RATE);
         gHat = tanf(PI_F * cf * inv);
     }
 
@@ -292,6 +332,39 @@ static void renderVoice(int i, float *buf)
             float go = fminf(1.f, 2.f * (1.f - m.tone));
             float gn = fminf(1.f, 2.f * m.tone);
             s = go * osc * v.env2 + gn * hp * 1.2f * v.env;
+        } else if (type == T_RIM) {
+            v.phase  += f * inv;          if (v.phase  >= 1.f) v.phase  -= 1.f;
+            v.phase2 += f * 2.4f * inv;   if (v.phase2 >= 1.f) v.phase2 -= 1.f;
+            float tonal = 0.6f * fastSin(v.phase) + 0.4f * fastSin(v.phase2);
+            float bp, hp;
+            svf(v, noiseGen(v), m.gHp, 1.4f, bp, hp);
+            float click = hp * v.env2 * m.tone * 1.5f;
+            s = fastTanh((tonal * v.env + click) * 2.f) * 0.8f;
+        } else if (type == T_CLAVE) {
+            v.phase  += f * inv;          if (v.phase  >= 1.f) v.phase  -= 1.f;
+            v.phase2 += f * 0.76f * inv;  if (v.phase2 >= 1.f) v.phase2 -= 1.f;
+            float tonal = 0.7f * fastSin(v.phase) + 0.3f * fastSin(v.phase2);
+            float bp, hp;
+            svf(v, noiseGen(v), m.gHp, 1.4f, bp, hp);
+            float click = hp * v.env2 * m.tone;
+            s = fastTanh(tonal * v.env * 1.4f + click);
+        } else if (type == T_COW) {
+            float dt1 = f * inv, dt2 = f * 1.48f * inv;
+            v.phase  += dt1;  if (v.phase  >= 1.f) v.phase  -= 1.f;
+            v.phase2 += dt2;  if (v.phase2 >= 1.f) v.phase2 -= 1.f;
+            float sq = 0.5f * (blepSquare(v.phase, dt1) + blepSquare(v.phase2, dt2));
+            float bp, hp;
+            svf(v, sq, gHat, m.k, bp, hp);
+            float amp = v.env * (0.6f + 0.4f * v.env2);
+            s = bp * m.k * 4.f * amp;
+        } else if (type == T_BONGO) {
+            v.phase  += f * inv;          if (v.phase  >= 1.f) v.phase  -= 1.f;
+            v.phase2 += f * 1.58f * inv;  if (v.phase2 >= 1.f) v.phase2 -= 1.f;
+            float tonal = fastSin(v.phase) + 0.25f * fastSin(v.phase2);
+            float bp, hp;
+            svf(v, noiseGen(v), m.gHp, 1.4f, bp, hp);
+            float slap = hp * v.env2 * m.tone * 1.2f;
+            s = tonal * 0.9f * v.env + slap;
         } else {   // T_HH: tuned noise
             float bp, hp;
             svf(v, noiseGen(v), gHat, m.k, bp, hp);
@@ -404,6 +477,7 @@ static Encoder enc[4];
 
 static Button encBtn[4];
 static Button instBtn;
+static Button bankBtn;
 
 // Same decoding as the tested version: act on A falling, B level gives direction.
 // Fast turns are accelerated.
@@ -426,7 +500,7 @@ static int encoderPoll(int idx)
 }
 
 // returns true when the debounced state changes; pressed tells which way
-static bool buttonUpdate(Button &b, bool &pressed)
+static bool buttonUpdate(struct Button &b, bool &pressed)
 {
     bool raw = (digitalRead(b.pin) == LOW);
     uint32_t now = millis();
@@ -440,7 +514,8 @@ static bool buttonUpdate(Button &b, bool &pressed)
 }
 
 // ---------- UI logic ----------
-static int curVoice = V_BD;     // voice edited in INST mode
+static int curVoice = V_BD;     // voice edited in INST mode (always inside the current bank)
+static int bank = 0;            // 0 = A (BD SD CH OH), 1 = B (RM CL CB BG)
 static uint32_t instHeldSince = 0;
 static bool instUsed = false, longDone = false;
 static int dirtyV = -1, dirtyK = -1;
@@ -524,6 +599,18 @@ static void clearSavedState()
     haveSaved = false;
 }
 
+static void applyBank(int newBank, bool verbose)
+{
+    bank = newBank;
+    curVoice = bank * 4 + (curVoice & 3);     // keep the same slot, move it into the new bank
+    if (verbose) {
+        markDirty();
+        Serial.printf("Bank %c: %s %s %s %s  (selected: %s)\n", bank ? 'B' : 'A',
+                      defs[bank * 4].name, defs[bank * 4 + 1].name,
+                      defs[bank * 4 + 2].name, defs[bank * 4 + 3].name, defs[curVoice].name);
+    }
+}
+
 static void printParam(int v, int k)
 {
     const VoiceDef &d = defs[v];
@@ -567,6 +654,13 @@ void setup()
     } else {
         Serial.println("No valid saved state, using defaults");
     }
+
+    // bank switch is the source of truth for the bank at power-up
+    pinMode(BANK_SW, INPUT_PULLUP);
+    delay(5);
+    bankBtn.pin = BANK_SW;
+    bankBtn.down = bankBtn.rawPrev = (digitalRead(BANK_SW) == LOW);
+    applyBank(bankBtn.down ? 1 : 0, false);
 
     MIDI.begin(31250, SERIAL_8N1, MIDI_RX_PIN, -1);
     Serial.println("DIN MIDI input started on GPIO16");
@@ -636,7 +730,7 @@ void setup()
         while (true) delay(1000);
     }
 
-    Serial.printf("Drum voice ready. Selected voice: %s\n", defs[curVoice].name);
+    Serial.printf("Drum voice ready. Bank %c, selected voice: %s\n", bank ? 'B' : 'A', defs[curVoice].name);
 }
 
 void loop()
@@ -656,24 +750,27 @@ void loop()
     }
     bool shift = instBtn.down;
 
+    if (buttonUpdate(bankBtn, pressed))
+        applyBank(bankBtn.down ? 1 : 0, true);
+
     for (int i = 0; i < 4; i++) {
         // rotation
         int steps = encoderPoll(i);
         if (steps) {
             if (shift) instUsed = true;
-            if (shift) adjust(curVoice, i, steps);   // enc 1..4 = TUNE, DECAY, BEND, TONE
-            else       adjust(i, P_LEVEL, steps);    // enc i = volume of voice i
+            if (shift) adjust(curVoice, i, steps);            // enc 1..4 = TUNE, DECAY, BEND, TONE
+            else       adjust(bank * 4 + i, P_LEVEL, steps);  // enc i = volume of voice i in this bank
         }
 
         // click
         if (buttonUpdate(encBtn[i], pressed) && pressed) {
             if (shift) {
                 instUsed = true;
-                curVoice = i;
+                curVoice = bank * 4 + i;
                 markDirty();
-                Serial.printf("Selected voice: %s\n", defs[i].name);
+                Serial.printf("Selected voice: %s\n", defs[curVoice].name);
             } else {
-                trigVel[i].store(100);               // preview
+                trigVel[bank * 4 + i].store(100);    // preview
             }
         }
     }

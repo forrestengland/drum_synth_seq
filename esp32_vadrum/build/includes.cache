@@ -7,8 +7,9 @@
   },
   {
     "compile": {
-      "source_path": "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged",
-      "depfile_path": "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged.libsdetect.d"
+      "source_path": "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp",
+      "object_path": "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.o",
+      "depfile_path": "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.d"
     },
     "compile_task": {
       "args": [
@@ -47,12 +48,9 @@
         "-I/home/forrest/.arduino15/packages/esp32/hardware/esp32/3.3.12/variants/esp32",
         "@/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/build_opt.h",
         "@/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/file_opts",
-        "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged",
+        "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp",
         "-o",
-        "/dev/null",
-        "-MMD",
-        "-MF",
-        "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged.libsdetect.d"
+        "/dev/null"
       ]
     }
   },
@@ -64,8 +62,9 @@
   },
   {
     "compile": {
-      "source_path": "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged",
-      "depfile_path": "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged.libsdetect.d"
+      "source_path": "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp",
+      "object_path": "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.o",
+      "depfile_path": "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.d"
     },
     "compile_task": {
       "args": [
@@ -105,12 +104,9 @@
         "-I/home/forrest/.arduino15/packages/esp32/hardware/esp32/3.3.12/libraries/Preferences/src",
         "@/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/build_opt.h",
         "@/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/file_opts",
-        "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged",
+        "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp",
         "-o",
-        "/dev/null",
-        "-MMD",
-        "-MF",
-        "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/sketch/esp32_vadrum.ino.cpp.merged.libsdetect.d"
+        "/dev/null"
       ]
     }
   },
@@ -120,7 +116,8 @@
   {
     "compile": {
       "source_path": "/home/forrest/.arduino15/packages/esp32/hardware/esp32/3.3.12/libraries/Preferences/src/Preferences.cpp",
-      "depfile_path": "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/libraries/Preferences/Preferences.cpp.libsdetect.d"
+      "object_path": "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/libraries/Preferences/Preferences.cpp.o",
+      "depfile_path": "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/libraries/Preferences/Preferences.cpp.d"
     },
     "compile_task": {
       "args": [
@@ -162,10 +159,7 @@
         "@/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/file_opts",
         "/home/forrest/.arduino15/packages/esp32/hardware/esp32/3.3.12/libraries/Preferences/src/Preferences.cpp",
         "-o",
-        "/dev/null",
-        "-MMD",
-        "-MF",
-        "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/build/libraries/Preferences/Preferences.cpp.libsdetect.d"
+        "/dev/null"
       ]
     }
   },
