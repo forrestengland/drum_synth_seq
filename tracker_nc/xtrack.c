@@ -6,13 +6,15 @@
  *   - 4 tracker channels, 64-row pattern, 8 instrument slots
  *   - cell = note, instrument number, 2-digit hex volume
  *   - instruments: sample import (anything libsndfile reads), tune (semitones),
- *     fine tune (cents), volume
+ *     fine tune (cents), volume, loop (off / forward / ping-pong, start+end)
+ *   - project save/load (text file, references samples by path)
  *
- * Usage:  ./xtrack [sample1.wav ... sample8.wav]
+ * Usage:  ./xtrack [project.xtp] [sample1.wav ... sample8.wav]
  *
  * Keys (global)
  *   F1 pattern view        F2 instrument view
- *   F3/F4 octave -/+       F9 sync INT <-> MIDI      F10 or Ctrl-C quit
+ *   F3/F4 octave -/+       F5 save project   F6 load project
+ *   F9 sync INT <-> MIDI   F10 or Ctrl-C quit
  *   Space play/stop        < > BPM -/+  (internal sync)
  *
  * Pattern view
@@ -25,9 +27,10 @@
  *   Enter play from cursor
  *
  * Instrument view
- *   Up/Down select slot   Tab select param (tune/fine/vol)   Left/Right adjust
- *   PgUp/PgDn big adjust  L or Enter load sample             Del unload
- *   piano keys audition the selected instrument
+ *   Up/Down select slot   Tab select param: tune fine vol loop lstart lend
+ *   Left/Right adjust     PgUp/PgDn big adjust    , .  1-frame adjust (loop points)
+ *   L or Enter load sample    Del unload
+ *   piano keys audition the selected instrument, 1 stops the audition
  */
 #define _GNU_SOURCE
 #include <ncurses.h>
@@ -43,6 +46,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <locale.h>
 
 #define NCHAN      4
@@ -55,6 +60,10 @@
 #define PREVIEW    NCHAN
 #define MIX_GAIN   0.5f
 #define PEAK_COLS  76
+#define PATHLEN    640
+#define PREVIEW_SECS 0.5              /* audition note length */
+
+enum { LOOP_OFF, LOOP_FWD, LOOP_PING };
 
 /* ------------------------------------------------------------------ data */
 
@@ -66,17 +75,20 @@ typedef struct {
     int      tune;               /* semitones  -48..48 */
     int      fine;               /* cents      -99..99 */
     int      vol;                /* 0..255 */
+    int      loop;               /* LOOP_* */
+    uint32_t loop_start, loop_end;   /* frames, end exclusive */
     char     name[24];
+    char     path[PATHLEN];      /* source file (UI thread only) */
 } Inst;
 
-typedef struct { int active, inst; double pos, step; float gain; } Voice;
+typedef struct { int active, inst, dir; double pos, step; float gain; } Voice;
 
 static Cell  pat[PAT_LEN][NCHAN];
 static Inst  ins[NINST];
 static Voice voices[NVOICE];
 static const float pan[NVOICE] = { 0.25f, 0.75f, 0.75f, 0.25f, 0.5f };
 
-/* instrument table is guarded by this; audio thread only try-locks */
+/* instrument table / pattern swaps are guarded by this; audio thread only try-locks */
 static pthread_mutex_t ins_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* UI -> audio / audio -> UI */
@@ -97,6 +109,7 @@ static int      next_row, running, clk;
 static double   acc, spr, clk_avg;
 static uint64_t abs_frames, last_clk_abs;
 static int      last_inst[NCHAN] = { -1, -1, -1, -1 };
+static int64_t  preview_left;          /* frames remaining on audition voice */
 
 /* ----------------------------------------------------------------- audio */
 
@@ -107,12 +120,14 @@ static void kill_voices(void)
 
 static void voice_trigger(int v, int inst, int note, float vol)
 {
+    Voice *vc = &voices[v];
+    vc->active = 0;                       /* a new note always cuts the previous one */
     Inst *in = &ins[inst];
     if (!in->data || !in->len) return;
     double semis = (note - BASE_NOTE) + in->tune + in->fine / 100.0;
-    Voice *vc = &voices[v];
     vc->inst = inst;
     vc->pos  = 0;
+    vc->dir  = 1;
     vc->step = ((double)in->rate / (double)srate) * pow(2.0, semis / 12.0);
     vc->gain = vol * (in->vol / 255.0f);
     vc->active = 1;
@@ -145,19 +160,51 @@ static void render(float *L, float *R, jack_nframes_t from, jack_nframes_t to)
         Voice *vc = &voices[v];
         if (!vc->active) continue;
         Inst *in = &ins[vc->inst];
-        if (!in->data) { vc->active = 0; continue; }
+        const float *d = in->data;
+        if (!d) { vc->active = 0; continue; }
+
+        uint32_t len = in->len;
+        int      loop = in->loop;
+        uint32_t le = in->loop_end > len ? len : in->loop_end;
+        uint32_t ls = in->loop_start;
+        if (le < 2 || ls + 2 > le) loop = LOOP_OFF;
+
         float pr = pan[v], pl = 1.0f - pr;
         float g  = vc->gain * MIX_GAIN;
+
         for (jack_nframes_t i = from; i < to; i++) {
+            if (vc->pos < 0) vc->pos = 0;
             uint32_t idx = (uint32_t)vc->pos;
-            if (idx >= in->len) { vc->active = 0; break; }
-            float fr = (float)(vc->pos - idx);
-            float s0 = in->data[idx];
-            float s1 = (idx + 1 < in->len) ? in->data[idx + 1] : 0.0f;
-            float s  = (s0 + (s1 - s0) * fr) * g;
+            if (idx >= len) { vc->active = 0; break; }
+
+            float gs = g;
+            if (v == PREVIEW) {                       /* audition: fixed length + fade-out */
+                if (preview_left <= 0) { vc->active = 0; break; }
+                float fade = (float)srate * 0.01f;
+                if ((float)preview_left < fade) gs = g * (float)preview_left / fade;
+                preview_left--;
+            }
+
+            float    fr = (float)(vc->pos - idx);
+            uint32_t i1 = idx + 1;
+            if (loop && i1 >= le) i1 = (loop == LOOP_FWD) ? ls : le - 1;
+            float s0 = d[idx];
+            float s1 = (i1 < len) ? d[i1] : 0.0f;
+            float s  = (s0 + (s1 - s0) * fr) * gs;
             L[i] += s * pl;
             R[i] += s * pr;
-            vc->pos += vc->step;
+
+            vc->pos += vc->step * vc->dir;
+
+            if (loop == LOOP_FWD) {
+                if (vc->pos >= le)
+                    vc->pos = ls + fmod(vc->pos - ls, (double)(le - ls));
+            } else if (loop == LOOP_PING) {
+                if (vc->dir > 0 && vc->pos >= le)      { vc->pos = 2.0 * le - vc->pos; vc->dir = -1; }
+                else if (vc->dir < 0 && vc->pos < ls)  { vc->pos = 2.0 * ls - vc->pos; vc->dir = 1;  }
+                if (vc->pos < ls)       vc->pos = ls;
+                if (vc->pos > le - 1.0) vc->pos = le - 1.0;
+            }
         }
     }
 }
@@ -217,7 +264,11 @@ static int process(jack_nframes_t n, void *arg)
     int pr = atomic_exchange(&preview_req, 0);
     if (pr) {
         int i = (pr >> 8) - 1, note = pr & 0xff;
-        if (i >= 0 && i < NINST) voice_trigger(PREVIEW, i, note, 1.0f);
+        if (note == NOTE_OFF)                 voices[PREVIEW].active = 0;
+        else if (i >= 0 && i < NINST) {
+            voice_trigger(PREVIEW, i, note, 1.0f);
+            preview_left = (int64_t)(srate * PREVIEW_SECS);
+        }
     }
 
     void *mb = jack_port_get_buffer(midi_in, n);
@@ -265,6 +316,8 @@ static void swap_sample(int slot, float *data, uint32_t len, uint32_t rate, cons
     ins[slot].data = data;
     ins[slot].len  = len;
     ins[slot].rate = rate;
+    ins[slot].loop_start = 0;
+    ins[slot].loop_end   = len;
     snprintf(ins[slot].name, sizeof ins[slot].name, "%s", name);
     for (int v = 0; v < NVOICE; v++)
         if (voices[v].inst == slot) voices[v].active = 0;
@@ -305,18 +358,165 @@ static int load_sample(int slot, const char *path, char *err, size_t errlen)
     const char *base = strrchr(path, '/');
     base = base ? base + 1 : path;
     swap_sample(slot, mono, (uint32_t)total, (uint32_t)si.samplerate, base);
+
+    char rp[PATH_MAX];
+    snprintf(ins[slot].path, sizeof ins[slot].path, "%s", realpath(path, rp) ? rp : path);
+    return 0;
+}
+
+/* --------------------------------------------------------------- project */
+
+static char proj_path[PATHLEN] = "";
+
+static int project_save(const char *path, char *err, size_t el)
+{
+    char tmp[PATHLEN + 8];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) { snprintf(err, el, "%s", strerror(errno)); return -1; }
+
+    fprintf(f, "XTRACK 1\nbpm %d\n", atomic_load(&bpm));
+    for (int i = 0; i < NINST; i++) {
+        Inst *in = &ins[i];
+        fprintf(f, "inst %d tune=%d fine=%d vol=%d loop=%d ls=%u le=%u path=%s\n",
+                i + 1, in->tune, in->fine, in->vol, in->loop,
+                (unsigned)in->loop_start, (unsigned)in->loop_end, in->path);
+    }
+    for (int r = 0; r < PAT_LEN; r++) {
+        int any = 0;
+        for (int c = 0; c < NCHAN; c++)
+            if (pat[r][c].note || pat[r][c].inst || pat[r][c].vol >= 0) any = 1;
+        if (!any) continue;
+        fprintf(f, "row %d", r);
+        for (int c = 0; c < NCHAN; c++)
+            fprintf(f, " %d:%d:%d", pat[r][c].note, pat[r][c].inst, pat[r][c].vol);
+        fputc('\n', f);
+    }
+    int bad = ferror(f);
+    if (fclose(f)) bad = 1;
+    if (bad || rename(tmp, path) != 0) {
+        snprintf(err, el, "%s", strerror(errno ? errno : EIO));
+        remove(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+static int project_load(const char *file, char *err, size_t el, int *missing)
+{
+    struct Cfg { int have, tune, fine, vol, loop; unsigned ls, le; char path[PATHLEN]; } cfg[NINST];
+    Cell tmp[PAT_LEN][NCHAN];
+    char line[1024];
+    int newbpm = 0;
+
+    *missing = 0;
+    FILE *f = fopen(file, "r");
+    if (!f) { snprintf(err, el, "%s", strerror(errno)); return -1; }
+    if (!fgets(line, sizeof line, f) || strncmp(line, "XTRACK", 6) != 0) {
+        fclose(f); snprintf(err, el, "not an xtrack project"); return -1;
+    }
+
+    memset(cfg, 0, sizeof cfg);
+    for (int i = 0; i < NINST; i++) cfg[i].vol = 255;
+    for (int r = 0; r < PAT_LEN; r++)
+        for (int c = 0; c < NCHAN; c++) tmp[r][c] = (Cell){ 0, 0, -1 };
+
+    while (fgets(line, sizeof line, f)) {
+        size_t l = strlen(line);
+        while (l && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
+
+        int a;
+        if (sscanf(line, "bpm %d", &a) == 1) {
+            newbpm = a;
+        } else if (!strncmp(line, "inst ", 5)) {
+            char path[PATHLEN] = "";
+            char *p = strstr(line, " path=");
+            if (p) { snprintf(path, sizeof path, "%s", p + 6); *p = 0; }
+            int n, tu, fi, vo, lo;
+            unsigned ls, le;
+            if (sscanf(line, "inst %d tune=%d fine=%d vol=%d loop=%d ls=%u le=%u",
+                       &n, &tu, &fi, &vo, &lo, &ls, &le) == 7 && n >= 1 && n <= NINST) {
+                struct Cfg *c = &cfg[n - 1];
+                c->have = 1;
+                c->tune = tu < -48 ? -48 : tu > 48 ? 48 : tu;
+                c->fine = fi < -99 ? -99 : fi > 99 ? 99 : fi;
+                c->vol  = vo < 0 ? 0 : vo > 255 ? 255 : vo;
+                c->loop = (lo >= 0 && lo <= LOOP_PING) ? lo : 0;
+                c->ls = ls; c->le = le;
+                snprintf(c->path, sizeof c->path, "%s", path);
+            }
+        } else if (!strncmp(line, "row ", 4)) {
+            int r, off = 0;
+            if (sscanf(line, "row %d%n", &r, &off) == 1 && r >= 0 && r < PAT_LEN) {
+                char *q = line + off;
+                for (int c = 0; c < NCHAN; c++) {
+                    int n, i, v, used = 0;
+                    if (sscanf(q, " %d:%d:%d%n", &n, &i, &v, &used) != 3) break;
+                    q += used;
+                    if (n < 0 || n > NOTE_OFF || i < 0 || i > NINST || v < -1 || v > 255) continue;
+                    tmp[r][c] = (Cell){ (uint8_t)n, (uint8_t)i, (int16_t)v };
+                }
+            }
+        }
+    }
+    fclose(f);
+
+    char dir[PATHLEN];
+    snprintf(dir, sizeof dir, "%s", file);
+    char *sl = strrchr(dir, '/');
+    if (sl) *sl = 0; else strcpy(dir, ".");
+
+    atomic_store(&cmd, 2);
+    pthread_mutex_lock(&ins_lock);
+    memcpy(pat, tmp, sizeof pat);
+    pthread_mutex_unlock(&ins_lock);
+    if (newbpm >= 32 && newbpm <= 300) atomic_store(&bpm, newbpm);
+
+    for (int i = 0; i < NINST; i++) {
+        struct Cfg *c = &cfg[i];
+        Inst *in = &ins[i];
+        char e2[96];
+
+        swap_sample(i, NULL, 0, 0, "");
+        snprintf(in->path, sizeof in->path, "%s", c->path);
+        if (c->path[0]) {
+            int rc = load_sample(i, c->path, e2, sizeof e2);
+            if (rc) {                                   /* fall back to project dir */
+                const char *b = strrchr(c->path, '/');
+                char alt[PATHLEN + 8];
+                snprintf(alt, sizeof alt, "%s/%s", dir, b ? b + 1 : c->path);
+                rc = load_sample(i, alt, e2, sizeof e2);
+            }
+            if (rc) (*missing)++;
+        }
+        in->tune = c->tune; in->fine = c->fine; in->vol = c->vol; in->loop = c->loop;
+        if (in->data) {
+            uint32_t le = c->le;
+            if (le == 0 || le > in->len) le = in->len;
+            uint32_t ls = c->ls;
+            if (le < 2 || ls + 2 > le) ls = 0;
+            in->loop_start = ls;
+            in->loop_end   = le;
+        } else {
+            in->loop_start = c->ls;                     /* keep so a re-save preserves it */
+            in->loop_end   = c->le;
+        }
+    }
+
+    snprintf(proj_path, sizeof proj_path, "%s", file);
     return 0;
 }
 
 /* -------------------------------------------------------------------- UI */
 
 enum { V_PATTERN, V_INST };
+enum { P_TUNE, P_FINE, P_VOL, P_LOOP, P_LSTART, P_LEND, NPARAM };
 
 static int  view = V_PATTERN;
 static int  cur_row, cur_ch, cur_field;        /* fields: 0 note 1 inst 2 volhi 3 vollo */
 static int  octave = 4, cur_inst, step = 1;
-static int  inst_sel, inst_param;              /* params: 0 tune 1 fine 2 vol */
-static char status[128] = "";
+static int  inst_sel, inst_param;
+static char status[160] = "";
 static float peaks[PEAK_COLS];
 static int  peaks_dirty = 1;
 static volatile sig_atomic_t quit_flag;
@@ -358,6 +558,12 @@ static void audition(int inst, int note)
 
 static void move_row(int d) { cur_row = ((cur_row + d) % PAT_LEN + PAT_LEN) % PAT_LEN; }
 
+static const char *base_name(const char *p)
+{
+    const char *b = strrchr(p, '/');
+    return b ? b + 1 : p;
+}
+
 static void title_bar(const char *name)
 {
     char right[32], sync[24];
@@ -376,13 +582,16 @@ static void title_bar(const char *name)
     attroff(A_REVERSE);
 }
 
-static void footer(const char *help)
+static void footer(const char *help1, const char *help2)
 {
     if (status[0]) mvprintw(LINES - 2, 1, "%.*s", COLS - 2, status);
+    else { attron(A_DIM); mvprintw(LINES - 2, 1, "%.*s", COLS - 2, help2); attroff(A_DIM); }
     attron(A_DIM);
-    mvprintw(LINES - 1, 1, "%.*s", COLS - 2, help);
+    mvprintw(LINES - 1, 1, "%.*s", COLS - 2, help1);
     attroff(A_DIM);
 }
+
+#define HELP_GLOBAL "F1 pattern F2 instr F3/F4 oct F5 save F6 load F9 sync F10 quit"
 
 static void draw_pattern(void)
 {
@@ -393,6 +602,9 @@ static void draw_pattern(void)
     mvprintw(1, 0, "ROW");
     for (int c = 0; c < NCHAN; c++) mvprintw(1, 5 + c * 12, "CH%d  nte in vl", c + 1);
     attroff(COLOR_PAIR(4) | A_BOLD);
+    attron(A_DIM);
+    mvprintw(1, 58, "%.20s", proj_path[0] ? base_name(proj_path) : "untitled");
+    attroff(A_DIM);
 
     int vis = LINES - 4;
     int top = cur_row - vis / 2;
@@ -427,7 +639,8 @@ static void draw_pattern(void)
         }
         attroff(attr);
     }
-    footer("F1/F2 view  Space play  Enter play@cursor  []inst ()step  Del clear  1=off  F10 quit");
+    footer(HELP_GLOBAL,
+           "Space play  Enter play@cursor  [ ]inst  ( )step  Del clear  1=note off  <>bpm");
 }
 
 static void compute_peaks(void)
@@ -448,6 +661,7 @@ static void compute_peaks(void)
 
 static void draw_inst(void)
 {
+    static const char *loopname[3] = { "OFF", "FWD", "PING" };
     title_bar("INSTRUMENTS");
     attron(COLOR_PAIR(4) | A_BOLD);
     mvprintw(1, 1, "#  NAME                     LEN       RATE   TUNE   FINE   VOL");
@@ -462,16 +676,18 @@ static void draw_inst(void)
         snprintf(fine, sizeof fine, "%+4d", in->fine);
         snprintf(vol,  sizeof vol,  "%02X", in->vol);
         int sel = (i == inst_sel);
+        const char *nm = in->data ? in->name : (in->path[0] ? "(missing)" : "(empty)");
         if (sel) attron(A_BOLD);
-        mvprintw(y, 0, "%c%d  %-22.22s", sel ? '>' : ' ', i + 1, in->data ? in->name : "(empty)");
+        mvprintw(y, 0, "%c%d  %-22.22s", sel ? '>' : ' ', i + 1, nm);
         if (in->data) {
             mvprintw(y, 28, "%6.2fs", (double)in->len / in->rate);
             mvprintw(y, 38, "%6u", in->rate);
+            if (in->loop) mvaddstr(y, 45, in->loop == LOOP_FWD ? "L" : "P");
         }
         mvaddstr(y, px[0], tune);
         mvaddstr(y, px[1], fine);
         mvaddstr(y, px[2], vol);
-        if (sel) {
+        if (sel && inst_param <= P_VOL) {
             const char *txt[3] = { tune, fine, vol };
             attron(A_REVERSE);
             mvaddnstr(y, px[inst_param], txt[inst_param], pw[inst_param]);
@@ -480,39 +696,123 @@ static void draw_inst(void)
         if (sel) attroff(A_BOLD);
     }
 
+    /* loop line for selected instrument */
+    Inst *s = &ins[inst_sel];
+    char lm[8], ls[16], le[16];
+    snprintf(lm, sizeof lm, "%-4s", loopname[s->loop]);
+    snprintf(ls, sizeof ls, "%8u", (unsigned)s->loop_start);
+    snprintf(le, sizeof le, "%8u", (unsigned)s->loop_end);
+    attron(COLOR_PAIR(4));
+    mvaddstr(11, 1, "LOOP:");  mvaddstr(11, 12, "START:");
+    mvaddstr(11, 28, "END:");  mvaddstr(11, 42, "LEN:");
+    attroff(COLOR_PAIR(4));
+    mvaddstr(11, 6, lm);  mvaddstr(11, 18, ls);  mvaddstr(11, 32, le);
+    mvprintw(11, 46, "%8u", (unsigned)s->len);
+    attron(A_REVERSE);
+    if (inst_param == P_LOOP)   mvaddstr(11, 6, lm);
+    if (inst_param == P_LSTART) mvaddstr(11, 18, ls);
+    if (inst_param == P_LEND)   mvaddstr(11, 32, le);
+    attroff(A_REVERSE);
+
     if (peaks_dirty) compute_peaks();
-    mvprintw(11, 1, "WAVEFORM");
-    int cy = 15, w = COLS - 4 < PEAK_COLS ? COLS - 4 : PEAK_COLS;
+    mvprintw(12, 1, "WAVEFORM");
+    int cy = 16, w = COLS - 4 < PEAK_COLS ? COLS - 4 : PEAK_COLS;
     mvhline(cy, 2, '-', w);
     for (int x = 0; x < w; x++) {
         int h = (int)lrintf(peaks[x] * 3.0f);
         for (int dy = -h; dy <= h; dy++) mvaddch(cy + dy, 2 + x, '#');
     }
-    footer("Up/Dn slot  Tab param  Lt/Rt adjust (PgUp/Dn x big)  L/Enter load  Del unload  keys=audition");
+    if (s->data && s->loop && s->len) {
+        int xs = (int)((uint64_t)s->loop_start * PEAK_COLS / s->len);
+        int xe = (int)((uint64_t)s->loop_end   * PEAK_COLS / s->len);
+        if (xs > w - 1) xs = w - 1;
+        if (xe > w - 1) xe = w - 1;
+        for (int x = xs; x <= xe; x++) mvaddch(20, 2 + x, '=');
+        mvaddch(20, 2 + xs, '[');
+        mvaddch(20, 2 + xe, ']');
+    }
+    footer(HELP_GLOBAL,
+           "Up/Dn slot Tab param Lt/Rt adj PgUp/Dn big ,/. fine L load Del clr 1=stop");
 }
 
-static void prompt_load(void)
-{
-    char buf[512], path[640], err[96];
-    move(LINES - 2, 0); clrtoeol();
-    printw(" Load sample into slot %d (empty = cancel): ", inst_sel + 1);
-    echo(); curs_set(1); timeout(-1);
-    getnstr(buf, sizeof buf - 1);
-    noecho(); curs_set(0); timeout(33);
+/* ---- prompts / project actions */
 
-    char *p = buf;
+static void clean_path(char *s, size_t n)
+{
+    char *p = s;
     while (isspace((unsigned char)*p)) p++;
     size_t l = strlen(p);
     while (l && isspace((unsigned char)p[l - 1])) p[--l] = 0;
-    if (!*p) { status[0] = 0; return; }
+    char tmp[PATHLEN];
     if (p[0] == '~' && (p[1] == '/' || p[1] == 0) && getenv("HOME"))
-        snprintf(path, sizeof path, "%s%s", getenv("HOME"), p + 1);
+        snprintf(tmp, sizeof tmp, "%s%s", getenv("HOME"), p + 1);
     else
-        snprintf(path, sizeof path, "%s", p);
+        snprintf(tmp, sizeof tmp, "%s", p);
+    snprintf(s, n, "%s", tmp);
+}
+
+static void ensure_ext(char *path, size_t n)
+{
+    if (!strchr(base_name(path), '.') && strlen(path) + 5 < n) strcat(path, ".xtp");
+}
+
+/* returns 1 if non-empty line entered */
+static int prompt_line(const char *msg, char *out, size_t n)
+{
+    move(LINES - 2, 0); clrtoeol();
+    printw(" %s", msg);
+    echo(); curs_set(1); timeout(-1);
+    out[0] = 0;
+    getnstr(out, (int)n - 1);
+    noecho(); curs_set(0); timeout(33);
+    clean_path(out, n);
+    return out[0] != 0;
+}
+
+static void prompt_load_sample(void)
+{
+    char path[PATHLEN], msg[96], err[96];
+    snprintf(msg, sizeof msg, "Load sample into slot %d (empty = cancel): ", inst_sel + 1);
+    if (!prompt_line(msg, path, sizeof path)) { status[0] = 0; return; }
 
     if (load_sample(inst_sel, path, err, sizeof err) == 0) {
         snprintf(status, sizeof status, "Loaded into slot %d: %s", inst_sel + 1, ins[inst_sel].name);
         peaks_dirty = 1;
+    } else {
+        snprintf(status, sizeof status, "Load failed: %s", err);
+    }
+}
+
+static void do_save(void)
+{
+    char path[PATHLEN], msg[160], err[96];
+    snprintf(msg, sizeof msg, "Save project as [%s]: ",
+             proj_path[0] ? base_name(proj_path) : "cancel");
+    int got = prompt_line(msg, path, sizeof path);
+    if (!got) {
+        if (!proj_path[0]) { status[0] = 0; return; }
+        snprintf(path, sizeof path, "%s", proj_path);
+    }
+    ensure_ext(path, sizeof path);
+    if (project_save(path, err, sizeof err) == 0) {
+        snprintf(proj_path, sizeof proj_path, "%s", path);
+        snprintf(status, sizeof status, "Saved %s", path);
+    } else {
+        snprintf(status, sizeof status, "Save failed: %s", err);
+    }
+}
+
+static void do_load(void)
+{
+    char path[PATHLEN], err[96];
+    int missing = 0;
+    if (!prompt_line("Load project (empty = cancel): ", path, sizeof path)) { status[0] = 0; return; }
+    ensure_ext(path, sizeof path);
+    if (project_load(path, err, sizeof err, &missing) == 0) {
+        peaks_dirty = 1;
+        cur_row = 0;
+        if (missing) snprintf(status, sizeof status, "Loaded %s (%d sample file(s) not found)", path, missing);
+        else         snprintf(status, sizeof status, "Loaded %s", path);
     } else {
         snprintf(status, sizeof status, "Load failed: %s", err);
     }
@@ -532,13 +832,50 @@ static void transport_toggle(int from_cursor)
     }
 }
 
-static void adjust_param(int d)
+/* mag: 0 = 1 unit, 1 = normal, 2 = big */
+static void adjust_param(int dir, int mag)
 {
     Inst *in = &ins[inst_sel];
     switch (inst_param) {
-    case 0: in->tune += d; if (in->tune < -48) in->tune = -48; if (in->tune > 48) in->tune = 48; break;
-    case 1: in->fine += d; if (in->fine < -99) in->fine = -99; if (in->fine > 99) in->fine = 99; break;
-    case 2: in->vol  += d; if (in->vol < 0) in->vol = 0; if (in->vol > 255) in->vol = 255; break;
+    case P_TUNE:
+        in->tune += dir * (mag == 2 ? 12 : 1);
+        if (in->tune < -48) in->tune = -48;
+        if (in->tune > 48)  in->tune = 48;
+        break;
+    case P_FINE:
+        in->fine += dir * (mag == 2 ? 10 : 1);
+        if (in->fine < -99) in->fine = -99;
+        if (in->fine > 99)  in->fine = 99;
+        break;
+    case P_VOL:
+        in->vol += dir * (mag == 2 ? 16 : 1);
+        if (in->vol < 0)   in->vol = 0;
+        if (in->vol > 255) in->vol = 255;
+        break;
+    case P_LOOP:
+        in->loop = (in->loop + dir + 3) % 3;
+        break;
+    case P_LSTART:
+    case P_LEND: {
+        if (in->len < 2) break;
+        int64_t unit = mag == 0 ? 1 : mag == 1 ? in->len / 1000 : in->len / 50;
+        if (unit < 1) unit = 1;
+        int64_t d = dir * unit;
+        if (inst_param == P_LSTART) {
+            int64_t v = (int64_t)in->loop_start + d;
+            int64_t mx = (int64_t)in->loop_end - 2;
+            if (v > mx) v = mx;
+            if (v < 0)  v = 0;
+            in->loop_start = (uint32_t)v;
+        } else {
+            int64_t v = (int64_t)in->loop_end + d;
+            int64_t lo = (int64_t)in->loop_start + 2;
+            if (v < lo) v = lo;
+            if (v > (int64_t)in->len) v = in->len;
+            in->loop_end = (uint32_t)v;
+        }
+        break;
+    }
     }
 }
 
@@ -547,15 +884,19 @@ static void inst_key(int k)
     switch (k) {
     case KEY_UP:    inst_sel = (inst_sel + NINST - 1) % NINST; cur_inst = inst_sel; peaks_dirty = 1; return;
     case KEY_DOWN:  inst_sel = (inst_sel + 1) % NINST;         cur_inst = inst_sel; peaks_dirty = 1; return;
-    case '\t':      inst_param = (inst_param + 1) % 3; return;
-    case KEY_BTAB:  inst_param = (inst_param + 2) % 3; return;
-    case KEY_LEFT:  adjust_param(-1); return;
-    case KEY_RIGHT: adjust_param(+1); return;
-    case KEY_PPAGE: adjust_param(inst_param == 0 ? 12 : inst_param == 1 ? 10 : 16); return;
-    case KEY_NPAGE: adjust_param(inst_param == 0 ? -12 : inst_param == 1 ? -10 : -16); return;
-    case 'l': case 'L': case '\n': case KEY_ENTER: prompt_load(); return;
+    case '\t':      inst_param = (inst_param + 1) % NPARAM; return;
+    case KEY_BTAB:  inst_param = (inst_param + NPARAM - 1) % NPARAM; return;
+    case KEY_LEFT:  adjust_param(-1, 1); return;
+    case KEY_RIGHT: adjust_param(+1, 1); return;
+    case ',':       adjust_param(-1, 0); return;
+    case '.':       adjust_param(+1, 0); return;
+    case KEY_PPAGE: adjust_param(+1, 2); return;
+    case KEY_NPAGE: adjust_param(-1, 2); return;
+    case '1':       audition(inst_sel, NOTE_OFF); return;
+    case 'l': case 'L': case '\n': case KEY_ENTER: prompt_load_sample(); return;
     case KEY_DC:
         swap_sample(inst_sel, NULL, 0, 0, "");
+        ins[inst_sel].path[0] = 0;
         peaks_dirty = 1;
         snprintf(status, sizeof status, "Slot %d cleared", inst_sel + 1);
         return;
@@ -631,6 +972,8 @@ static void global_key(int k, int *handled)
     case KEY_F(2): view = V_INST; peaks_dirty = 1; break;
     case KEY_F(3): if (octave > 0) octave--; break;
     case KEY_F(4): if (octave < 7) octave++; break;
+    case KEY_F(5): do_save(); break;
+    case KEY_F(6): do_load(); break;
     case KEY_F(9): {
         int e = !atomic_load(&sync_ext);
         atomic_store(&sync_ext, e);
@@ -675,10 +1018,21 @@ int main(int argc, char **argv)
     midi_in = jack_port_register(client, "midi_in", JACK_DEFAULT_MIDI_TYPE,  JackPortIsInput,  0);
     jack_set_process_callback(client, process, NULL);
 
-    for (int i = 1; i < argc && i <= NINST; i++) {
+    int slot = 0;
+    for (int i = 1; i < argc; i++) {
         char err[96];
-        if (load_sample(i - 1, argv[i], err, sizeof err) != 0)
-            fprintf(stderr, "xtrack: %s: %s\n", argv[i], err);
+        size_t l = strlen(argv[i]);
+        if (l > 4 && strcmp(argv[i] + l - 4, ".xtp") == 0) {
+            int missing = 0;
+            if (project_load(argv[i], err, sizeof err, &missing) != 0)
+                fprintf(stderr, "xtrack: %s: %s\n", argv[i], err);
+            else if (missing)
+                fprintf(stderr, "xtrack: %s: %d sample file(s) not found\n", argv[i], missing);
+        } else if (slot < NINST) {
+            if (load_sample(slot, argv[i], err, sizeof err) != 0)
+                fprintf(stderr, "xtrack: %s: %s\n", argv[i], err);
+            slot++;
+        }
     }
 
     if (jack_activate(client)) { fprintf(stderr, "xtrack: cannot activate JACK client\n"); return 1; }
