@@ -15,6 +15,7 @@
  * Keys (global)
  *   F1 pattern view        F2 instrument view
  *   F3/F4 octave -/+       F5 save project   F6 load project
+ *   F7 edit mode on/off (off = pattern is read-only; notes just audition)
  *   F9 sync INT <-> MIDI   F10 or Ctrl-C quit
  *   Space play/stop        < > BPM -/+  (internal sync)
  *
@@ -571,6 +572,7 @@ static int  view = V_PATTERN;
 static int  cur_row, cur_ch, cur_field;        /* fields: 0 note 1 inst 2 volhi 3 vollo */
 static int  octave = 4, cur_inst, step = 1;
 static int  inst_sel, inst_param;
+static int  edit_mode = 0;                     /* 0 = view/audition only, 1 = pattern edits allowed */
 static char status[160] = "";
 static float peaks[PEAK_COLS];
 static int  peaks_dirty = 1;
@@ -646,12 +648,14 @@ static void footer(const char *help1, const char *help2)
     attroff(A_DIM);
 }
 
-#define HELP_GLOBAL "F1 pattern F2 instr F3/F4 oct F5 save F6 load F9 sync F10 quit"
+#define HELP_GLOBAL "F1 pattern F2 instr F3/F4 oct F5 save F6 load F7 edit F9 sync F10 quit"
 
 static void draw_pattern(void)
 {
     static const int foff[4] = { 0, 4, 7, 8 }, flen[4] = { 3, 2, 1, 1 };
     title_bar("PATTERN");
+    if (edit_mode) { attron(COLOR_PAIR(5) | A_BOLD); mvaddstr(0, 67, "EDIT"); attroff(COLOR_PAIR(5) | A_BOLD); }
+    else           { attron(A_REVERSE);              mvaddstr(0, 67, "VIEW"); attroff(A_REVERSE); }
 
     attron(COLOR_PAIR(4) | A_BOLD);
     mvprintw(1, 0, "ROW");
@@ -1016,10 +1020,20 @@ static void pattern_key(int k)
     case ')': if (step < 16) step++; return;
     case '\n': case KEY_ENTER: transport_toggle(1); return;
     case KEY_DC:
+        if (!edit_mode) { snprintf(status, sizeof status, "Edit mode is off - press F7 to edit"); return; }
         if (cur_field == 0) { ce->note = 0; ce->inst = 0; ce->vol = -1; }
         else if (cur_field == 1) ce->inst = 0;
         else ce->vol = -1;
         move_row(step);
+        return;
+    }
+
+    if (!edit_mode) {                 /* view mode: audition only, never touch the pattern */
+        int n = key_to_note(k, octave);
+        if (n)            audition(cur_inst, n);
+        else if (k == '1') audition(cur_inst, NOTE_OFF);
+        else if (cur_field >= 1 && (hexval(k) >= 0))
+            snprintf(status, sizeof status, "Edit mode is off - press F7 to edit");
         return;
     }
 
@@ -1061,6 +1075,10 @@ static void global_key(int k, int *handled)
     case KEY_F(4): if (octave < 7) octave++; break;
     case KEY_F(5): do_save(); break;
     case KEY_F(6): do_load(); break;
+    case KEY_F(7):
+        edit_mode = !edit_mode;
+        snprintf(status, sizeof status, edit_mode ? "Edit mode ON" : "Edit mode OFF (view / audition only)");
+        break;
     case KEY_F(9): {
         int e = !atomic_load(&sync_ext);
         atomic_store(&sync_ext, e);
@@ -1145,6 +1163,7 @@ int main(int argc, char **argv)
         init_pair(2, COLOR_BLACK, COLOR_GREEN);   /* play head */
         init_pair(3, COLOR_YELLOW, -1);           /* beat rows */
         init_pair(4, COLOR_CYAN, -1);             /* headers   */
+        init_pair(5, COLOR_WHITE, COLOR_RED);     /* edit-mode indicator */
     }
 
     while (!quit_flag) {
