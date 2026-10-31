@@ -6,7 +6,8 @@
  *   - 4 tracker channels, 64-row pattern, 8 instrument slots
  *   - cell = note, instrument number, 2-digit hex volume
  *   - instruments: sample import (anything libsndfile reads), tune (semitones),
- *     fine tune (cents), volume, loop (off / forward / ping-pong, start+end)
+ *     fine tune (cents), volume, loop (off / forward / ping-pong, start+end),
+ *     ADSR amplitude envelope
  *   - project save/load (text file, references samples by path)
  *
  * Usage:  ./xtrack [project.xtp] [sample1.wav ... sample8.wav]
@@ -28,6 +29,7 @@
  *
  * Instrument view
  *   Up/Down select slot   Tab select param: tune fine vol loop lstart lend
+ *                         att dec sus rel (amplitude envelope, times in ms)
  *   Left/Right adjust     PgUp/PgDn big adjust    , .  1-frame adjust (loop points)
  *   L or Enter load sample    Del unload
  *   piano keys audition the selected instrument, 1 stops the audition
@@ -61,6 +63,7 @@
 #define MIX_GAIN   0.5f
 #define PEAK_COLS  76
 #define PATHLEN    640
+#define MAX_ENV_MS 5000
 #define PREVIEW_SECS 0.5              /* audition note length */
 
 enum { LOOP_OFF, LOOP_FWD, LOOP_PING };
@@ -77,11 +80,20 @@ typedef struct {
     int      vol;                /* 0..255 */
     int      loop;               /* LOOP_* */
     uint32_t loop_start, loop_end;   /* frames, end exclusive */
+    int      att_ms, dec_ms; /* envelope: attack / decay time (ms) */
+    int      sus;            /* sustain level 0..255 */
+    int      rel_ms;         /* release time (ms) */
     char     name[24];
     char     path[PATHLEN];      /* source file (UI thread only) */
 } Inst;
 
-typedef struct { int active, inst, dir; double pos, step; float gain; } Voice;
+enum { ENV_ATK, ENV_DEC, ENV_SUS, ENV_REL };
+
+typedef struct {
+    int active, inst, dir, stage;
+    double pos, step;
+    float gain, level, rel_step;
+} Voice;
 
 static Cell  pat[PAT_LEN][NCHAN];
 static Inst  ins[NINST];
@@ -130,7 +142,21 @@ static void voice_trigger(int v, int inst, int note, float vol)
     vc->dir  = 1;
     vc->step = ((double)in->rate / (double)srate) * pow(2.0, semis / 12.0);
     vc->gain = vol * (in->vol / 255.0f);
+    if (in->att_ms > 0) { vc->level = 0.0f; vc->stage = ENV_ATK; }
+    else                { vc->level = 1.0f; vc->stage = ENV_DEC; }
     vc->active = 1;
+}
+
+/* start the release stage (note-off); min 2 ms so cuts never click */
+static void voice_release(Voice *vc)
+{
+    if (!vc->active || vc->stage == ENV_REL) return;
+    if (vc->level <= 0.0f) { vc->active = 0; return; }
+    float frames = (float)ins[vc->inst].rel_ms * (float)srate / 1000.0f;
+    float minf   = (float)srate * 0.002f;
+    if (frames < minf) frames = minf;
+    vc->rel_step = vc->level / frames;
+    vc->stage = ENV_REL;
 }
 
 static void step_row(void)
@@ -142,7 +168,7 @@ static void step_row(void)
     for (int c = 0; c < NCHAN; c++) {
         Cell *ce = &pat[r][c];
         if (ce->note == NOTE_OFF) {
-            voices[c].active = 0;
+            voice_release(&voices[c]);
         } else if (ce->note >= 1 && ce->note <= 96) {
             int i = ce->inst ? ce->inst - 1 : last_inst[c];
             if (i < 0 || i >= NINST) continue;
@@ -169,6 +195,10 @@ static void render(float *L, float *R, jack_nframes_t from, jack_nframes_t to)
         uint32_t ls = in->loop_start;
         if (le < 2 || ls + 2 > le) loop = LOOP_OFF;
 
+        float sus     = in->sus / 255.0f;
+        float atk_inc = in->att_ms > 0 ? 1000.0f / ((float)in->att_ms * (float)srate) : 1.0f;
+        float dec_dec = in->dec_ms > 0 ? (1.0f - sus) * 1000.0f / ((float)in->dec_ms * (float)srate) : 1.0f;
+
         float pr = pan[v], pl = 1.0f - pr;
         float g  = vc->gain * MIX_GAIN;
 
@@ -177,22 +207,36 @@ static void render(float *L, float *R, jack_nframes_t from, jack_nframes_t to)
             uint32_t idx = (uint32_t)vc->pos;
             if (idx >= len) { vc->active = 0; break; }
 
-            float gs = g;
-            if (v == PREVIEW) {                       /* audition: fixed length + fade-out */
-                if (preview_left <= 0) { vc->active = 0; break; }
-                float fade = (float)srate * 0.01f;
-                if ((float)preview_left < fade) gs = g * (float)preview_left / fade;
-                preview_left--;
-            }
+            /* audition voice: auto note-off after its hold time */
+            if (v == PREVIEW && preview_left > 0 && --preview_left == 0) voice_release(vc);
 
             float    fr = (float)(vc->pos - idx);
             uint32_t i1 = idx + 1;
             if (loop && i1 >= le) i1 = (loop == LOOP_FWD) ? ls : le - 1;
             float s0 = d[idx];
             float s1 = (i1 < len) ? d[i1] : 0.0f;
-            float s  = (s0 + (s1 - s0) * fr) * gs;
+            float s  = (s0 + (s1 - s0) * fr) * g * vc->level;
             L[i] += s * pl;
             R[i] += s * pr;
+
+            switch (vc->stage) {
+            case ENV_ATK:
+                vc->level += atk_inc;
+                if (vc->level >= 1.0f) { vc->level = 1.0f; vc->stage = ENV_DEC; }
+                break;
+            case ENV_DEC:
+                vc->level -= dec_dec;
+                if (vc->level <= sus) { vc->level = sus; vc->stage = ENV_SUS; }
+                break;
+            case ENV_SUS:
+                vc->level = sus;
+                break;
+            case ENV_REL:
+                vc->level -= vc->rel_step;
+                if (vc->level <= 0.0f) vc->active = 0;
+                break;
+            }
+            if (!vc->active) break;
 
             vc->pos += vc->step * vc->dir;
 
@@ -264,10 +308,11 @@ static int process(jack_nframes_t n, void *arg)
     int pr = atomic_exchange(&preview_req, 0);
     if (pr) {
         int i = (pr >> 8) - 1, note = pr & 0xff;
-        if (note == NOTE_OFF)                 voices[PREVIEW].active = 0;
+        if (note == NOTE_OFF)                 voice_release(&voices[PREVIEW]);
         else if (i >= 0 && i < NINST) {
             voice_trigger(PREVIEW, i, note, 1.0f);
-            preview_left = (int64_t)(srate * PREVIEW_SECS);
+            if (voices[PREVIEW].active)       /* hold long enough to hear attack+decay */
+                preview_left = (int64_t)(srate * (PREVIEW_SECS + (ins[i].att_ms + ins[i].dec_ms) / 1000.0));
         }
     }
 
@@ -378,9 +423,10 @@ static int project_save(const char *path, char *err, size_t el)
     fprintf(f, "XTRACK 1\nbpm %d\n", atomic_load(&bpm));
     for (int i = 0; i < NINST; i++) {
         Inst *in = &ins[i];
-        fprintf(f, "inst %d tune=%d fine=%d vol=%d loop=%d ls=%u le=%u path=%s\n",
+        fprintf(f, "inst %d tune=%d fine=%d vol=%d loop=%d ls=%u le=%u a=%d d=%d s=%d r=%d path=%s\n",
                 i + 1, in->tune, in->fine, in->vol, in->loop,
-                (unsigned)in->loop_start, (unsigned)in->loop_end, in->path);
+                (unsigned)in->loop_start, (unsigned)in->loop_end,
+                in->att_ms, in->dec_ms, in->sus, in->rel_ms, in->path);
     }
     for (int r = 0; r < PAT_LEN; r++) {
         int any = 0;
@@ -404,7 +450,7 @@ static int project_save(const char *path, char *err, size_t el)
 
 static int project_load(const char *file, char *err, size_t el, int *missing)
 {
-    struct Cfg { int have, tune, fine, vol, loop; unsigned ls, le; char path[PATHLEN]; } cfg[NINST];
+    struct Cfg { int have, tune, fine, vol, loop, att, dec, sus, rel; unsigned ls, le; char path[PATHLEN]; } cfg[NINST];
     Cell tmp[PAT_LEN][NCHAN];
     char line[1024];
     int newbpm = 0;
@@ -417,7 +463,7 @@ static int project_load(const char *file, char *err, size_t el, int *missing)
     }
 
     memset(cfg, 0, sizeof cfg);
-    for (int i = 0; i < NINST; i++) cfg[i].vol = 255;
+    for (int i = 0; i < NINST; i++) { cfg[i].vol = 255; cfg[i].sus = 255; }
     for (int r = 0; r < PAT_LEN; r++)
         for (int c = 0; c < NCHAN; c++) tmp[r][c] = (Cell){ 0, 0, -1 };
 
@@ -443,6 +489,14 @@ static int project_load(const char *file, char *err, size_t el, int *missing)
                 c->vol  = vo < 0 ? 0 : vo > 255 ? 255 : vo;
                 c->loop = (lo >= 0 && lo <= LOOP_PING) ? lo : 0;
                 c->ls = ls; c->le = le;
+                int ea, ed, es, er;      /* envelope fields are optional (older files) */
+                if (sscanf(line, "inst %*d tune=%*d fine=%*d vol=%*d loop=%*d ls=%*u le=%*u a=%d d=%d s=%d r=%d",
+                           &ea, &ed, &es, &er) == 4) {
+                    c->att = ea < 0 ? 0 : ea > MAX_ENV_MS ? MAX_ENV_MS : ea;
+                    c->dec = ed < 0 ? 0 : ed > MAX_ENV_MS ? MAX_ENV_MS : ed;
+                    c->sus = es < 0 ? 0 : es > 255 ? 255 : es;
+                    c->rel = er < 0 ? 0 : er > MAX_ENV_MS ? MAX_ENV_MS : er;
+                }
                 snprintf(c->path, sizeof c->path, "%s", path);
             }
         } else if (!strncmp(line, "row ", 4)) {
@@ -490,6 +544,7 @@ static int project_load(const char *file, char *err, size_t el, int *missing)
             if (rc) (*missing)++;
         }
         in->tune = c->tune; in->fine = c->fine; in->vol = c->vol; in->loop = c->loop;
+        in->att_ms = c->att; in->dec_ms = c->dec; in->sus = c->sus; in->rel_ms = c->rel;
         if (in->data) {
             uint32_t le = c->le;
             if (le == 0 || le > in->len) le = in->len;
@@ -510,7 +565,7 @@ static int project_load(const char *file, char *err, size_t el, int *missing)
 /* -------------------------------------------------------------------- UI */
 
 enum { V_PATTERN, V_INST };
-enum { P_TUNE, P_FINE, P_VOL, P_LOOP, P_LSTART, P_LEND, NPARAM };
+enum { P_TUNE, P_FINE, P_VOL, P_LOOP, P_LSTART, P_LEND, P_ATT, P_DEC, P_SUS, P_REL, NPARAM };
 
 static int  view = V_PATTERN;
 static int  cur_row, cur_ch, cur_field;        /* fields: 0 note 1 inst 2 volhi 3 vollo */
@@ -715,7 +770,27 @@ static void draw_inst(void)
     attroff(A_REVERSE);
 
     if (peaks_dirty) compute_peaks();
-    mvprintw(12, 1, "WAVEFORM");
+    {
+        char ea[8], ed[8], es[8], er[8];
+        snprintf(ea, sizeof ea, "%4d", s->att_ms);
+        snprintf(ed, sizeof ed, "%4d", s->dec_ms);
+        snprintf(es, sizeof es, "%02X", s->sus);
+        snprintf(er, sizeof er, "%4d", s->rel_ms);
+        attron(COLOR_PAIR(4));
+        mvaddstr(12, 1, "ATT:");  mvaddstr(12, 14, "DEC:");
+        mvaddstr(12, 27, "SUS:"); mvaddstr(12, 36, "REL:");
+        attroff(COLOR_PAIR(4));
+        mvaddstr(12, 5, ea);  mvaddstr(12, 10, "ms");
+        mvaddstr(12, 18, ed); mvaddstr(12, 23, "ms");
+        mvaddstr(12, 31, es);
+        mvaddstr(12, 40, er); mvaddstr(12, 45, "ms");
+        attron(A_REVERSE);
+        if (inst_param == P_ATT) mvaddstr(12, 5, ea);
+        if (inst_param == P_DEC) mvaddstr(12, 18, ed);
+        if (inst_param == P_SUS) mvaddstr(12, 31, es);
+        if (inst_param == P_REL) mvaddstr(12, 40, er);
+        attroff(A_REVERSE);
+    }
     int cy = 16, w = COLS - 4 < PEAK_COLS ? COLS - 4 : PEAK_COLS;
     mvhline(cy, 2, '-', w);
     for (int x = 0; x < w; x++) {
@@ -854,6 +929,18 @@ static void adjust_param(int dir, int mag)
         break;
     case P_LOOP:
         in->loop = (in->loop + dir + 3) % 3;
+        break;
+    case P_ATT: case P_DEC: case P_REL: {
+        int *t = inst_param == P_ATT ? &in->att_ms : inst_param == P_DEC ? &in->dec_ms : &in->rel_ms;
+        *t += dir * (mag == 0 ? 1 : mag == 1 ? 10 : 100);
+        if (*t < 0) *t = 0;
+        if (*t > MAX_ENV_MS) *t = MAX_ENV_MS;
+        break;
+    }
+    case P_SUS:
+        in->sus += dir * (mag == 2 ? 16 : 1);
+        if (in->sus < 0)   in->sus = 0;
+        if (in->sus > 255) in->sus = 255;
         break;
     case P_LSTART:
     case P_LEND: {
@@ -1003,7 +1090,7 @@ static void demo_pattern(void)
 int main(int argc, char **argv)
 {
     setlocale(LC_ALL, "");
-    for (int i = 0; i < NINST; i++) ins[i].vol = 255;
+    for (int i = 0; i < NINST; i++) { ins[i].vol = 255; ins[i].sus = 255; }
     demo_pattern();
 
     jack_status_t jst;
