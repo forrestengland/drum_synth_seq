@@ -17,6 +17,24 @@ constexpr int SAMPLE_RATE = 44100;
 constexpr int BLOCK_FRAMES = 128;
 constexpr float MAX_AMPLITUDE = 0.25f;
 
+// wavetable osc
+enum Waveform {
+    WAVE_SAW,
+    WAVE_SQUARE
+};
+
+Waveform currentWaveform = WAVE_SAW;
+
+// -------- Wavetable settings --------
+#define WAVETABLE_SIZE 1024
+
+float sawTable[WAVETABLE_SIZE];
+float squareTable[WAVETABLE_SIZE];
+
+// Oscillator phase, measured in wavetable samples.
+//float phase = 0.0f;
+//float phaseIncrement = 0.0f;
+
 // -------- MIDI --------
 USBConnection usbHost;
 static uint64_t lastEventIndex = 0;
@@ -32,6 +50,33 @@ float phaseIncrement = 0.0f;
 
 // -------- I2S driver --------
 i2s_chan_handle_t txHandle = nullptr;
+
+float getOscillatorSample() {
+  int index = (int)phase;
+  float fraction = phase - index;
+
+  int nextIndex = index + 1;
+
+  if (nextIndex >= WAVETABLE_SIZE) {
+    nextIndex = 0;
+  }
+
+  float* table =
+      (currentWaveform == WAVE_SAW)
+      ? sawTable
+      : squareTable;
+
+  float sample = table[index] +
+      (table[nextIndex] - table[index]) * fraction;
+
+  phase += phaseIncrement;
+
+  while (phase >= WAVETABLE_SIZE) {
+    phase -= WAVETABLE_SIZE;
+  }
+
+  return sample;
+}
 
 void setupAudio() {
   i2s_chan_config_t chanConfig =
@@ -78,15 +123,18 @@ void setupAudio() {
 void setNoteOff(int note);
 
 void setNoteOn(int note, int velocity) {
+
   if (velocity <= 0) {
     setNoteOff(note);
     return;
   }
 
-  float frequency = 440.0f *
-      powf(2.0f, (note - 69) / 12.0f);
+	float frequency = 440.0f *
+    powf(2.0f, (note - 69) / 12.0f);
 
-  float increment = TWO_PI * frequency / SAMPLE_RATE;
+	float increment =
+    (frequency * WAVETABLE_SIZE) / SAMPLE_RATE;
+ 
   float amplitude =
       MAX_AMPLITUDE * (velocity / 127.0f);
 
@@ -198,13 +246,9 @@ void audioTask(void* parameter) {
       float sample = 0.0f;
 
       if (currentAmplitude > 0.00001f) {
-        sample = sinf(phase) * currentAmplitude;
 
-        phase += blockPhaseIncrement;
+				sample = getOscillatorSample() * currentAmplitude;
 
-        if (phase >= TWO_PI) {
-          phase -= TWO_PI;
-        }
       }
 
       int16_t pcm = (int16_t)(sample * 32767.0f);
@@ -230,12 +274,29 @@ void audioTask(void* parameter) {
   }
 }
 
+void initializeWavetables() {
+  for (int i = 0; i < WAVETABLE_SIZE; i++) {
+    float position = (float)i / WAVETABLE_SIZE;
+
+    // Sawtooth: -1.0 to nearly +1.0
+    sawTable[i] = (2.0f * position) - 1.0f;
+
+    // Square: first half positive, second half negative
+    squareTable[i] = (position < 0.5f) ? 1.0f : -1.0f;
+  }
+
+  Serial.println("Wavetables initialized.");
+}
+
 void setup() {
+
   Serial.begin(115200);
   delay(500);
 
   Serial.println();
   Serial.println("ESP32-S3 USB MIDI Sine Synth");
+
+	initializeWavetables();
 
   setupAudio();
 
