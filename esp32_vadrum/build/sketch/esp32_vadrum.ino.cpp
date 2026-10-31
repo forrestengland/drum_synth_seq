@@ -8,8 +8,9 @@
  * (MIDI always triggers all eight voices; the switch only changes what the panel controls.)
  *
  * Controls (for the voices of the current bank)
- *   Normal mode:  encoder 1..4 turn  = volume of voice 1..4
- *                 encoder 1..4 click = preview (trigger) that voice
+ *   Normal mode:  encoder 1..4 turn        = volume of voice 1..4
+ *                 encoder 1..4 click       = preview (trigger) that voice
+ *                 encoder 1..4 press+turn  = PAN of that voice (re-triggers on release so you hear it)
  *   INST held:    encoder 1..4 turn  = TUNE / DECAY / BEND / TONE of the *selected* voice
  *                 encoder 1..4 click = select voice 1..4 of the current bank
  *
@@ -55,7 +56,7 @@ static constexpr int BANK_SW = 5;     // toggle switch to GND: open = bank A, cl
 static constexpr int   SAMPLE_RATE   = 44100;
 static constexpr int   BLOCK_FRAMES  = 128;
 static constexpr float PI_F          = 3.14159265358979323846f;
-static constexpr float MASTER_GAIN   = 0.5f;      // keep conservative until you know your output level
+static constexpr float MASTER_GAIN   = 0.7f;      // keep conservative until you know your output level
 static constexpr float ENC_STEP      = 0.02f;     // normalized change per encoder tick (50 ticks full range)
 static constexpr int   ENC_DIR       = 1;         // set to -1 to reverse all encoders
 static constexpr uint32_t DEBOUNCE_MS = 10;
@@ -67,7 +68,7 @@ static const uint8_t midiNote[8] = { 30, 31, 32, 33,      // BD, SD, CH, OH
                                      34, 35, 36, 37 };    // rim, clave, cowbell, bongo
 
 // ---------- Voice definitions ----------
-enum { P_TUNE, P_DECAY, P_BEND, P_TONE, P_LEVEL, NP };
+enum { P_TUNE, P_DECAY, P_BEND, P_TONE, P_LEVEL, P_PAN, NP };
 enum { V_BD, V_SD, V_CH, V_OH, V_RM, V_CL, V_CB, V_BG, NV };
 enum { T_BD, T_SD, T_HH, T_RIM, T_CLAVE, T_COW, T_BONGO };
 
@@ -78,19 +79,19 @@ struct VoiceDef {
     float decLo, decHi;       // seconds to -60 dB (exponential map)
     float bendMax;            // start pitch = tune * (1 + bend)
     float ptau;               // pitch env time constant (s)
-    float def[NP];            // tune, decay, bend, tone, level (normalized)
+    float def[NP];            // tune, decay, bend, tone, level, pan (normalized)
 };
 
 static const VoiceDef defs[NV] = {
-    { "BD", "CLICK", T_BD,   30.f,   120.f, 0.05f, 1.2f, 6.0f, 0.030f, {0.35f, 0.45f, 0.45f, 0.25f, 0.80f} },
-    { "SD", "NOISE", T_SD,  120.f,   400.f, 0.04f, 0.6f, 2.0f, 0.015f, {0.40f, 0.50f, 0.30f, 0.60f, 0.80f} },
-    { "CH", "RESO",  T_HH, 3000.f, 14000.f, 0.01f, 0.25f, 1.5f, 0.020f, {0.70f, 0.30f, 0.00f, 0.30f, 0.70f} },
-    { "OH", "RESO",  T_HH, 3000.f, 14000.f, 0.10f, 2.0f, 1.5f, 0.020f, {0.70f, 0.50f, 0.00f, 0.30f, 0.70f} },
+    { "BD", "CLICK", T_BD,   30.f,   120.f, 0.05f, 1.2f, 6.0f, 0.030f, {0.35f, 0.45f, 0.45f, 0.25f, 0.80f, 0.50f} },
+    { "SD", "NOISE", T_SD,  120.f,   400.f, 0.04f, 0.6f, 2.0f, 0.015f, {0.40f, 0.50f, 0.30f, 0.60f, 0.80f, 0.50f} },
+    { "CH", "RESO",  T_HH, 3000.f, 14000.f, 0.01f, 0.25f, 1.5f, 0.020f, {0.70f, 0.30f, 0.00f, 0.30f, 0.70f, 0.50f} },
+    { "OH", "RESO",  T_HH, 3000.f, 14000.f, 0.10f, 2.0f, 1.5f, 0.020f, {0.70f, 0.50f, 0.00f, 0.30f, 0.70f, 0.50f} },
     // bank B
-    { "RM", "CLICK", T_RIM,   400.f, 2500.f, 0.01f, 0.12f, 1.0f, 0.004f, {0.55f, 0.40f, 0.10f, 0.50f, 0.70f} },
-    { "CL", "CLICK", T_CLAVE, 1500.f, 3500.f, 0.02f, 0.25f, 0.5f, 0.005f, {0.50f, 0.35f, 0.10f, 0.30f, 0.70f} },
-    { "CB", "RESO",  T_COW,   300.f,  900.f, 0.05f, 0.80f, 0.3f, 0.010f, {0.45f, 0.45f, 0.00f, 0.35f, 0.65f} },
-    { "BG", "SLAP",  T_BONGO, 150.f,  600.f, 0.04f, 0.40f, 3.0f, 0.020f, {0.55f, 0.40f, 0.30f, 0.35f, 0.80f} },
+    { "RM", "CLICK", T_RIM,   400.f, 2500.f, 0.01f, 0.12f, 1.0f, 0.004f, {0.55f, 0.40f, 0.10f, 0.50f, 0.70f, 0.50f} },
+    { "CL", "CLICK", T_CLAVE, 1500.f, 3500.f, 0.02f, 0.25f, 0.5f, 0.005f, {0.50f, 0.35f, 0.10f, 0.30f, 0.70f, 0.50f} },
+    { "CB", "RESO",  T_COW,   300.f,  900.f, 0.05f, 0.80f, 0.3f, 0.010f, {0.45f, 0.45f, 0.00f, 0.35f, 0.65f, 0.50f} },
+    { "BG", "SLAP",  T_BONGO, 150.f,  600.f, 0.04f, 0.40f, 3.0f, 0.020f, {0.55f, 0.40f, 0.30f, 0.35f, 0.80f, 0.50f} },
 };
 static const char *paramName[4] = { "TUNE", "DECAY", "BEND", nullptr };
 
@@ -102,61 +103,61 @@ static std::atomic<uint8_t> trigVel[NV];    // pending trigger velocity (1..127)
 // Kept above every function on purpose: the Arduino .ino preprocessor auto-generates
 // prototypes before the first function, so types used in function signatures must already exist.
 // band-limited square (PolyBLEP) for the cowbell oscillators
-#line 104 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 105 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static float polyBlep(float t, float dt);
-#line 110 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 111 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static float blepSquare(float phase, float dt);
-#line 153 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static float clamp01(float x);
-#line 154 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static float expMap(float n, float lo, float hi);
 #line 155 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static float decCoef(float t60, float sr);
+static float clamp01(float x);
 #line 156 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static float expMap(float n, float lo, float hi);
+#line 157 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static float decCoef(float t60, float sr);
+#line 158 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static float tcCoef(float tau, float sr);
-#line 159 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 161 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static float fastSin(float p);
-#line 168 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 170 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static float fastTanh(float x);
-#line 179 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 181 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static float noiseGen(struct Voice &v);
-#line 188 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 190 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static void svf(Voice &v, float in, float g, float k, float &bp, float &hp);
-#line 201 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 203 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static void voiceTrigger(int i, float vel);
-#line 213 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 215 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static void computeParams();
-#line 243 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
-static void renderVoice(int i, float *buf);
-#line 337 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 248 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+static void renderVoice(int i, float *bufL, float *bufR);
+#line 344 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 void audioTask(void *parameter);
-#line 371 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 377 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static void handleMidiMessage(uint8_t status, uint8_t note, uint8_t velocity);
-#line 390 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 396 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static void readMidi();
-#line 428 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 434 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static int encoderPoll(int idx);
-#line 447 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 453 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static bool buttonUpdate(struct Button &b, bool &pressed);
-#line 474 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 482 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static void markDirty();
-#line 480 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 488 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static void saveState(bool verbose);
-#line 514 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 522 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static bool loadState();
-#line 536 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 544 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static void clearSavedState();
-#line 546 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 554 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static void applyBank(int newBank, bool verbose);
-#line 558 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 566 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static void printParam(int v, int k);
-#line 571 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 585 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static void adjust(int v, int k, int steps);
-#line 579 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 595 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 void setup();
-#line 680 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 696 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 void loop();
-#line 104 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
+#line 105 "/home/forrest/programming_2026/drum_synth_seq/esp32_vadrum/esp32_vadrum.ino"
 static inline float polyBlep(float t, float dt)
 {
     if (t < dt)         { t /= dt;          return t + t - t * t - 1.f; }
@@ -182,6 +183,7 @@ struct Voice {
 
 struct MP {                              // per-block mapped parameters
     float tune, bend, tone, level;
+    float gL, gR;                        // equal-power pan gains
     float coef, coef2, pcoef, chokeCoef;
     float gHp;                           // snare noise highpass
     float k, sqrtK;                      // hat resonance
@@ -194,7 +196,7 @@ struct SavedState {                      // what goes into flash
     float    p[NV][NP];
 };
 static constexpr uint32_t STATE_MAGIC   = 0x44525653;   // 'DRVS'
-static constexpr uint32_t STATE_VERSION = 2;
+static constexpr uint32_t STATE_VERSION = 3;
 
 struct Encoder {
     int      lastA = HIGH;
@@ -278,6 +280,9 @@ static void computeParams()
         m.tone  = clamp01(P[i][P_TONE]);
         m.level = clamp01(P[i][P_LEVEL]);
         m.level *= m.level;
+        float th = clamp01(P[i][P_PAN]) * (PI_F * 0.5f);
+        m.gL = cosf(th);                 // centre = 0.707 each (MASTER_GAIN compensates)
+        m.gR = sinf(th);
         m.coef  = decCoef(dec, sr);
         m.pcoef = tcCoef(d.ptau, sr);
         m.chokeCoef = decCoef(0.010f, sr);
@@ -296,7 +301,7 @@ static void computeParams()
     }
 }
 
-static void renderVoice(int i, float *buf)
+static void renderVoice(int i, float *bufL, float *bufR)
 {
     Voice &v = vo[i];
     if (!v.active) return;
@@ -376,7 +381,9 @@ static void renderVoice(int i, float *buf)
             v.ic1 = v.ic2 = 0.f;
         }
 
-        buf[n] += s * v.vel * m.level;
+        float x = s * v.vel * m.level;
+        bufL[n] += x * m.gL;
+        bufR[n] += x * m.gR;
 
         float c1 = v.choke ? m.chokeCoef : m.coef;
         float c2 = v.choke ? m.chokeCoef : m.coef2;
@@ -394,7 +401,7 @@ void audioTask(void *parameter)
 {
     (void)parameter;
     int16_t out[BLOCK_FRAMES * 2];
-    float mix[BLOCK_FRAMES];
+    float mixL[BLOCK_FRAMES], mixR[BLOCK_FRAMES];
 
     while (true) {
         for (int i = 0; i < NV; i++) {
@@ -403,14 +410,13 @@ void audioTask(void *parameter)
         }
         computeParams();
 
-        memset(mix, 0, sizeof mix);
-        for (int i = 0; i < NV; i++) renderVoice(i, mix);
+        memset(mixL, 0, sizeof mixL);
+        memset(mixR, 0, sizeof mixR);
+        for (int i = 0; i < NV; i++) renderVoice(i, mixL, mixR);
 
         for (int n = 0; n < BLOCK_FRAMES; n++) {
-            float s = fastTanh(mix[n]) * MASTER_GAIN;
-            int16_t q = (int16_t)(s * 32767.0f);
-            out[n * 2]     = q;
-            out[n * 2 + 1] = q;
+            out[n * 2]     = (int16_t)(fastTanh(mixL[n]) * MASTER_GAIN * 32767.0f);
+            out[n * 2 + 1] = (int16_t)(fastTanh(mixR[n]) * MASTER_GAIN * 32767.0f);
         }
 
         size_t written = 0;
@@ -515,6 +521,8 @@ static bool buttonUpdate(struct Button &b, bool &pressed)
 
 // ---------- UI logic ----------
 static int curVoice = V_BD;     // voice edited in INST mode (always inside the current bank)
+static bool encHeld[4] = {false, false, false, false};     // pressed while not in INST mode
+static bool encTurned[4] = {false, false, false, false};   // turned while pressed (pan edit)
 static int bank = 0;            // 0 = A (BD SD CH OH), 1 = B (RM CL CB BG)
 static uint32_t instHeldSince = 0;
 static bool instUsed = false, longDone = false;
@@ -615,18 +623,26 @@ static void printParam(int v, int k)
 {
     const VoiceDef &d = defs[v];
     float n = clamp01(P[v][k]);
-    const char *name = (k == P_TONE) ? d.toneName : (k == P_LEVEL ? "LEVEL" : paramName[k]);
+    const char *name = (k == P_TONE) ? d.toneName : (k == P_LEVEL ? "LEVEL" : (k == P_PAN ? "PAN" : paramName[k]));
     switch (k) {
     case P_TUNE:  Serial.printf("%s %s %.0f Hz\n", d.name, name, expMap(n, d.tuneLo, d.tuneHi)); break;
     case P_DECAY: Serial.printf("%s %s %.0f ms\n", d.name, name, 1000.f * expMap(n, d.decLo, d.decHi)); break;
     case P_BEND:  Serial.printf("%s %s x%.1f\n",   d.name, name, 1.f + n * d.bendMax); break;
+    case P_PAN: {
+        int p = (int)lroundf((n - 0.5f) * 200.f);
+        if (p == 0) Serial.printf("%s PAN C\n", d.name);
+        else        Serial.printf("%s PAN %c%d\n", d.name, p < 0 ? 'L' : 'R', abs(p));
+        break;
+    }
     default:      Serial.printf("%s %s %.0f%%\n",  d.name, name, n * 100.f); break;
     }
 }
 
 static void adjust(int v, int k, int steps)
 {
-    P[v][k] = clamp01(P[v][k] + steps * ENC_STEP);
+    float n = clamp01(P[v][k] + steps * ENC_STEP);
+    if (k == P_PAN && fabsf(n - 0.5f) < 0.005f) n = 0.5f;   // exact centre despite float drift
+    P[v][k] = n;
     dirtyV = v; dirtyK = k;
     markDirty();
 }
@@ -758,19 +774,33 @@ void loop()
         int steps = encoderPoll(i);
         if (steps) {
             if (shift) instUsed = true;
-            if (shift) adjust(curVoice, i, steps);            // enc 1..4 = TUNE, DECAY, BEND, TONE
-            else       adjust(bank * 4 + i, P_LEVEL, steps);  // enc i = volume of voice i in this bank
+            if (shift) {
+                adjust(curVoice, i, steps);                   // enc 1..4 = TUNE, DECAY, BEND, TONE
+            } else if (encHeld[i]) {
+                adjust(bank * 4 + i, P_PAN, steps);           // press + turn = pan
+                encTurned[i] = true;
+            } else {
+                adjust(bank * 4 + i, P_LEVEL, steps);         // turn = volume of voice i in this bank
+            }
         }
 
         // click
-        if (buttonUpdate(encBtn[i], pressed) && pressed) {
-            if (shift) {
-                instUsed = true;
-                curVoice = bank * 4 + i;
-                markDirty();
-                Serial.printf("Selected voice: %s\n", defs[curVoice].name);
-            } else {
-                trigVel[bank * 4 + i].store(100);    // preview
+        if (buttonUpdate(encBtn[i], pressed)) {
+            if (pressed) {
+                if (shift) {
+                    instUsed = true;
+                    curVoice = bank * 4 + i;
+                    markDirty();
+                    Serial.printf("Selected voice: %s\n", defs[curVoice].name);
+                } else {
+                    encHeld[i] = true;
+                    encTurned[i] = false;
+                    trigVel[bank * 4 + i].store(100);    // preview
+                }
+            } else if (encHeld[i]) {
+                encHeld[i] = false;
+                if (encTurned[i])                        // panned: audition the new position
+                    trigVel[bank * 4 + i].store(100);
             }
         }
     }
