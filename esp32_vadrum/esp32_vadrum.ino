@@ -10,20 +10,24 @@
  *
  * TONE meaning per voice: BD = click+drive, SD = noise/tone mix, hats = resonance.
  *
+ * Saved state (flash / NVS): all knob values + selected voice
+ *   - auto-saved 3 s after the last change
+ *   - or hold INST ~2 s without touching anything to save right now
+ *   - reloaded at power-up
+ *   - hold INST while powering on to wipe the saved state and start from defaults
+ *
  * MIDI notes: BD 30, SD 31, CH 32, OH 33  (edit midiNote[] below)
  */
 
 #include <Arduino.h>
 #include <atomic>
+#include <Preferences.h>
 #include <math.h>
 #include "driver/i2s_std.h"
 
 // ---------- Pins ----------
 static constexpr int MIDI_RX_PIN = 16;
 HardwareSerial MIDI(2);
-
-//static constexpr int MIDI_TX_PIN = 2;
-//HardwareSerial MIDI_OUT(1);
 
 static constexpr int I2S_BCLK = 26;
 static constexpr int I2S_LRCK = 25;
@@ -44,10 +48,13 @@ static constexpr int INST_SW = 4;
 static constexpr int   SAMPLE_RATE   = 44100;
 static constexpr int   BLOCK_FRAMES  = 128;
 static constexpr float PI_F          = 3.14159265358979323846f;
-static constexpr float MASTER_GAIN   = 0.9f;      // keep conservative until you know your output level
+static constexpr float MASTER_GAIN   = 0.5f;      // keep conservative until you know your output level
 static constexpr float ENC_STEP      = 0.02f;     // normalized change per encoder tick (50 ticks full range)
 static constexpr int   ENC_DIR       = 1;         // set to -1 to reverse all encoders
 static constexpr uint32_t DEBOUNCE_MS = 10;
+static constexpr bool     AUTO_SAVE      = true;   // save a few seconds after the last change
+static constexpr uint32_t SAVE_DELAY_MS  = 3000;
+static constexpr uint32_t LONG_PRESS_MS  = 2000;   // INST held this long, untouched = save now
 
 static const uint8_t midiNote[4] = { 30, 31, 32, 33 };   // BD, SD, CH, OH
 
@@ -96,6 +103,15 @@ struct MP {                              // per-block mapped parameters
     float gHp;                           // snare noise highpass
     float k, sqrtK;                      // hat resonance
 };
+
+struct SavedState {                      // what goes into flash
+    uint32_t magic;
+    uint32_t version;
+    uint32_t curVoice;
+    float    p[NV][NP];
+};
+static constexpr uint32_t STATE_MAGIC   = 0x44525653;   // 'DRVS'
+static constexpr uint32_t STATE_VERSION = 1;
 
 struct Encoder {
     int      lastA = HIGH;
@@ -306,13 +322,9 @@ static void handleMidiMessage(uint8_t status, uint8_t note, uint8_t velocity)
 
 static void readMidi()
 {
-	while (MIDI.available()) {
-    uint8_t b = MIDI.read();
-
-    // Forward every MIDI byte, including real-time messages
-		//    MIDI_OUT.write(b);
-
-    if (b >= 0xF8) continue;            // ignore real-time for synth parser			
+    while (MIDI.available()) {
+        uint8_t b = MIDI.read();
+        if (b >= 0xF8) continue;            // ignore real-time
 
         if (b & 0x80) {
             midiStatus = b;
@@ -379,8 +391,88 @@ static bool buttonUpdate(Button &b, bool &pressed)
 
 // ---------- UI logic ----------
 static int curVoice = V_BD;     // voice edited in INST mode
+static uint32_t instHeldSince = 0;
+static bool instUsed = false, longDone = false;
 static int dirtyV = -1, dirtyK = -1;
 static uint32_t lastPrint = 0;
+
+// ---------- Saved state ----------
+static bool        stateDirty = false;
+static uint32_t    lastChangeMs = 0;
+static SavedState  lastSaved;
+static bool        haveSaved = false;
+
+static void markDirty()
+{
+    stateDirty = true;
+    lastChangeMs = millis();
+}
+
+static void saveState(bool verbose)
+{
+    stateDirty = false;
+
+    SavedState s;
+    memset(&s, 0, sizeof s);              // zero padding so memcmp is reliable
+    s.magic = STATE_MAGIC;
+    s.version = STATE_VERSION;
+    s.curVoice = (uint32_t)curVoice;
+    for (int v = 0; v < NV; v++)
+        for (int k = 0; k < NP; k++) s.p[v][k] = P[v][k];
+
+    if (haveSaved && memcmp(&s, &lastSaved, sizeof s) == 0) {
+        if (verbose) Serial.println("State already saved");
+        return;
+    }
+
+    Preferences prefs;
+    if (!prefs.begin("drumvoice", false)) {
+        Serial.println("Save failed: cannot open NVS");
+        return;
+    }
+    size_t n = prefs.putBytes("state", &s, sizeof s);
+    prefs.end();
+
+    if (n == sizeof s) {
+        lastSaved = s;
+        haveSaved = true;
+        Serial.println("State saved");
+    } else {
+        Serial.println("Save failed: NVS write error");
+    }
+}
+
+static bool loadState()
+{
+    Preferences prefs;
+    if (!prefs.begin("drumvoice", true)) return false;   // read-only; fails if nothing saved yet
+    SavedState s;
+    size_t n = prefs.getBytes("state", &s, sizeof s);
+    prefs.end();
+
+    if (n != sizeof s || s.magic != STATE_MAGIC || s.version != STATE_VERSION || s.curVoice >= NV)
+        return false;
+    for (int v = 0; v < NV; v++)
+        for (int k = 0; k < NP; k++)
+            if (!(s.p[v][k] >= 0.f && s.p[v][k] <= 1.f)) return false;   // also rejects NaN
+
+    for (int v = 0; v < NV; v++)
+        for (int k = 0; k < NP; k++) P[v][k] = s.p[v][k];
+    curVoice = (int)s.curVoice;
+    lastSaved = s;
+    haveSaved = true;
+    return true;
+}
+
+static void clearSavedState()
+{
+    Preferences prefs;
+    if (prefs.begin("drumvoice", false)) {
+        prefs.clear();
+        prefs.end();
+    }
+    haveSaved = false;
+}
 
 static void printParam(int v, int k)
 {
@@ -399,6 +491,7 @@ static void adjust(int v, int k, int steps)
 {
     P[v][k] = clamp01(P[v][k] + steps * ENC_STEP);
     dirtyV = v; dirtyK = k;
+    markDirty();
 }
 
 // ---------- Setup / loop ----------
@@ -413,11 +506,20 @@ void setup()
         trigVel[v].store(0);
     }
 
+    // INST held at power-up = factory reset, otherwise restore the saved state
+    pinMode(INST_SW, INPUT_PULLUP);
+    delay(10);
+    if (digitalRead(INST_SW) == LOW) {
+        clearSavedState();
+        Serial.println("INST held at boot: saved state erased, using defaults");
+    } else if (loadState()) {
+        Serial.printf("Saved state restored (selected voice: %s)\n", defs[curVoice].name);
+    } else {
+        Serial.println("No valid saved state, using defaults");
+    }
+
     MIDI.begin(31250, SERIAL_8N1, MIDI_RX_PIN, -1);
     Serial.println("DIN MIDI input started on GPIO16");
-
-		//		MIDI_OUT.begin(31250, SERIAL_8N1, -1, MIDI_TX_PIN);
-		//		Serial.println("MIDI Thru output started on GPIO2");		
 
     // I2S TX
     i2s_chan_config_t chanConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
@@ -484,7 +586,7 @@ void setup()
         while (true) delay(1000);
     }
 
-    Serial.println("Drum voice ready. Selected voice: BD");
+    Serial.printf("Drum voice ready. Selected voice: %s\n", defs[curVoice].name);
 }
 
 void loop()
@@ -492,14 +594,23 @@ void loop()
     readMidi();
 
     bool pressed;
-    if (buttonUpdate(instBtn, pressed))
-        Serial.println(pressed ? "INST held - editing voice params" : "INST released - volume mode");
+    if (buttonUpdate(instBtn, pressed)) {
+        if (pressed) {
+            instHeldSince = millis();
+            instUsed = false;
+            longDone = false;
+            Serial.println("INST held - editing voice params");
+        } else {
+            Serial.println("INST released - volume mode");
+        }
+    }
     bool shift = instBtn.down;
 
     for (int i = 0; i < 4; i++) {
         // rotation
         int steps = encoderPoll(i);
         if (steps) {
+            if (shift) instUsed = true;
             if (shift) adjust(curVoice, i, steps);   // enc 1..4 = TUNE, DECAY, BEND, TONE
             else       adjust(i, P_LEVEL, steps);    // enc i = volume of voice i
         }
@@ -507,13 +618,25 @@ void loop()
         // click
         if (buttonUpdate(encBtn[i], pressed) && pressed) {
             if (shift) {
+                instUsed = true;
                 curVoice = i;
+                markDirty();
                 Serial.printf("Selected voice: %s\n", defs[i].name);
             } else {
                 trigVel[i].store(100);               // preview
             }
         }
     }
+
+    // INST held ~2 s with nothing touched = save now
+    if (shift && !instUsed && !longDone && millis() - instHeldSince >= LONG_PRESS_MS) {
+        longDone = true;
+        saveState(true);
+    }
+
+    // debounced auto-save
+    if (AUTO_SAVE && stateDirty && millis() - lastChangeMs >= SAVE_DELAY_MS)
+        saveState(false);
 
     // print the last-touched parameter at most every 40 ms so fast turns don't flood the UART
     if (dirtyV >= 0 && millis() - lastPrint >= 40) {
