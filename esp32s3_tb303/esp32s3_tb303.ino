@@ -48,6 +48,9 @@ float currentAmplitude = 0.0f;
 float phase = 0.0f;
 float phaseIncrement = 0.0f;
 
+// waveform switch
+#define WAVE_SWITCH_PIN 4
+
 // -------- I2S driver --------
 i2s_chan_handle_t txHandle = nullptr;
 
@@ -288,6 +291,29 @@ void initializeWavetables() {
   Serial.println("Wavetables initialized.");
 }
 
+void updateWaveformSwitch() {
+  static Waveform lastWaveform = WAVE_SAW;
+
+  Waveform selectedWaveform =
+      digitalRead(WAVE_SWITCH_PIN) == LOW
+      ? WAVE_SQUARE
+      : WAVE_SAW;
+
+  if (selectedWaveform != lastWaveform) {
+    portENTER_CRITICAL(&synthMux);
+    currentWaveform = selectedWaveform;
+    portEXIT_CRITICAL(&synthMux);
+
+    lastWaveform = selectedWaveform;
+
+    Serial.println(
+        currentWaveform == WAVE_SAW
+        ? "Waveform: SAW"
+        : "Waveform: SQUARE"
+    );
+  }
+}
+
 void setup() {
 
   Serial.begin(115200);
@@ -322,10 +348,13 @@ void setup() {
   usbHost.begin();
   midiHandler.begin();
 
+	pinMode(WAVE_SWITCH_PIN, INPUT_PULLUP);	
+
   Serial.println("USB MIDI initialized.");
   Serial.println("Press a key on your MIDI keyboard.");
 }
 
 void loop() {
   processMidi();
+  updateWaveformSwitch();
 }
