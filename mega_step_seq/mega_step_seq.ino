@@ -32,7 +32,13 @@ const uint8_t ENC_SW = 20;
 const uint8_t MIDI_CH = 0;                       // channel 1 on the wire
 const uint8_t NOTES[8] = {30, 31, 32, 33, 34, 35, 36, 37};
 const uint8_t VELOCITY_NORMAL = 100;
-const uint8_t VELOCITY_ACCENT = 127;
+
+//const uint8_t VELOCITY_ACCENT = 127;
+const uint8_t ACCENT_MIN = 1;
+const uint8_t ACCENT_MAX = 127;
+
+uint8_t accentLevel = 127;
+
 // EEPROM busy indicator: checkerboard flipping between two frames. Bit i = LED i.
 // Assumes two rows of 8 (LEDs 0-7 top row, 8-15 bottom row). For a single row of 16 use 0x5555 / 0xAAAA.
 const uint16_t LOAD_FRAME_A = 0xAA55;           // top row: even LEDs, bottom row: odd LEDs
@@ -188,7 +194,16 @@ void playStep() {
     uint8_t p = stepCounter % chLen(curPat, c);
     if (steps[curPat][c][p >> 4] & (1u << (p & 15))) {
       if (noteOn[c]) midiOff(NOTES[c]);
-      midiOn(NOTES[c], (accents[curPat][p >> 4] & (1u << (p & 15))) ? VELOCITY_ACCENT : VELOCITY_NORMAL);
+
+			//      midiOn(NOTES[c], (accents[curPat][p >> 4] & (1u << (p & 15))) ? VELOCITY_ACCENT : VELOCITY_NORMAL);
+
+			uint8_t velocity =
+				(accents[curPat][p >> 4] & (1u << (p & 15)))
+				? VELOCITY_NORMAL
+				: accentLevel;
+
+			midiOn(NOTES[c], velocity);
+			
       noteOn[c] = true;
       offTime[c] = now + gate;
     }
@@ -430,6 +445,18 @@ void updateLeds() {
   }
 }
 
+void updateAccentLevel() {
+  static uint32_t lastRead = 0;
+
+  if (millis() - lastRead < 20) return;
+  lastRead = millis();
+
+  int potValue = analogRead(A0);
+
+  accentLevel = map(potValue, 0, 1023,
+                    ACCENT_MIN, ACCENT_MAX);
+}
+
 // ---------- Setup / loop ----------
 void setup() {
   Serial1.begin(31250);                         // MIDI notes out
@@ -460,5 +487,6 @@ void loop() {
   handleButtons();
   checkSaveCombo();
   handleEncoder();
+	updateAccentLevel();
   updateLeds();
 }
