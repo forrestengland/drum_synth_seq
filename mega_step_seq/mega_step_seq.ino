@@ -8,6 +8,8 @@
 //   none      : toggle step in viewed bank (current channel)
 //   Shift A   : 1-8 channel, 9-12 bank 1-4, 13-16 spare
 //   Shift B   : 1-8 pattern, 9-15 spare, 16 (hold 1 s) = save to EEPROM
+//   Encoder   : turn = tempo (40-240 BPM, accelerates), push + turn = swing (0-66%).
+//               LEDs show a bar graph of the value for 1 s. Tempo/swing are saved with the pattern save.
 //   Accent held (no shift): step buttons toggle accents for the viewed bank. One accent
 //             track per pattern, shared by all channels (indexed by each lane's own step).
 //   A + B     : set last step of current channel = bank*16 + button
@@ -22,15 +24,22 @@ const uint8_t SHIFT_A_PIN = 7;
 const uint8_t SHIFT_B_PIN = 6;
 const uint8_t PLAY_PIN = 5;
 const uint8_t ACCENT_PIN = 4;
-const uint8_t TEMPO_POT = A0;
-const uint8_t SWING_POT = A1;
+const uint8_t ENC_A = 2;                        // interrupt pins (INT4 / INT5)
+const uint8_t ENC_B = 3;
+const uint8_t ENC_SW = 20;
 
 // ---------- MIDI config ----------
 const uint8_t MIDI_CH = 0;                       // channel 1 on the wire
 const uint8_t NOTES[8] = {30, 31, 32, 33, 34, 35, 36, 37};
-const uint8_t VELOCITY_NORMAL = 60;
+const uint8_t VELOCITY_NORMAL = 100;
 const uint8_t VELOCITY_ACCENT = 127;
-const uint32_t CLOCK_LEAD_US = 30000;             // clock leads the notes by this much (compensates slaved gear's latency; tune by ear)
+// EEPROM busy indicator: checkerboard flipping between two frames. Bit i = LED i.
+// Assumes two rows of 8 (LEDs 0-7 top row, 8-15 bottom row). For a single row of 16 use 0x5555 / 0xAAAA.
+const uint16_t LOAD_FRAME_A = 0xAA55;           // top row: even LEDs, bottom row: odd LEDs
+const uint16_t LOAD_FRAME_B = 0x55AA;           // inverse
+const uint16_t BUSY_FRAME_MS = 150;             // time per frame
+const uint16_t BOOT_ANIM_MS = 600;              // minimum time the pattern shows at power-up (0 = off)
+const uint32_t CLOCK_LEAD_US = 5000;             // clock leads the notes by this much (compensates slaved gear's latency; tune by ear)
 
 // ---------- Data ----------
 uint16_t steps[8][8][4];     // [pattern][channel][bank] -> 16 step bits
@@ -51,13 +60,17 @@ uint8_t swingPct = 0;
 bool noteOn[8];
 uint32_t offTime[8];
 
+// 1. Force a forward declaration at the absolute top of the file
+struct Settings_t; 
+typedef struct Settings_t Settings;
+
 // ---------- Buttons ----------
 struct Btn {
   uint8_t pin;
   bool down;
   uint32_t t;
 };
-Btn stepB[16], shiftA, shiftB, playB, accentB;
+Btn stepB[16], shiftA, shiftB, playB, accentB, encSw;
 
 void initBtn(Btn &b, uint8_t pin) {
   b.pin = pin; b.down = false; b.t = 0;
@@ -86,47 +99,83 @@ void allNotesOff() {
   }
 }
 
-// ---------- Pots ----------
-// One ADC read per call (non-blocking), alternating pots. The first read after switching ADC
-// channel is discarded (mux settling), readings are smoothed (EMA), and a deadband stops the
-// final value flipping on noise. Tempo is whole BPM, swing is whole percent.
-int32_t tempoAcc = 0, swingAcc = 0;             // smoothed reading x16
-uint16_t bpm = 120;
-bool potTurn = false;
+// ---------- Encoder (tempo / swing) ----------
+// Full-step Gray-code state machine (one count per detent), decoded in a pin-change interrupt.
+#define R_START     0x0
+#define R_CW_FINAL  0x1
+#define R_CW_BEGIN  0x2
+#define R_CW_NEXT   0x3
+#define R_CCW_BEGIN 0x4
+#define R_CCW_FINAL 0x5
+#define R_CCW_NEXT  0x6
+#define DIR_CW      0x10
+#define DIR_CCW     0x20
 
-float potToUnit(int32_t acc) {                  // 0.0 .. 1.0, dead ends trimmed so extremes are reachable
-  float v = (acc / 16.0f - 8.0f) / 1007.0f;
-  return constrain(v, 0.0f, 1.0f);
+const uint8_t encTable[7][4] = {
+  {R_START,    R_CW_BEGIN,  R_CCW_BEGIN, R_START},              // R_START
+  {R_CW_NEXT,  R_START,     R_CW_FINAL,  R_START | DIR_CW},     // R_CW_FINAL
+  {R_CW_NEXT,  R_CW_BEGIN,  R_START,     R_START},              // R_CW_BEGIN
+  {R_CW_NEXT,  R_CW_BEGIN,  R_CW_FINAL,  R_START},              // R_CW_NEXT
+  {R_CCW_NEXT, R_START,     R_CCW_BEGIN, R_START},              // R_CCW_BEGIN
+  {R_CCW_NEXT, R_CCW_FINAL, R_START,     R_START | DIR_CCW},    // R_CCW_FINAL
+  {R_CCW_NEXT, R_CCW_FINAL, R_CCW_BEGIN, R_START}               // R_CCW_NEXT
+};
+
+volatile uint8_t encState = R_START;
+volatile int8_t encDelta = 0;                   // detents since last read (+ = clockwise)
+
+uint16_t bpm = 120;
+bool readoutSwing = false;                      // which value the LED bar graph shows
+uint32_t readoutUntil = 0;                      // LED bar graph visible until this time (millis)
+
+void encISR() {
+  uint8_t pinState = (digitalRead(ENC_B) << 1) | digitalRead(ENC_A);
+  encState = encTable[encState & 0x0F][pinState];
+  uint8_t dir = encState & 0x30;
+  if (dir == DIR_CW) encDelta++;
+  else if (dir == DIR_CCW) encDelta--;
 }
 
-void applyPots() {
-  float bpmF = 40.0f + potToUnit(tempoAcc) * 200.0f;
-  if (fabs(bpmF - bpm) > 0.75f) bpm = (uint16_t)(bpmF + 0.5f);       // deadband
-  float swF = potToUnit(swingAcc) * 66.0f;
-  if (fabs(swF - swingPct) > 0.75f) swingPct = (uint8_t)(swF + 0.5f);
+void applyTempo() {
   stepLenUs = 15000000UL / bpm;                 // 16th notes
 }
 
-void readPots() {                               // call every ~2 ms
-  if (potTurn) {
-    analogRead(SWING_POT);                      // discard
-    swingAcc += ((int32_t)analogRead(SWING_POT) * 16 - swingAcc) >> 3;
-  } else {
-    analogRead(TEMPO_POT);                      // discard
-    tempoAcc += ((int32_t)analogRead(TEMPO_POT) * 16 - tempoAcc) >> 3;
-  }
-  potTurn = !potTurn;
-  applyPots();
+void initEncoder() {
+  pinMode(ENC_A, INPUT_PULLUP);
+  pinMode(ENC_B, INPUT_PULLUP);
+  initBtn(encSw, ENC_SW);
+  attachInterrupt(digitalPinToInterrupt(ENC_A), encISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_B), encISR, CHANGE);
 }
 
-void initPots() {
-  analogRead(TEMPO_POT);
-  tempoAcc = (int32_t)analogRead(TEMPO_POT) * 16;
-  analogRead(SWING_POT);
-  swingAcc = (int32_t)analogRead(SWING_POT) * 16;
-  bpm = 40 + (uint16_t)(potToUnit(tempoAcc) * 200.0f + 0.5f);
-  swingPct = (uint8_t)(potToUnit(swingAcc) * 66.0f + 0.5f);
-  stepLenUs = 15000000UL / bpm;
+void handleEncoder() {
+  pressed(encSw);                               // keep debounce state current
+
+  noInterrupts();
+  int8_t d = encDelta;
+  encDelta = 0;
+  interrupts();
+  if (d == 0) return;
+
+  // acceleration: slow turns = 1 per click, faster turns jump
+  static uint32_t lastTurn = 0;
+  uint32_t now = millis();
+  uint32_t dt = now - lastTurn;
+  lastTurn = now;
+  int16_t mult = 1;
+  if (abs(d) > 1 || dt < 30) mult = 5;
+  else if (dt < 80) mult = 2;
+  int16_t delta = d * mult;
+
+  if (encSw.down) {                             // push + turn = swing
+    swingPct = constrain((int16_t)swingPct + delta, 0, 66);
+    readoutSwing = true;
+  } else {                                      // turn = tempo
+    bpm = constrain((int16_t)bpm + delta, 40, 240);
+    readoutSwing = false;
+    applyTempo();
+  }
+  readoutUntil = now + 1000;
 }
 
 // ---------- Sequencer ----------
@@ -203,6 +252,19 @@ const int EE_LAST  = EE_STEPS + sizeof(steps);
 const int EE_ACC   = EE_LAST + sizeof(lastStep);
 const int EE_SUM   = EE_ACC + sizeof(accents);
 
+// Tempo + swing live in their own block so the pattern save stays valid.
+const int EE_SET = 700;
+
+typedef struct Settings_t {
+  uint16_t bpm;
+  uint8_t swing;
+  uint8_t check;
+} Settings;
+
+uint8_t settingsCheck(const Settings &st) {
+  return (st.bpm & 0xFF) ^ (st.bpm >> 8) ^ st.swing ^ 0x5A;
+}
+
 uint32_t flashUntil = 0;                        // all LEDs on until this time (save confirmation)
 
 uint16_t dataChecksum() {
@@ -238,15 +300,56 @@ bool loadState() {
   return true;
 }
 
+void loadSettings() {
+  Settings st;
+  EEPROM.get(EE_SET, st);
+  if (st.check == settingsCheck(st) && st.bpm >= 40 && st.bpm <= 240 && st.swing <= 66) {
+    bpm = st.bpm;
+    swingPct = st.swing;
+  }                                             // else keep 120 BPM / 0% swing
+  applyTempo();
+}
+
+// ---------- Busy indicator + animated EEPROM writes ----------
+int8_t lastBusyPhase = -1;
+
+void busyAnim(uint32_t t0) {                    // call repeatedly while busy; redraws on frame change
+  int8_t phase = ((millis() - t0) / BUSY_FRAME_MS) & 1;
+  if (phase == lastBusyPhase) return;
+  lastBusyPhase = phase;
+  uint16_t m = phase ? LOAD_FRAME_B : LOAD_FRAME_A;
+  for (uint8_t i = 0; i < 16; i++) digitalWrite(STEP_LED[i], (m >> i) & 1);
+}
+
+// Writes only changed bytes, keeping the animation running between (slow, ~3 ms) writes
+void eeWrite(int addr, const void *src, size_t n, uint32_t t0) {
+  const uint8_t *p = (const uint8_t *)src;
+  for (size_t i = 0; i < n; i++) {
+    EEPROM.update(addr + i, p[i]);
+    busyAnim(t0);
+  }
+}
+
+void saveSettings(uint32_t t0) {
+  Settings st = {bpm, swingPct, 0};
+  st.check = settingsCheck(st);
+  eeWrite(EE_SET, &st, sizeof(st), t0);
+}
+
 void saveState() {
   allNotesOff();                                // writes block for a moment
-  EEPROM.put(EE_STEPS, steps);                  // put() only writes bytes that changed
-  EEPROM.put(EE_LAST, lastStep);
-  EEPROM.put(EE_ACC, accents);
-  EEPROM.put(EE_SUM, dataChecksum());
-  EEPROM.put(EE_MAGIC, SAVE_MAGIC);             // magic last, so a partial save is never valid
+  uint32_t t0 = millis();
+  lastBusyPhase = -1;
+  eeWrite(EE_STEPS, steps, sizeof(steps), t0);
+  eeWrite(EE_LAST, lastStep, sizeof(lastStep), t0);
+  eeWrite(EE_ACC, accents, sizeof(accents), t0);
+  uint16_t sum = dataChecksum();
+  eeWrite(EE_SUM, &sum, sizeof(sum), t0);
+  saveSettings(t0);
+  uint32_t magic = SAVE_MAGIC;                  // magic last, so a partial save is never valid
+  eeWrite(EE_MAGIC, &magic, sizeof(magic), t0);
   if (running) tickTime = micros();             // resync clock after the blocking write
-  flashUntil = millis() + 400;
+  flashUntil = millis() + 400;                  // all-on confirmation
 }
 
 // Shift B + step 16 held for 1 second = save
@@ -298,6 +401,11 @@ void updateLeds() {
     for (uint8_t i = 0; i < 16; i++) digitalWrite(STEP_LED[i], HIGH);
     return;
   }
+  if ((int32_t)(millis() - readoutUntil) < 0) { // encoder readout: bar graph from the left
+    uint8_t n = readoutSwing ? 1 + (swingPct * 15) / 66 : 1 + ((bpm - 40) * 15) / 200;
+    for (uint8_t i = 0; i < 16; i++) digitalWrite(STEP_LED[i], i < n);
+    return;
+  }
   bool a = shiftA.down, b = shiftB.down;
   uint8_t last = lastStep[curPat][curCh];
 
@@ -335,17 +443,22 @@ void setup() {
   initBtn(playB, PLAY_PIN);
   initBtn(accentB, ACCENT_PIN);
 
+  uint32_t bootT0 = millis();
+  lastBusyPhase = -1;
+  busyAnim(bootT0);                             // show the pattern while loading
   initDefaults();
   loadState();                                  // restore last save if present
 
-  initPots();
+  initEncoder();
+  loadSettings();                               // restore saved tempo/swing, else 120 BPM / 0%
+  while (millis() - bootT0 < BOOT_ANIM_MS) busyAnim(bootT0);   // hold so it is visible
+  for (uint8_t i = 0; i < 16; i++) digitalWrite(STEP_LED[i], LOW);
 }
 
 void loop() {
-  static uint32_t potT = 0;
   runClock();                                   // timing first
   handleButtons();
   checkSaveCombo();
-  if (millis() - potT >= 2) { potT = millis(); readPots(); }
+  handleEncoder();
   updateLeds();
 }
