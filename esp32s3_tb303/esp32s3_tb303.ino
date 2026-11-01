@@ -7,6 +7,15 @@
 
 #include "driver/i2s_std.h"
 
+// pots
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
+
+#define I2C_SDA 11
+#define I2C_SCL 12
+
+Adafruit_ADS1115 ads;
+
 // -------- I2S wiring --------
 constexpr int I2S_BCLK = 5;
 constexpr int I2S_LRCK = 6;
@@ -314,6 +323,16 @@ void updateWaveformSwitch() {
   }
 }
 
+float readCutoffPot() {
+  int16_t raw = ads.readADC_SingleEnded(0);
+
+  // GAIN_ONE uses a +/-4.096V measurement range.
+  // Convert the reading to a 0.0 - 1.0 range.
+  float normalized = raw / 26400.0f;
+
+  return constrain(normalized, 0.0f, 1.0f);
+}
+
 void setup() {
 
   Serial.begin(115200);
@@ -352,9 +371,34 @@ void setup() {
 
   Serial.println("USB MIDI initialized.");
   Serial.println("Press a key on your MIDI keyboard.");
+
+	Wire.begin(I2C_SDA, I2C_SCL);
+
+	if (!ads.begin(0x48)) {
+		Serial.println("ADS1115 initialization failed!");
+
+		while (true) {
+			delay(1000);
+		}
+	}
+
+	ads.setGain(GAIN_ONE);
+
+	Serial.println("ADS1115 initialized.");
+ 
 }
 
 void loop() {
   processMidi();
   updateWaveformSwitch();
+
+  static uint32_t lastPotRead = 0;
+
+  if (millis() - lastPotRead >= 100) {
+    lastPotRead = millis();
+
+    float cutoff = readCutoffPot();
+
+    Serial.printf("Cutoff: %.3f\n", cutoff);
+  }
 }
