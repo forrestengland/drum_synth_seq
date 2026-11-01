@@ -77,23 +77,18 @@ float processFilter(
     float coefficient,
     float resonance
 ) {
-  // Resonance feedback with soft saturation.
-  float x = tanhf(
-      (input * 2.0f) -
-      (filterStage[3] * resonance * 3.5f)
-  );
+    // Resonance feedback.
+    float feedback = filterStage[3] * resonance * 3.0f;
 
-  // Four cascaded low-pass stages.
-  for (int i = 0; i < 4; i++) {
-    float stageOutput = tanhf(filterStage[i]);
+    float x = input - feedback;
 
-    filterStage[i] +=
-        coefficient * (x - stageOutput);
+    // Four cascaded low-pass stages.
+    for (int i = 0; i < 4; i++) {
+        filterStage[i] += coefficient * (x - filterStage[i]);
+        x = filterStage[i];
+    }
 
-    x = filterStage[i];
-  }
-
-  return x;
+    return x;
 }
 
 float getOscillatorSample() {
@@ -393,6 +388,7 @@ float readCutoffPot() {
 }
 
 void updateSynthControls() {
+
   static uint32_t lastRead = 0;
 
   if (millis() - lastRead < 20) {
@@ -423,7 +419,7 @@ void updateSynthControls() {
 
   // Convert normalized readings to synth parameters.
   float newCutoff = 80.0f * powf(150.0f, pot0);
-  float newResonance = pot1 * 0.95f;
+  float newResonance = pot1 * 0.75f;
   float newEnvDepth = pot2 * 8000.0f;
   float newDecay = 50.0f + pot3 * 1450.0f;
 
