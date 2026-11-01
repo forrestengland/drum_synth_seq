@@ -7,6 +7,10 @@
 
 #include "driver/i2s_std.h"
 
+// 5 pin midi in
+#define MIDI_RX_PIN 16
+#define MIDI_TX_PIN -1
+
 // pots
 #include <Wire.h>
 #include <Adafruit_ADS1X15.h>
@@ -553,6 +557,17 @@ void setup() {
 	ads.setDataRate(RATE_ADS1115_860SPS);
 
 	Serial.println("ADS1115 initialized.");
+
+ Serial2.begin(
+        31250,
+        SERIAL_8N1,
+        MIDI_RX_PIN,
+        MIDI_TX_PIN
+							 );
+
+ Serial.println("DIN MIDI input ready");
+
+ 
  
 }
 
@@ -560,5 +575,11 @@ void loop() {
   processMidi();
   updateWaveformSwitch();
   updateSynthControls();
-	printSynthControls();
+	//	printSynthControls();
+
+    while (Serial2.available()) {
+        uint8_t data = Serial2.read();
+
+        Serial.printf("%02X ", data);
+    }	
 }
