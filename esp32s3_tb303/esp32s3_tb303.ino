@@ -66,8 +66,35 @@ float filterResonance = 0.0f;
 float filterEnvDepth = 0.0f;
 float envelopeDecay = 500.0f;
 
+// -------- Resonant low-pass filter --------
+float filterStage[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
 // -------- I2S driver --------
 i2s_chan_handle_t txHandle = nullptr;
+
+float processFilter(
+    float input,
+    float coefficient,
+    float resonance
+) {
+  // Resonance feedback with soft saturation.
+  float x = tanhf(
+      (input * 2.0f) -
+      (filterStage[3] * resonance * 3.5f)
+  );
+
+  // Four cascaded low-pass stages.
+  for (int i = 0; i < 4; i++) {
+    float stageOutput = tanhf(filterStage[i]);
+
+    filterStage[i] +=
+        coefficient * (x - stageOutput);
+
+    x = filterStage[i];
+  }
+
+  return x;
+}
 
 float getOscillatorSample() {
   int index = (int)phase;
@@ -236,15 +263,33 @@ void audioTask(void* parameter) {
   constexpr float RAMP_STEP =
       1.0f / (SAMPLE_RATE * 0.005f);
 
-  for (;;) {
+	for (;;) {
     float blockTargetAmplitude;
+    float blockCutoff;
+    float blockResonance;
     float blockPhaseIncrement;
 
-    // Snapshot parameters shared with MIDI processing.
     portENTER_CRITICAL(&synthMux);
+
     blockTargetAmplitude = targetAmplitude;
     blockPhaseIncrement = phaseIncrement;
+
+    blockCutoff = filterCutoff;
+    blockResonance = filterResonance;
+
     portEXIT_CRITICAL(&synthMux);
+
+    // Calculate filter coefficient once per block.
+    float cutoff = constrain(
+        blockCutoff,
+        20.0f,
+        SAMPLE_RATE * 0.45f
+    );
+
+    float filterCoefficient =
+        1.0f - expf(
+            -TWO_PI * cutoff / SAMPLE_RATE
+        );
 
     for (int i = 0; i < BLOCK_FRAMES; i++) {
       if (currentAmplitude < blockTargetAmplitude) {
@@ -264,8 +309,16 @@ void audioTask(void* parameter) {
       float sample = 0.0f;
 
       if (currentAmplitude > 0.00001f) {
+				float oscillatorSample = getOscillatorSample();
 
-				sample = getOscillatorSample() * currentAmplitude;
+				float filteredSample = processFilter(
+																						 oscillatorSample,
+																						 filterCoefficient,
+																						 blockResonance
+																						 );
+
+				sample = filteredSample * currentAmplitude;
+				//				sample = getOscillatorSample() * currentAmplitude;
 
       }
 
@@ -460,6 +513,7 @@ void setup() {
 	}
 
 	ads.setGain(GAIN_ONE);
+	ads.setDataRate(RATE_ADS1115_860SPS);
 
 	Serial.println("ADS1115 initialized.");
  
