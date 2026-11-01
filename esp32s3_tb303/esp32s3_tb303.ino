@@ -60,6 +60,12 @@ float phaseIncrement = 0.0f;
 // waveform switch
 #define WAVE_SWITCH_PIN 4
 
+// -------- Synth controls --------
+float filterCutoff = 1000.0f;
+float filterResonance = 0.0f;
+float filterEnvDepth = 0.0f;
+float envelopeDecay = 500.0f;
+
 // -------- I2S driver --------
 i2s_chan_handle_t txHandle = nullptr;
 
@@ -333,6 +339,77 @@ float readCutoffPot() {
   return constrain(normalized, 0.0f, 1.0f);
 }
 
+void updateSynthControls() {
+  static uint32_t lastRead = 0;
+
+  if (millis() - lastRead < 20) {
+    return;
+  }
+
+  lastRead = millis();
+
+  float pot0 = constrain(
+      ads.readADC_SingleEnded(0) / 26400.0f,
+      0.0f, 1.0f
+  );
+
+  float pot1 = constrain(
+      ads.readADC_SingleEnded(1) / 26400.0f,
+      0.0f, 1.0f
+  );
+
+  float pot2 = constrain(
+      ads.readADC_SingleEnded(2) / 26400.0f,
+      0.0f, 1.0f
+  );
+
+  float pot3 = constrain(
+      ads.readADC_SingleEnded(3) / 26400.0f,
+      0.0f, 1.0f
+  );
+
+  // Convert normalized readings to synth parameters.
+  float newCutoff = 80.0f * powf(150.0f, pot0);
+  float newResonance = pot1 * 0.95f;
+  float newEnvDepth = pot2 * 8000.0f;
+  float newDecay = 50.0f + pot3 * 1450.0f;
+
+  portENTER_CRITICAL(&synthMux);
+
+  filterCutoff = newCutoff;
+  filterResonance = newResonance;
+  filterEnvDepth = newEnvDepth;
+  envelopeDecay = newDecay;
+
+  portEXIT_CRITICAL(&synthMux);
+}
+
+void printSynthControls() {
+  static uint32_t lastPrint = 0;
+
+  if (millis() - lastPrint < 500) {
+    return;
+  }
+
+  lastPrint = millis();
+
+  float cutoff, resonance, envDepth, decay;
+
+  portENTER_CRITICAL(&synthMux);
+
+  cutoff = filterCutoff;
+  resonance = filterResonance;
+  envDepth = filterEnvDepth;
+  decay = envelopeDecay;
+
+  portEXIT_CRITICAL(&synthMux);
+
+  Serial.printf(
+    "Cutoff: %.0f Hz | Resonance: %.2f | Env: %.0f Hz | Decay: %.0f ms\n",
+    cutoff, resonance, envDepth, decay
+  );
+}
+
 void setup() {
 
   Serial.begin(115200);
@@ -391,14 +468,6 @@ void setup() {
 void loop() {
   processMidi();
   updateWaveformSwitch();
-
-  static uint32_t lastPotRead = 0;
-
-  if (millis() - lastPotRead >= 100) {
-    lastPotRead = millis();
-
-    float cutoff = readCutoffPot();
-
-    Serial.printf("Cutoff: %.3f\n", cutoff);
-  }
+  updateSynthControls();
+	printSynthControls();
 }
