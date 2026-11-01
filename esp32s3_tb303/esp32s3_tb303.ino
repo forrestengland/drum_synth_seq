@@ -13,6 +13,13 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
+// encoder button debounce
+#define ENCODER_DEBOUNCE_MS 50
+
+bool lastButtonReading = HIGH;
+bool stableButtonState = HIGH;
+uint32_t lastButtonChange = 0;
+
 // encoder
 #define ENCODER_CLK 13
 #define ENCODER_DT  14
@@ -140,8 +147,37 @@ void setupEncoder() {
     lastEncoderCLK = digitalRead(ENCODER_CLK);
 }
 
+void updateEncoderButton() {
+
+	bool reading = digitalRead(ENCODER_SW);
+
+    if (reading != lastButtonReading) {
+        lastButtonChange = millis();
+        lastButtonReading = reading;
+    }
+
+    if ((millis() - lastButtonChange) >= ENCODER_DEBOUNCE_MS) {
+        if (reading != stableButtonState) {
+            stableButtonState = reading;
+
+            // Trigger only once when button is pressed
+            if (stableButtonState == LOW) {
+                pattern[selectedStep].active =
+                    !pattern[selectedStep].active;
+
+                displayDirty = true;
+
+                Serial.printf("Step %d active: %d\n",
+                              selectedStep + 1,
+                              pattern[selectedStep].active);
+            }
+        }
+    }
+}
+
 void updateEncoder() {
-    int clk = digitalRead(ENCODER_CLK);
+
+	int clk = digitalRead(ENCODER_CLK);
 
     if (clk != lastEncoderCLK && clk == LOW) {
         if (digitalRead(ENCODER_DT) != clk) {
@@ -151,13 +187,19 @@ void updateEncoder() {
         }
 
         Serial.println(encoderPosition);
+
+				selectedStep = ((encoderPosition % NUM_STEPS) + NUM_STEPS) % NUM_STEPS;
+				displayDirty = true;
     }
 
     lastEncoderCLK = clk;
 
-    if (digitalRead(ENCODER_SW) == LOW) {
+		//  if (digitalRead(ENCODER_SW) == LOW) {
         // Button pressed
-    }
+		//			pattern[selectedStep].active = !pattern[selectedStep].active;
+		//			displayDirty = true;
+		//    }
+		updateEncoderButton();
 }
 
 float processFilter(
