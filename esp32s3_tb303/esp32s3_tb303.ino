@@ -13,6 +13,25 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
+#include "esp_timer.h"
+
+// Sync mode switch
+#define SYNC_SWITCH_PIN 8
+
+enum SyncMode {
+    SYNC_EXTERNAL,
+    SYNC_INTERNAL
+};
+
+SyncMode syncMode = SYNC_EXTERNAL;
+
+// Internal tempo
+float internalBpm = 120.0f;
+constexpr float MIN_BPM = 40.0f;
+constexpr float MAX_BPM = 240.0f;
+
+esp_timer_handle_t internalClockTimer = nullptr;
+
 // encoder button debounce
 #define ENCODER_DEBOUNCE_MS 50
 
@@ -155,6 +174,34 @@ Adafruit_SSD1306 display(
     OLED_RESET
 );
 
+void internalClockCallback(void* arg) {
+
+    if (syncMode != SYNC_INTERNAL) {
+        return;
+    }
+
+    currentStep = (currentStep + 1) % NUM_STEPS;
+
+    triggerSequencerStep();
+
+    displayDirty = true;
+}
+
+void restartInternalClock() {
+
+    if (esp_timer_is_active(internalClockTimer)) {
+        esp_timer_stop(internalClockTimer);
+    }
+
+    uint64_t interval =
+        (uint64_t)(60000000.0f / (internalBpm * 4.0f));
+
+    esp_timer_start_periodic(
+        internalClockTimer,
+        interval
+    );
+}
+
 void setupEncoder() {
 
 	pinMode(ENCODER_CLK, INPUT_PULLUP);
@@ -220,6 +267,8 @@ void updateEncoderButton() {
 
 void updateEncoder() {
 
+	updateEncoderButton();
+
 	int clk = digitalRead(ENCODER_CLK);
 
     if (clk != lastEncoderCLK && clk == LOW) {
@@ -233,41 +282,59 @@ void updateEncoder() {
 
 				selectedStep = ((encoderPosition % NUM_STEPS) + NUM_STEPS) % NUM_STEPS;
 				displayDirty = true;
-    }
+    }		
 
     lastEncoderCLK = clk;
 
 		clk = digitalRead(ENCODER2_CLK);
 
-    if (clk != lastEncoder2CLK && clk == LOW) {
+		if (clk != lastEncoder2CLK && clk == LOW) {
 
 			int lastpos = encoder2Position;
 
 			if (digitalRead(ENCODER2_DT) != clk) {
-            encoder2Position++;
-        } else {
-            encoder2Position--;
+        encoder2Position++;
+			} else {
+        encoder2Position--;
+			}
+
+			int delta = encoder2Position - lastpos;
+
+			if (stableButton2State == LOW) {
+
+        // Push + turn: adjust internal tempo.
+        internalBpm += delta;
+
+        internalBpm = constrain(
+																internalBpm,
+																MIN_BPM,
+																MAX_BPM
+																);
+
+        if (syncMode == SYNC_INTERNAL) {
+					restartInternalClock();
         }
 
-			//				Serial.print("encoder 2 position: ");
-			//        Serial.println(encoder2Position);
+        Serial.printf(
+											"Internal tempo: %.0f BPM\n",
+											internalBpm
+											);
 
-				int note = pattern[selectedStep].note + (encoder2Position - lastpos);
-				if (note < 0) note = 0;
-				if (note >= 128) note = 127;
-				pattern[selectedStep].note = note;
-				
-				displayDirty = true;
-    }
+			} else {
 
-    lastEncoder2CLK = clk;
+        // Normal rotation: adjust selected step note.
+        int note =
+					pattern[selectedStep].note + delta;
 
-		//  if (digitalRead(ENCODER_SW) == LOW) {
-        // Button pressed
-		//			pattern[selectedStep].active = !pattern[selectedStep].active;
-		//			displayDirty = true;
-		//    }
-		updateEncoderButton();
+        note = constrain(note, 0, 127);
+
+        pattern[selectedStep].note = note;
+			}
+
+			displayDirty = true;
+		}
+
+		lastEncoder2CLK = clk;		
 }
 
 float processFilter(
@@ -761,6 +828,11 @@ void getNoteName(uint8_t note, char* output, size_t outputSize) {
 }
 
 void handleMidiClock(uint8_t data) {
+
+    if (syncMode != SYNC_EXTERNAL) {
+        return;
+    }
+
     switch (data) {
 
         case 0xFA:  // MIDI Start
@@ -886,20 +958,34 @@ void updateDisplay() {
     display.setCursor(0, 0);
     display.print("TB-303");
 
-    // External clock indicator.
-    display.setCursor(66, 0);
-    display.print("EXT");
+		display.setCursor(66, 0);
 
-    char tempoText[8];
+		if (syncMode == SYNC_INTERNAL) {
+			display.print("INT");
+		} else {
+			display.print("EXT");
+		}
 
-    if (externalBpm > 0.0f) {
-        snprintf(tempoText, sizeof(tempoText), "%3.0f", externalBpm);
-    } else {
-        snprintf(tempoText, sizeof(tempoText), "---");
-    }
+		char tempoText[8];
 
-    display.setCursor(98, 0);
-    display.print(tempoText);
+		float displayedBpm =
+			syncMode == SYNC_INTERNAL
+			? internalBpm
+			: externalBpm;
+
+		if (displayedBpm > 0.0f) {
+			snprintf(
+							 tempoText,
+							 sizeof(tempoText),
+							 "%3.0f",
+							 displayedBpm
+							 );
+		} else {
+			snprintf(tempoText, sizeof(tempoText), "---");
+		}
+
+		display.setCursor(98, 0);
+		display.print(tempoText);		
 
     // Small indicator: filled when running, outlined when stopped.
     if (midiRunning) {
@@ -994,7 +1080,73 @@ void updateDisplay() {
     display.display();
 }
 
+void updateSyncSwitch() {
+
+    static int lastReading = HIGH;
+    static int stableReading = HIGH;
+    static uint32_t lastChange = 0;
+
+    int reading = digitalRead(SYNC_SWITCH_PIN);
+
+    if (reading != lastReading) {
+        lastChange = millis();
+        lastReading = reading;
+    }
+
+    if (millis() - lastChange < 30) {
+        return;
+    }
+
+    if (reading == stableReading) {
+        return;
+    }
+
+    stableReading = reading;
+
+    SyncMode newMode =
+        reading == LOW
+        ? SYNC_INTERNAL
+        : SYNC_EXTERNAL;
+
+    if (newMode == syncMode) {
+        return;
+    }
+
+    syncMode = newMode;
+
+    // Stop the previous clock source.
+    if (esp_timer_is_active(internalClockTimer)) {
+        esp_timer_stop(internalClockTimer);
+    }
+
+    stopSequencerNote();
+
+    clockCount = 0;
+    lastClockMicros = 0;
+    midiRunning = false;
+
+    currentStep = 0;
+
+    if (syncMode == SYNC_INTERNAL) {
+
+        // Trigger the first step immediately.
+        triggerSequencerStep();
+
+        restartInternalClock();
+
+        Serial.println("SYNC: INTERNAL");
+
+    } else {
+
+        Serial.println("SYNC: EXTERNAL");
+    }
+
+    displayDirty = true;
+}
+
 void setup() {
+
+	pinMode(SYNC_SWITCH_PIN, INPUT_PULLUP);
 
   Serial.begin(115200);
   delay(500);
@@ -1077,6 +1229,17 @@ void setup() {
 	display.display();  */
 
 	setupEncoder();
+
+	esp_timer_create_args_t timerArgs = {
+    .callback = &internalClockCallback,
+    .arg = nullptr,
+    .dispatch_method = ESP_TIMER_TASK,
+    .name = "internal_clock"
+	};
+
+	ESP_ERROR_CHECK(
+									esp_timer_create(&timerArgs, &internalClockTimer)
+									);	
  
 }
 
@@ -1092,6 +1255,7 @@ void loop() {
     }
 
 		updateEncoder();
+		updateSyncSwitch();		
 
     updateDisplay();
 }
