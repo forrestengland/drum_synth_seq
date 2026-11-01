@@ -69,6 +69,9 @@ float envelopeDecay = 500.0f;
 // -------- Resonant low-pass filter --------
 float filterStage[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
+// -------- Filter envelope --------
+bool filterEnvelopeTrigger = false;
+
 // -------- I2S driver --------
 i2s_chan_handle_t txHandle = nullptr;
 
@@ -178,11 +181,16 @@ void setNoteOn(int note, int velocity) {
   float amplitude =
       MAX_AMPLITUDE * (velocity / 127.0f);
 
-  portENTER_CRITICAL(&synthMux);
-  activeNote = note;
-  phaseIncrement = increment;
-  targetAmplitude = amplitude;
-  portEXIT_CRITICAL(&synthMux);
+	portENTER_CRITICAL(&synthMux);
+
+	activeNote = note;
+	phaseIncrement = increment;
+	targetAmplitude = amplitude;
+
+	// Trigger a new filter envelope.
+	filterEnvelopeTrigger = true;
+
+	portEXIT_CRITICAL(&synthMux);
 
   Serial.printf(
       "NOTE ON: %d, frequency: %.2f Hz, velocity: %d\n",
@@ -258,33 +266,59 @@ void audioTask(void* parameter) {
   constexpr float RAMP_STEP =
       1.0f / (SAMPLE_RATE * 0.005f);
 
+	float filterEnvelope = 0.0f;
+
 	for (;;) {
     float blockTargetAmplitude;
     float blockCutoff;
     float blockResonance;
     float blockPhaseIncrement;
+		float blockDecay;
+		float blockEnvDepth;
+		bool triggerEnvelope;
 
     portENTER_CRITICAL(&synthMux);
 
     blockTargetAmplitude = targetAmplitude;
-    blockPhaseIncrement = phaseIncrement;
-
+		//    blockPhaseIncrement = phaseIncrement;
     blockCutoff = filterCutoff;
     blockResonance = filterResonance;
+		blockEnvDepth = filterEnvDepth;
+		blockDecay = envelopeDecay;
+
+		// consume the trigger
+		triggerEnvelope = filterEnvelopeTrigger;
+		filterEnvelopeTrigger = false;
 
     portEXIT_CRITICAL(&synthMux);
 
-    // Calculate filter coefficient once per block.
-    float cutoff = constrain(
-        blockCutoff,
-        20.0f,
-        SAMPLE_RATE * 0.45f
-    );
+		// Restart envelope when a new MIDI note arrives.
+		if (triggerEnvelope) {
+			filterEnvelope = 1.0f;
+		}
 
-    float filterCoefficient =
-        1.0f - expf(
-            -TWO_PI * cutoff / SAMPLE_RATE
-        );
+		// Calculate exponential envelope decay.
+		// blockDecay is expressed in milliseconds.
+		float decayMultiplier = expf(
+																 -1.0f / (blockDecay * 0.001f * SAMPLE_RATE)
+																 );
+
+		// Apply envelope depth to the base cutoff.
+		float effectiveCutoff =
+			blockCutoff + (blockEnvDepth * filterEnvelope);
+
+		effectiveCutoff = constrain(
+																effectiveCutoff,
+																20.0f,
+																SAMPLE_RATE * 0.45f
+																);
+
+		// Calculate filter coefficient.
+		float filterCoefficient =
+			1.0f - expf(
+									-TWO_PI * effectiveCutoff / SAMPLE_RATE
+									);		
+
 
     for (int i = 0; i < BLOCK_FRAMES; i++) {
       if (currentAmplitude < blockTargetAmplitude) {
@@ -322,6 +356,13 @@ void audioTask(void* parameter) {
       // Duplicate mono signal to left and right.
       buffer[i * 2] = pcm;
       buffer[i * 2 + 1] = pcm;
+
+			// Advance filter envelope.
+			filterEnvelope *= decayMultiplier;
+
+			if (filterEnvelope < 0.0001f) {
+				filterEnvelope = 0.0f;
+			}
     }
 
     size_t bytesWritten = 0;
