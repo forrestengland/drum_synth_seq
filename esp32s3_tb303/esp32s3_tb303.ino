@@ -20,14 +20,24 @@ bool lastButtonReading = HIGH;
 bool stableButtonState = HIGH;
 uint32_t lastButtonChange = 0;
 
-// encoder
+bool lastButton2Reading = HIGH;
+bool stableButton2State = HIGH;
+uint32_t lastButton2Change = 0;
+
+// encoders
 #define ENCODER_CLK 13
 #define ENCODER_DT  14
 #define ENCODER_SW  15
 
+#define ENCODER2_CLK 17
+#define ENCODER2_DT  18
+#define ENCODER2_SW  21
 
 int lastEncoderCLK = HIGH;
 int encoderPosition = 0;
+
+int lastEncoder2CLK = HIGH;
+int encoder2Position = 0;
 
 // clock
 // MIDI clock / sequencer state
@@ -140,11 +150,19 @@ Adafruit_SSD1306 display(
 );
 
 void setupEncoder() {
-    pinMode(ENCODER_CLK, INPUT_PULLUP);
+
+	pinMode(ENCODER_CLK, INPUT_PULLUP);
     pinMode(ENCODER_DT, INPUT_PULLUP);
     pinMode(ENCODER_SW, INPUT_PULLUP);
 
     lastEncoderCLK = digitalRead(ENCODER_CLK);
+
+	pinMode(ENCODER2_CLK, INPUT_PULLUP);
+    pinMode(ENCODER2_DT, INPUT_PULLUP);
+    pinMode(ENCODER2_SW, INPUT_PULLUP);
+
+    lastEncoder2CLK = digitalRead(ENCODER2_CLK);
+		
 }
 
 void updateEncoderButton() {
@@ -173,6 +191,25 @@ void updateEncoderButton() {
             }
         }
     }
+
+	reading = digitalRead(ENCODER2_SW);
+
+    if (reading != lastButton2Reading) {
+        lastButton2Change = millis();
+        lastButton2Reading = reading;
+    }
+
+    if ((millis() - lastButton2Change) >= ENCODER_DEBOUNCE_MS) {
+        if (reading != stableButton2State) {
+            stableButton2State = reading;
+
+            // Trigger only once when button is pressed
+            if (stableButton2State == LOW) {
+                Serial.printf("encoder 2 pressed\n");
+            }
+        }
+    }
+		
 }
 
 void updateEncoder() {
@@ -193,6 +230,31 @@ void updateEncoder() {
     }
 
     lastEncoderCLK = clk;
+
+		clk = digitalRead(ENCODER2_CLK);
+
+    if (clk != lastEncoder2CLK && clk == LOW) {
+
+			int lastpos = encoder2Position;
+
+			if (digitalRead(ENCODER2_DT) != clk) {
+            encoder2Position++;
+        } else {
+            encoder2Position--;
+        }
+
+				Serial.print("encoder 2 position: ");
+        Serial.println(encoder2Position);
+
+				int note = pattern[selectedStep].note + (encoder2Position - lastpos);
+				if (note < 0) note = 0;
+				if (note >= 128) note = 127;
+				pattern[selectedStep].note = note;
+				
+				displayDirty = true;
+    }
+
+    lastEncoder2CLK = clk;
 
 		//  if (digitalRead(ENCODER_SW) == LOW) {
         // Button pressed
