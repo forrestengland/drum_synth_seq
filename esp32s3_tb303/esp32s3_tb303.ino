@@ -118,6 +118,12 @@ float currentAmplitude = 0.0f;
 float phase = 0.0f;
 float phaseIncrement = 0.0f;
 
+int manualNote = -1;
+int manualVelocity = 0;
+
+int sequencerNote = -1;
+int sequencerVelocity = 0;
+
 // waveform switch
 #define WAVE_SWITCH_PIN 4
 
@@ -185,9 +191,9 @@ void updateEncoderButton() {
 
                 displayDirty = true;
 
-                Serial.printf("Step %d active: %d\n",
+								/*                Serial.printf("Step %d active: %d\n",
                               selectedStep + 1,
-                              pattern[selectedStep].active);
+                              pattern[selectedStep].active); */
             }
         }
     }
@@ -205,7 +211,7 @@ void updateEncoderButton() {
 
             // Trigger only once when button is pressed
             if (stableButton2State == LOW) {
-                Serial.printf("encoder 2 pressed\n");
+							//                Serial.printf("encoder 2 pressed\n");
             }
         }
     }
@@ -223,7 +229,7 @@ void updateEncoder() {
             encoderPosition--;
         }
 
-        Serial.println(encoderPosition);
+				//        Serial.println(encoderPosition);
 
 				selectedStep = ((encoderPosition % NUM_STEPS) + NUM_STEPS) % NUM_STEPS;
 				displayDirty = true;
@@ -243,8 +249,8 @@ void updateEncoder() {
             encoder2Position--;
         }
 
-				Serial.print("encoder 2 position: ");
-        Serial.println(encoder2Position);
+			//				Serial.print("encoder 2 position: ");
+			//        Serial.println(encoder2Position);
 
 				int note = pattern[selectedStep].note + (encoder2Position - lastpos);
 				if (note < 0) note = 0;
@@ -349,60 +355,105 @@ void setupAudio() {
 
   ESP_ERROR_CHECK(i2s_channel_enable(txHandle));
 
-  Serial.println("I2S audio started.");
+	//  Serial.println("I2S audio started.");
 }
 
-void setNoteOff(int note);
+void updateSynthVoice() {
+    // Manual keyboard notes take priority.
+    int note = manualNote >= 0 ? manualNote : sequencerNote;
+    int velocity = manualNote >= 0
+        ? manualVelocity
+        : sequencerVelocity;
+
+    if (note < 0) {
+        portENTER_CRITICAL(&synthMux);
+        activeNote = -1;
+        targetAmplitude = 0.0f;
+        portEXIT_CRITICAL(&synthMux);
+        return;
+    }
+
+    float frequency = 440.0f *
+        powf(2.0f, (note - 69) / 12.0f);
+
+    float increment =
+        (frequency * WAVETABLE_SIZE) / SAMPLE_RATE;
+
+    float amplitude =
+        MAX_AMPLITUDE * (velocity / 127.0f);
+
+    portENTER_CRITICAL(&synthMux);
+
+    // Only retrigger the filter envelope if the pitch changes.
+    if (activeNote != note) {
+        filterEnvelopeTrigger = true;
+    }
+
+    activeNote = note;
+    phaseIncrement = increment;
+    targetAmplitude = amplitude;
+
+    portEXIT_CRITICAL(&synthMux);
+
+		//    Serial.printf("SYNTH NOTE: %d velocity: %d\n",
+		//                  note, velocity);
+}
 
 void setNoteOn(int note, int velocity) {
+    if (velocity <= 0) {
+        setNoteOff(note);
+        return;
+    }
 
-  if (velocity <= 0) {
-    setNoteOff(note);
-    return;
-  }
+    manualNote = note;
+    manualVelocity = velocity;
 
-	float frequency = 440.0f *
-    powf(2.0f, (note - 69) / 12.0f);
-
-	float increment =
-    (frequency * WAVETABLE_SIZE) / SAMPLE_RATE;
- 
-  float amplitude =
-      MAX_AMPLITUDE * (velocity / 127.0f);
-
-	portENTER_CRITICAL(&synthMux);
-
-	activeNote = note;
-	phaseIncrement = increment;
-	targetAmplitude = amplitude;
-
-	// Trigger a new filter envelope.
-	filterEnvelopeTrigger = true;
-
-	portEXIT_CRITICAL(&synthMux);
-
-  Serial.printf(
-      "NOTE ON: %d, frequency: %.2f Hz, velocity: %d\n",
-      note, frequency, velocity
-  );
+    updateSynthVoice();
 }
 
 void setNoteOff(int note) {
-  bool released = false;
+    if (manualNote == note) {
+        manualNote = -1;
+        manualVelocity = 0;
 
-  portENTER_CRITICAL(&synthMux);
+        updateSynthVoice();
+    }
+}
 
-  if (activeNote == note) {
-    targetAmplitude = 0.0f;
-    activeNote = -1;
-    released = true;
-  }
+void triggerSequencerStep() {
+    // Release the previous sequencer note.
+    sequencerNote = -1;
+    sequencerVelocity = 0;
 
-  portEXIT_CRITICAL(&synthMux);
+    Step& step = pattern[currentStep];
 
-  if (released) {
-    Serial.printf("NOTE OFF: %d\n", note);
-  }
+    if (step.active) {
+        sequencerNote = step.note;
+
+        // Accent steps use maximum velocity.
+        sequencerVelocity = step.accent ? 127 : 100;
+
+				/*        Serial.printf(
+            "SEQUENCER STEP %d: NOTE ON %d velocity %d\n",
+            currentStep + 1,
+            sequencerNote,
+            sequencerVelocity */
+				//        );
+    } else {
+	/*        Serial.printf(
+            "SEQUENCER STEP %d: REST\n",
+            currentStep + 1
+						); */
+    }
+
+    updateSynthVoice();
+}
+
+void stopSequencerNote() {
+    sequencerNote = -1;
+    sequencerVelocity = 0;
+
+    updateSynthVoice();
 }
 
 void processMidi() {
@@ -443,7 +494,7 @@ void processMidi() {
     } else {
       // Includes Note On with velocity zero.
       setNoteOff(note);
-      Serial.printf("MIDI channel: %d\n", channel);
+			//      Serial.printf("MIDI channel: %d\n", channel);
     }
   }
 }
@@ -565,7 +616,7 @@ void audioTask(void* parameter) {
     );
 
     if (result != ESP_OK) {
-      Serial.printf("I2S write error: %d\n", result);
+			//      Serial.printf("I2S write error: %d\n", result);
     }
   }
 }
@@ -581,7 +632,7 @@ void initializeWavetables() {
     squareTable[i] = (position < 0.5f) ? 1.0f : -1.0f;
   }
 
-  Serial.println("Wavetables initialized.");
+	//  Serial.println("Wavetables initialized.");
 }
 
 void updateWaveformSwitch() {
@@ -599,11 +650,11 @@ void updateWaveformSwitch() {
 
     lastWaveform = selectedWaveform;
 
-    Serial.println(
+		/*    Serial.println(
         currentWaveform == WAVE_SAW
         ? "Waveform: SAW"
         : "Waveform: SQUARE"
-    );
+				); */
   }
 }
 
@@ -683,10 +734,10 @@ void printSynthControls() {
 
   portEXIT_CRITICAL(&synthMux);
 
-  Serial.printf(
+	/*  Serial.printf(
     "Cutoff: %.0f Hz | Resonance: %.2f | Env: %.0f Hz | Decay: %.0f ms\n",
     cutoff, resonance, envDepth, decay
-  );
+		); */
 }
 
 //uint8_t clockCount = 0;
@@ -721,9 +772,11 @@ void handleMidiClock(uint8_t data) {
             averageClockInterval = 0.0f;
             externalBpm = 0.0f;
 
+						triggerSequencerStep();
+
             displayDirty = true;
 
-            Serial.println("MIDI START");
+						//            Serial.println("MIDI START");
             break;
 
         case 0xFB:  // MIDI Continue
@@ -734,16 +787,18 @@ void handleMidiClock(uint8_t data) {
 
             displayDirty = true;
 
-            Serial.println("MIDI CONTINUE");
+						//            Serial.println("MIDI CONTINUE");
             break;
 
         case 0xFC:  // MIDI Stop
             midiRunning = false;
             lastClockMicros = 0;
 
+						stopSequencerNote();
+
             displayDirty = true;
 
-            Serial.println("MIDI STOP");
+						//            Serial.println("MIDI STOP");
             break;
 
         case 0xF8:  // MIDI Clock
@@ -790,12 +845,14 @@ void handleMidiClock(uint8_t data) {
                     currentStep =
                         (currentStep + 1) % NUM_STEPS;
 
+										triggerSequencerStep();
+
                     displayDirty = true;
 
-                    Serial.printf(
+										/*                    Serial.printf(
                         "Step: %u\n",
                         currentStep + 1
-                    );
+												); */
                 }
             }
 
@@ -1000,7 +1057,7 @@ void setup() {
 
 	Serial.println("DIN MIDI input ready");
 
-	Wire.setClock(100000);
+	//	Wire.setClock(100000);
 
 	if (!display.begin(
 										 SSD1306_SWITCHCAPVCC,
