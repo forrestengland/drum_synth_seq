@@ -504,6 +504,38 @@ void printSynthControls() {
   );
 }
 
+uint8_t clockCount = 0;
+uint32_t stepCount = 0;
+
+void handleMidiClock(uint8_t data) {
+    switch (data) {
+        case 0xFA:  // Start
+            clockCount = 0;
+            stepCount = 0;
+            Serial.println("MIDI START");
+            break;
+
+        case 0xFB:  // Continue
+            Serial.println("MIDI CONTINUE");
+            break;
+
+        case 0xFC:  // Stop
+            Serial.println("MIDI STOP");
+            break;
+
+        case 0xF8:  // Clock
+            clockCount++;
+
+            if (clockCount >= 6) {
+                clockCount = 0;
+                stepCount = (stepCount + 1) % 16;
+
+                Serial.printf("Step: %u\n", stepCount + 1);
+            }
+            break;
+    }
+}
+
 void setup() {
 
   Serial.begin(115200);
@@ -580,6 +612,7 @@ void loop() {
     while (Serial2.available()) {
         uint8_t data = Serial2.read();
 
-        Serial.printf("%02X ", data);
+				//       Serial.printf("%02X ", data);
+				handleMidiClock(data);
     }	
 }
