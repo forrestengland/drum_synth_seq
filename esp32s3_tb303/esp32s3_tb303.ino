@@ -13,6 +13,34 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
+// clock
+// MIDI clock / sequencer state
+uint8_t clockCount = 0;
+bool midiRunning = false;
+
+uint32_t lastClockMicros = 0;
+float averageClockInterval = 0.0f;
+float externalBpm = 0.0f;
+
+// OLED refresh state
+bool displayDirty = true;
+uint32_t lastDisplayUpdate = 0;
+
+// sequence
+#define NUM_STEPS 16
+
+struct Step {
+    uint8_t note = 60;  // Middle C
+    bool active = false;
+    bool accent = false;
+    bool slide = false;
+};
+
+Step pattern[NUM_STEPS];
+
+uint8_t currentStep = 0;
+uint8_t selectedStep = 0;
+
 // 5 pin midi in
 #define MIDI_RX_PIN 16
 #define MIDI_TX_PIN -1
@@ -520,36 +548,252 @@ void printSynthControls() {
   );
 }
 
-uint8_t clockCount = 0;
-uint32_t stepCount = 0;
+//uint8_t clockCount = 0;
+//uint32_t stepCount = 0;
+
+void getNoteName(uint8_t note, char* output, size_t outputSize) {
+    static const char* noteNames[] = {
+        "C", "C#", "D", "D#", "E", "F",
+        "F#", "G", "G#", "A", "A#", "B"
+    };
+
+    int octave = (note / 12) - 1;
+
+    snprintf(
+        output,
+        outputSize,
+        "%s%d",
+        noteNames[note % 12],
+        octave
+    );
+}
 
 void handleMidiClock(uint8_t data) {
     switch (data) {
-        case 0xFA:  // Start
+
+        case 0xFA:  // MIDI Start
             clockCount = 0;
-            stepCount = 0;
+            currentStep = 0;
+            midiRunning = true;
+
+            lastClockMicros = 0;
+            averageClockInterval = 0.0f;
+            externalBpm = 0.0f;
+
+            displayDirty = true;
+
             Serial.println("MIDI START");
             break;
 
-        case 0xFB:  // Continue
+        case 0xFB:  // MIDI Continue
+            midiRunning = true;
+
+            // Avoid measuring the pause as a clock interval.
+            lastClockMicros = 0;
+
+            displayDirty = true;
+
             Serial.println("MIDI CONTINUE");
             break;
 
-        case 0xFC:  // Stop
+        case 0xFC:  // MIDI Stop
+            midiRunning = false;
+            lastClockMicros = 0;
+
+            displayDirty = true;
+
             Serial.println("MIDI STOP");
             break;
 
-        case 0xF8:  // Clock
-            clockCount++;
+        case 0xF8:  // MIDI Clock
+        {
+            uint32_t now = micros();
 
-            if (clockCount >= 6) {
-                clockCount = 0;
-                stepCount = (stepCount + 1) % 16;
+            // Measure the time between clock pulses.
+            if (lastClockMicros != 0) {
+                uint32_t interval = now - lastClockMicros;
 
-                Serial.printf("Step: %u\n", stepCount + 1);
+                // Ignore unusually long or short intervals.
+                if (interval >= 1000 && interval <= 1000000) {
+
+                    if (averageClockInterval == 0.0f) {
+                        averageClockInterval = interval;
+                    } else {
+                        // Smooth out clock jitter.
+                        averageClockInterval =
+                            averageClockInterval * 0.85f +
+                            interval * 0.15f;
+                    }
+
+                    // MIDI clock = 24 pulses per quarter note.
+                    float newBpm =
+                        60000000.0f /
+                        (averageClockInterval * 24.0f);
+
+                    if (fabsf(newBpm - externalBpm) >= 0.5f) {
+                        externalBpm = newBpm;
+                        displayDirty = true;
+                    }
+                }
             }
+
+            lastClockMicros = now;
+
+            if (midiRunning) {
+                clockCount++;
+
+                // Six MIDI clock pulses = one sixteenth note.
+                if (clockCount >= 6) {
+                    clockCount = 0;
+
+                    currentStep =
+                        (currentStep + 1) % NUM_STEPS;
+
+                    displayDirty = true;
+
+                    Serial.printf(
+                        "Step: %u\n",
+                        currentStep + 1
+                    );
+                }
+            }
+
             break;
+        }
     }
+}
+
+void updateDisplay() {
+    // Only refresh when something has changed.
+    if (!displayDirty) {
+        return;
+    }
+
+    // Limit refresh rate to 20 Hz.
+    if (millis() - lastDisplayUpdate < 50) {
+        return;
+    }
+
+    lastDisplayUpdate = millis();
+    displayDirty = false;
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+
+    // --------------------------------
+    // Header
+    // --------------------------------
+
+    display.setCursor(0, 0);
+    display.print("TB-303");
+
+    // External clock indicator.
+    display.setCursor(66, 0);
+    display.print("EXT");
+
+    char tempoText[8];
+
+    if (externalBpm > 0.0f) {
+        snprintf(tempoText, sizeof(tempoText), "%3.0f", externalBpm);
+    } else {
+        snprintf(tempoText, sizeof(tempoText), "---");
+    }
+
+    display.setCursor(98, 0);
+    display.print(tempoText);
+
+    // Small indicator: filled when running, outlined when stopped.
+    if (midiRunning) {
+        display.fillCircle(60, 4, 2, SSD1306_WHITE);
+    } else {
+        display.drawCircle(60, 4, 2, SSD1306_WHITE);
+    }
+
+    // --------------------------------
+    // First row: steps 1-8
+    // --------------------------------
+
+    for (int i = 0; i < 8; i++) {
+        int x = 2 + (i * 16);
+        int y = 19;
+
+        // Step number.
+        display.setCursor(x, 10);
+        display.print(i + 1);
+
+        // Active step.
+        if (pattern[i].active) {
+            display.fillRect(x, y, 7, 7, SSD1306_WHITE);
+        } else {
+            display.drawPixel(x + 3, y + 3, SSD1306_WHITE);
+        }
+
+        // Playback position.
+        if (currentStep == i) {
+            display.drawRect(x - 1, y - 1, 9, 9, SSD1306_WHITE);
+        }
+
+        // Editing selection.
+        if (selectedStep == i) {
+            display.drawFastHLine(x, 27, 7, SSD1306_WHITE);
+        }
+    }
+
+    // --------------------------------
+    // Second row: steps 9-16
+    // --------------------------------
+
+    for (int i = 8; i < 16; i++) {
+        int x = 2 + ((i - 8) * 16);
+        int y = 38;
+
+        // Step number.
+        display.setCursor(x, 29);
+        display.print(i + 1);
+
+        // Active step.
+        if (pattern[i].active) {
+            display.fillRect(x, y, 7, 7, SSD1306_WHITE);
+        } else {
+            display.drawPixel(x + 3, y + 3, SSD1306_WHITE);
+        }
+
+        // Playback position.
+        if (currentStep == i) {
+            display.drawRect(x - 1, y - 1, 9, 9, SSD1306_WHITE);
+        }
+
+        // Editing selection.
+        if (selectedStep == i) {
+            display.drawFastHLine(x, 46, 7, SSD1306_WHITE);
+        }
+    }
+
+    // --------------------------------
+    // Selected step information
+    // --------------------------------
+
+    char noteText[8];
+    getNoteName(pattern[selectedStep].note, noteText, sizeof(noteText));
+
+    display.setCursor(0, 55);
+
+    char statusText[24];
+
+    snprintf(
+        statusText,
+        sizeof(statusText),
+        "S%02d %s %s %s",
+        selectedStep + 1,
+        noteText,
+        pattern[selectedStep].accent ? "ACC" : "---",
+        pattern[selectedStep].slide ? "SLD" : "---"
+    );
+
+    display.print(statusText);
+
+    display.display();
 }
 
 void setup() {
@@ -615,7 +859,6 @@ void setup() {
 
 	Serial.println("DIN MIDI input ready");
 
-	Wire.begin(11, 12);
 	Wire.setClock(100000);
 
 	if (!display.begin(
@@ -627,26 +870,26 @@ void setup() {
 	}
 
  
-	display.clearDisplay();
+	/*	display.clearDisplay();
 	display.setTextColor(SSD1306_WHITE);
 	display.setTextSize(1);
 	display.setCursor(0, 0);
 	display.println("TB-303");
 	display.println("OLED ready");
-	display.display();  
+	display.display();  */
  
 }
 
 void loop() {
-  processMidi();
-  updateWaveformSwitch();
-  updateSynthControls();
-	//	printSynthControls();
+    processMidi();
+
+    updateWaveformSwitch();
+    updateSynthControls();
 
     while (Serial2.available()) {
         uint8_t data = Serial2.read();
+        handleMidiClock(data);
+    }
 
-				//       Serial.printf("%02X ", data);
-				handleMidiClock(data);
-    }	
+    updateDisplay();
 }
