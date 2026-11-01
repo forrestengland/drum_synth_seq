@@ -13,6 +13,15 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
+// encoder
+#define ENCODER_CLK 13
+#define ENCODER_DT  14
+#define ENCODER_SW  15
+
+
+int lastEncoderCLK = HIGH;
+int encoderPosition = 0;
+
 // clock
 // MIDI clock / sequencer state
 uint8_t clockCount = 0;
@@ -122,6 +131,34 @@ Adafruit_SSD1306 display(
     &Wire,
     OLED_RESET
 );
+
+void setupEncoder() {
+    pinMode(ENCODER_CLK, INPUT_PULLUP);
+    pinMode(ENCODER_DT, INPUT_PULLUP);
+    pinMode(ENCODER_SW, INPUT_PULLUP);
+
+    lastEncoderCLK = digitalRead(ENCODER_CLK);
+}
+
+void updateEncoder() {
+    int clk = digitalRead(ENCODER_CLK);
+
+    if (clk != lastEncoderCLK && clk == LOW) {
+        if (digitalRead(ENCODER_DT) != clk) {
+            encoderPosition++;
+        } else {
+            encoderPosition--;
+        }
+
+        Serial.println(encoderPosition);
+    }
+
+    lastEncoderCLK = clk;
+
+    if (digitalRead(ENCODER_SW) == LOW) {
+        // Button pressed
+    }
+}
 
 float processFilter(
     float input,
@@ -877,6 +914,8 @@ void setup() {
 	display.println("TB-303");
 	display.println("OLED ready");
 	display.display();  */
+
+	setupEncoder();
  
 }
 
@@ -890,6 +929,8 @@ void loop() {
         uint8_t data = Serial2.read();
         handleMidiClock(data);
     }
+
+		updateEncoder();
 
     updateDisplay();
 }
