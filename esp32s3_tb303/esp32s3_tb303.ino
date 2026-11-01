@@ -7,14 +7,17 @@
 
 #include "driver/i2s_std.h"
 
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
 // 5 pin midi in
 #define MIDI_RX_PIN 16
 #define MIDI_TX_PIN -1
 
 // pots
-#include <Wire.h>
-#include <Adafruit_ADS1X15.h>
-
 #define I2C_SDA 11
 #define I2C_SCL 12
 
@@ -78,6 +81,19 @@ bool filterEnvelopeTrigger = false;
 
 // -------- I2S driver --------
 i2s_chan_handle_t txHandle = nullptr;
+
+// display
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_ADDRESS 0x3C
+
+Adafruit_SSD1306 display(
+    SCREEN_WIDTH,
+    SCREEN_HEIGHT,
+    &Wire,
+    OLED_RESET
+);
 
 float processFilter(
     float input,
@@ -590,16 +606,34 @@ void setup() {
 
 	Serial.println("ADS1115 initialized.");
 
- Serial2.begin(
-        31250,
-        SERIAL_8N1,
-        MIDI_RX_PIN,
-        MIDI_TX_PIN
-							 );
+	Serial2.begin(
+								31250,
+								SERIAL_8N1,
+								MIDI_RX_PIN,
+								MIDI_TX_PIN
+								);
 
- Serial.println("DIN MIDI input ready");
+	Serial.println("DIN MIDI input ready");
+
+	Wire.begin(11, 12);
+	Wire.setClock(100000);
+
+	if (!display.begin(
+										 SSD1306_SWITCHCAPVCC,
+										 OLED_ADDRESS
+										 )) {
+		Serial.println("OLED initialization failed");
+		while (true);
+	}
 
  
+	display.clearDisplay();
+	display.setTextColor(SSD1306_WHITE);
+	display.setTextSize(1);
+	display.setCursor(0, 0);
+	display.println("TB-303");
+	display.println("OLED ready");
+	display.display();  
  
 }
 
