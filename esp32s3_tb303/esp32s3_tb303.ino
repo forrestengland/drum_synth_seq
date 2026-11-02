@@ -15,6 +15,7 @@
 
 #include "esp_timer.h"
 
+
 // Sync mode switch
 #define SYNC_SWITCH_PIN 8
 
@@ -52,11 +53,16 @@ uint32_t lastButton2Change = 0;
 #define ENCODER2_DT  18
 #define ENCODER2_SW  21
 
-int lastEncoderCLK = HIGH;
+// Gray-code encoder state
+
+int encoderPosition = 0;
+int encoder2Position = 0;
+
+/*int lastEncoderCLK = HIGH;
 int encoderPosition = 0;
 
 int lastEncoder2CLK = HIGH;
-int encoder2Position = 0;
+int encoder2Position = 0; */
 
 // clock
 // MIDI clock / sequencer state
@@ -168,11 +174,107 @@ i2s_chan_handle_t txHandle = nullptr;
 #define OLED_ADDRESS 0x3C
 
 Adafruit_SSD1306 display(
-    SCREEN_WIDTH,
-    SCREEN_HEIGHT,
-    &Wire,
-    OLED_RESET
+    SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET,
+    400000UL, 400000UL   // clkDuring, clkAfter
 );
+
+// ---------- Interrupt-driven encoders ----------
+#define ENCODER_TRANSITIONS_PER_DETENT 4   // try 2 if your encoder gives 2 counts per click
+
+struct Encoder {
+    uint8_t clkPin;
+    uint8_t dtPin;
+    volatile uint8_t state;
+    volatile int8_t accumulator;
+    volatile int32_t detents;
+};
+
+Encoder enc1 = { ENCODER_CLK,  ENCODER_DT,  0, 0, 0 };
+Encoder enc2 = { ENCODER2_CLK, ENCODER2_DT, 0, 0, 0 };
+
+static const DRAM_ATTR int8_t encoderTable[16] = {
+     0, -1,  1,  0,
+     1,  0,  0, -1,
+    -1,  0,  0,  1,
+     0,  1, -1,  0
+};
+
+void IRAM_ATTR encoderISR(void* arg) {
+    Encoder* e = (Encoder*)arg;
+
+    uint8_t current =
+        (gpio_get_level((gpio_num_t)e->clkPin) << 1) |
+         gpio_get_level((gpio_num_t)e->dtPin);
+
+    int8_t movement = encoderTable[(e->state << 2) | current];
+    e->state = current;
+
+    e->accumulator += movement;
+
+    if (e->accumulator >= ENCODER_TRANSITIONS_PER_DETENT) {
+        e->accumulator = 0;
+        e->detents++;
+    } else if (e->accumulator <= -ENCODER_TRANSITIONS_PER_DETENT) {
+        e->accumulator = 0;
+        e->detents--;
+    }
+}
+
+// Returns detents since last call and clears the counter.
+int32_t takeEncoderDetents(Encoder& e) {
+    portENTER_CRITICAL(&synthMux);
+    int32_t d = e.detents;
+    e.detents = 0;
+    portEXIT_CRITICAL(&synthMux);
+    return d;
+}
+
+void updateEncoder() {
+    updateEncoderButton();
+
+    // Encoder 1: select step
+    int32_t d1 = takeEncoderDetents(enc1);
+    if (d1 != 0) {
+        selectedStep = (selectedStep + NUM_STEPS + (d1 % NUM_STEPS)) % NUM_STEPS;
+        displayDirty = true;
+    }
+
+    // Encoder 2: note, or tempo while its button is held
+    int32_t d2 = takeEncoderDetents(enc2);
+    if (d2 != 0) {
+        bool buttonHeld = (stableButton2State == LOW);
+
+        if (buttonHeld) {
+            // Tempo only applies to the internal clock.
+            if (syncMode == SYNC_INTERNAL) {
+                internalBpm = constrain(internalBpm + d2, MIN_BPM, MAX_BPM);
+                restartInternalClock();
+                displayDirty = true;
+            }
+        } else {
+            int n = pattern[selectedStep].note + d2;
+            pattern[selectedStep].note = constrain(n, 24, 96);
+            displayDirty = true;
+        }
+    }
+}
+
+void setupEncoder() {
+    pinMode(ENCODER_CLK,  INPUT_PULLUP);
+    pinMode(ENCODER_DT,   INPUT_PULLUP);
+    pinMode(ENCODER_SW,   INPUT_PULLUP);
+    pinMode(ENCODER2_CLK, INPUT_PULLUP);
+    pinMode(ENCODER2_DT,  INPUT_PULLUP);
+    pinMode(ENCODER2_SW,  INPUT_PULLUP);
+
+    enc1.state = (digitalRead(ENCODER_CLK) << 1) | digitalRead(ENCODER_DT);
+    enc2.state = (digitalRead(ENCODER2_CLK) << 1) | digitalRead(ENCODER2_DT);
+
+    attachInterruptArg(digitalPinToInterrupt(ENCODER_CLK),  encoderISR, &enc1, CHANGE);
+    attachInterruptArg(digitalPinToInterrupt(ENCODER_DT),   encoderISR, &enc1, CHANGE);
+    attachInterruptArg(digitalPinToInterrupt(ENCODER2_CLK), encoderISR, &enc2, CHANGE);
+    attachInterruptArg(digitalPinToInterrupt(ENCODER2_DT),  encoderISR, &enc2, CHANGE);
+}
 
 void internalClockCallback(void* arg) {
 
@@ -202,21 +304,7 @@ void restartInternalClock() {
     );
 }
 
-void setupEncoder() {
 
-	pinMode(ENCODER_CLK, INPUT_PULLUP);
-    pinMode(ENCODER_DT, INPUT_PULLUP);
-    pinMode(ENCODER_SW, INPUT_PULLUP);
-
-    lastEncoderCLK = digitalRead(ENCODER_CLK);
-
-	pinMode(ENCODER2_CLK, INPUT_PULLUP);
-    pinMode(ENCODER2_DT, INPUT_PULLUP);
-    pinMode(ENCODER2_SW, INPUT_PULLUP);
-
-    lastEncoder2CLK = digitalRead(ENCODER2_CLK);
-		
-}
 
 void updateEncoderButton() {
 
@@ -265,77 +353,6 @@ void updateEncoderButton() {
 		
 }
 
-void updateEncoder() {
-
-	updateEncoderButton();
-
-	int clk = digitalRead(ENCODER_CLK);
-
-    if (clk != lastEncoderCLK && clk == LOW) {
-        if (digitalRead(ENCODER_DT) != clk) {
-            encoderPosition++;
-        } else {
-            encoderPosition--;
-        }
-
-				//        Serial.println(encoderPosition);
-
-				selectedStep = ((encoderPosition % NUM_STEPS) + NUM_STEPS) % NUM_STEPS;
-				displayDirty = true;
-    }		
-
-    lastEncoderCLK = clk;
-
-		clk = digitalRead(ENCODER2_CLK);
-
-		if (clk != lastEncoder2CLK && clk == LOW) {
-
-			int lastpos = encoder2Position;
-
-			if (digitalRead(ENCODER2_DT) != clk) {
-        encoder2Position++;
-			} else {
-        encoder2Position--;
-			}
-
-			int delta = encoder2Position - lastpos;
-
-			if (stableButton2State == LOW) {
-
-        // Push + turn: adjust internal tempo.
-        internalBpm += delta;
-
-        internalBpm = constrain(
-																internalBpm,
-																MIN_BPM,
-																MAX_BPM
-																);
-
-        if (syncMode == SYNC_INTERNAL) {
-					restartInternalClock();
-        }
-
-        Serial.printf(
-											"Internal tempo: %.0f BPM\n",
-											internalBpm
-											);
-
-			} else {
-
-        // Normal rotation: adjust selected step note.
-        int note =
-					pattern[selectedStep].note + delta;
-
-        note = constrain(note, 0, 127);
-
-        pattern[selectedStep].note = note;
-			}
-
-			displayDirty = true;
-		}
-
-		lastEncoder2CLK = clk;		
-}
 
 float processFilter(
     float input,
@@ -1186,6 +1203,7 @@ void setup() {
   Serial.println("Press a key on your MIDI keyboard.");
 
 	Wire.begin(I2C_SDA, I2C_SCL);
+	Wire.setClock(400000);
 
 	if (!ads.begin(0x48)) {
 		Serial.println("ADS1115 initialization failed!");
