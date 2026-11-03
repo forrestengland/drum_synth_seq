@@ -66,16 +66,24 @@ int encoder2Position = 0; */
 
 // clock
 // MIDI clock / sequencer state
-uint8_t clockCount = 0;
-bool midiRunning = false;
-
-uint32_t lastClockMicros = 0;
-float averageClockInterval = 0.0f;
-float externalBpm = 0.0f;
 
 // OLED refresh state
-bool displayDirty = true;
 uint32_t lastDisplayUpdate = 0;
+
+// MIDI clock / sequencer state (shared between tasks)
+volatile uint8_t clockCount = 0;
+volatile bool midiRunning = false;
+volatile uint8_t currentStep = 0;
+volatile bool displayDirty = true;
+
+volatile uint32_t lastClockMicros = 0;
+volatile float externalBpm = 0.0f;
+
+// Tempo is measured over one quarter note (24 pulses).
+constexpr int CLOCK_WINDOW = 24;
+uint32_t clockTimes[CLOCK_WINDOW];
+uint8_t clockTimeIndex = 0;
+uint8_t clockTimeCount = 0;
 
 // sequence
 #define NUM_STEPS 16
@@ -89,7 +97,6 @@ struct Step {
 
 Step pattern[NUM_STEPS];
 
-uint8_t currentStep = 0;
 uint8_t selectedStep = 0;
 
 // 5 pin midi in
@@ -844,7 +851,35 @@ void getNoteName(uint8_t note, char* output, size_t outputSize) {
     );
 }
 
-void handleMidiClock(uint8_t data) {
+void midiClockTask(void* parameter) {
+    for (;;) {
+        while (Serial2.available()) {
+            uint8_t data = Serial2.read();
+            uint32_t now = micros();   // timestamp as soon as the byte is read
+
+            if (data >= 0xF8) {        // real-time messages only
+                handleMidiClock(data, now);
+            }
+        }
+
+        // If the clock stops arriving, drop the tempo readout.
+        if (syncMode == SYNC_EXTERNAL &&
+            externalBpm > 0.0f &&
+            (micros() - lastClockMicros) > 500000) {
+            externalBpm = 0.0f;
+            displayDirty = true;
+        }
+
+        vTaskDelay(1);  // poll at ~1 kHz
+    }
+}
+
+void resetClockTempo() {
+    clockTimeIndex = 0;
+    clockTimeCount = 0;
+}
+
+void handleMidiClock(uint8_t data, uint32_t now) {
 
     if (syncMode != SYNC_EXTERNAL) {
         return;
@@ -856,73 +891,54 @@ void handleMidiClock(uint8_t data) {
             clockCount = 0;
             currentStep = 0;
             midiRunning = true;
-
             lastClockMicros = 0;
-            averageClockInterval = 0.0f;
-            externalBpm = 0.0f;
-
-						triggerSequencerStep();
-
+            triggerSequencerStep();
             displayDirty = true;
-
-						//            Serial.println("MIDI START");
             break;
 
         case 0xFB:  // MIDI Continue
             midiRunning = true;
-
-            // Avoid measuring the pause as a clock interval.
             lastClockMicros = 0;
-
             displayDirty = true;
-
-						//            Serial.println("MIDI CONTINUE");
             break;
 
         case 0xFC:  // MIDI Stop
             midiRunning = false;
             lastClockMicros = 0;
-
-						stopSequencerNote();
-
+            stopSequencerNote();
             displayDirty = true;
-
-						//            Serial.println("MIDI STOP");
             break;
 
         case 0xF8:  // MIDI Clock
         {
-            uint32_t now = micros();
+            // First pulse after start/stop, or a long gap: restart measurement.
+            if (lastClockMicros == 0 || (now - lastClockMicros) > 250000) {
+                resetClockTempo();
+            }
+            lastClockMicros = now;
 
-            // Measure the time between clock pulses.
-            if (lastClockMicros != 0) {
-                uint32_t interval = now - lastClockMicros;
+            // When the window is full, clockTimeIndex points at the oldest
+            // timestamp: exactly 24 pulses (one quarter note) ago.
+            if (clockTimeCount == CLOCK_WINDOW) {
+                uint32_t span = now - clockTimes[clockTimeIndex];
+                float bpm = 60000000.0f / (float)span;
 
-                // Ignore unusually long or short intervals.
-                if (interval >= 1000 && interval <= 1000000) {
-
-                    if (averageClockInterval == 0.0f) {
-                        averageClockInterval = interval;
-                    } else {
-                        // Smooth out clock jitter.
-                        averageClockInterval =
-                            averageClockInterval * 0.85f +
-                            interval * 0.15f;
-                    }
-
-                    // MIDI clock = 24 pulses per quarter note.
-                    float newBpm =
-                        60000000.0f /
-                        (averageClockInterval * 24.0f);
-
-                    if (fabsf(newBpm - externalBpm) >= 0.5f) {
-                        externalBpm = newBpm;
+                if (bpm >= 20.0f && bpm <= 400.0f) {
+                    // Hysteresis: only change the shown value when the
+                    // measurement has clearly moved to a new integer BPM.
+                    if (externalBpm == 0.0f ||
+                        fabsf(bpm - externalBpm) > 0.75f) {
+                        externalBpm = roundf(bpm);
                         displayDirty = true;
                     }
                 }
             }
 
-            lastClockMicros = now;
+            clockTimes[clockTimeIndex] = now;
+            clockTimeIndex = (clockTimeIndex + 1) % CLOCK_WINDOW;
+            if (clockTimeCount < CLOCK_WINDOW) {
+                clockTimeCount++;
+            }
 
             if (midiRunning) {
                 clockCount++;
@@ -930,21 +946,11 @@ void handleMidiClock(uint8_t data) {
                 // Six MIDI clock pulses = one sixteenth note.
                 if (clockCount >= 6) {
                     clockCount = 0;
-
-                    currentStep =
-                        (currentStep + 1) % NUM_STEPS;
-
-										triggerSequencerStep();
-
+                    currentStep = (currentStep + 1) % NUM_STEPS;
+                    triggerSequencerStep();
                     displayDirty = true;
-
-										/*                    Serial.printf(
-                        "Step: %u\n",
-                        currentStep + 1
-												); */
                 }
             }
-
             break;
         }
     }
@@ -1225,6 +1231,16 @@ void setup() {
 								MIDI_TX_PIN
 								);
 
+	xTaskCreatePinnedToCore(
+													midiClockTask,
+													"MidiClock",
+													4096,
+													nullptr,
+													5,        // higher than loop() (priority 1)
+													nullptr,
+													1         // core 1, away from the audio task on core 0
+													);	
+
 	Serial.println("DIN MIDI input ready");
 
 	//	Wire.setClock(100000);
@@ -1262,15 +1278,11 @@ void setup() {
 }
 
 void loop() {
-    processMidi();
+
+	processMidi();
 
     updateWaveformSwitch();
     updateSynthControls();
-
-    while (Serial2.available()) {
-        uint8_t data = Serial2.read();
-        handleMidiClock(data);
-    }
 
 		updateEncoder();
 		updateSyncSwitch();		
