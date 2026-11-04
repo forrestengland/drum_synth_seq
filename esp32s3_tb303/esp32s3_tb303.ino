@@ -15,8 +15,6 @@
 
 #include "esp_timer.h"
 
-bool encoder2Turned = false;   // set if encoder 2 was turned while its button was held
-
 float targetPhaseIncrement = 0.0f;
 bool glideActive = false;
 
@@ -32,6 +30,10 @@ enum RetriggerMode {
 // 3 = 50%, 4 = 67%, 5 = 83%
 constexpr uint8_t GATE_PULSES = 4;
 
+constexpr float ACCENT_ENV_MULT   = 1.8f;   // filter envelope depth multiplier
+constexpr float ACCENT_DECAY_MULT = 0.5f;   // envelope decay time multiplier
+constexpr float ACCENT_RES_BOOST  = 0.15f;  // added to resonance
+
 // Sync mode switch
 #define SYNC_SWITCH_PIN 8
 
@@ -41,24 +43,6 @@ enum SyncMode {
 };
 
 SyncMode syncMode = SYNC_EXTERNAL;
-
-// Internal tempo
-float internalBpm = 120.0f;
-constexpr float MIN_BPM = 40.0f;
-constexpr float MAX_BPM = 240.0f;
-
-esp_timer_handle_t internalClockTimer = nullptr;
-
-// encoder button debounce
-#define ENCODER_DEBOUNCE_MS 50
-
-bool lastButtonReading = HIGH;
-bool stableButtonState = HIGH;
-uint32_t lastButtonChange = 0;
-
-bool lastButton2Reading = HIGH;
-bool stableButton2State = HIGH;
-uint32_t lastButton2Change = 0;
 
 // encoders
 #define ENCODER_CLK 13
@@ -79,6 +63,37 @@ int encoderPosition = 0;
 
 int lastEncoder2CLK = HIGH;
 int encoder2Position = 0; */
+
+#define ACCENT_BUTTON_PIN 1
+#define START_BUTTON_PIN  2
+
+enum ButtonEvent { BTN_NONE, BTN_PRESSED, BTN_RELEASED };
+
+struct Button {
+    uint8_t pin;
+    bool lastReading;
+    bool stableState;
+    uint32_t lastChange;
+
+    Button(uint8_t p) : pin(p), lastReading(HIGH), stableState(HIGH), lastChange(0) {}
+};
+
+Button encoder1Button(ENCODER_SW);       // defined after the encoder pin #defines
+Button encoder2Button(ENCODER2_SW);
+Button accentButton(ACCENT_BUTTON_PIN);
+Button startButton(START_BUTTON_PIN);
+
+bool encoder2Turned = false;
+
+// Internal tempo
+float internalBpm = 120.0f;
+constexpr float MIN_BPM = 40.0f;
+constexpr float MAX_BPM = 240.0f;
+
+esp_timer_handle_t internalClockTimer = nullptr;
+
+// encoder button debounce
+#define ENCODER_DEBOUNCE_MS 50
 
 // clock
 // MIDI clock / sequencer state
@@ -114,6 +129,9 @@ struct Step {
 Step pattern[NUM_STEPS];
 
 uint8_t selectedStep = 0;
+
+bool sequencerAccent = false;   // set per step
+bool accentActive = false;      // read by the audio task
 
 // 5 pin midi in
 #define MIDI_RX_PIN 16
@@ -254,7 +272,7 @@ int32_t takeEncoderDetents(Encoder& e) {
 
 void updateEncoder() {
 
-	updateEncoderButton();
+	updateButtons();
 
     // Encoder 1: select step
     int32_t d1 = takeEncoderDetents(enc1);
@@ -266,7 +284,8 @@ void updateEncoder() {
     // Encoder 2: note, or tempo while its button is held
     int32_t d2 = takeEncoderDetents(enc2);
     if (d2 != 0) {
-        bool buttonHeld = (stableButton2State == LOW);
+
+			bool buttonHeld = (encoder2Button.stableState == LOW);
 
         if (buttonHeld) {
 
@@ -275,7 +294,7 @@ void updateEncoder() {
             // Tempo only applies to the internal clock.
             if (syncMode == SYNC_INTERNAL) {
                 internalBpm = constrain(internalBpm + d2, MIN_BPM, MAX_BPM);
-                restartInternalClock();
+                if (midiRunning) restartInternalClock();
                 displayDirty = true;
             }
         } else {
@@ -294,6 +313,9 @@ void setupEncoder() {
     pinMode(ENCODER2_DT,  INPUT_PULLUP);
     pinMode(ENCODER2_SW,  INPUT_PULLUP);
 
+		pinMode(ACCENT_BUTTON_PIN, INPUT_PULLUP);
+		pinMode(START_BUTTON_PIN,  INPUT_PULLUP);		
+
     enc1.state = (digitalRead(ENCODER_CLK) << 1) | digitalRead(ENCODER_DT);
     enc2.state = (digitalRead(ENCODER2_CLK) << 1) | digitalRead(ENCODER2_DT);
 
@@ -304,7 +326,7 @@ void setupEncoder() {
 }
 
 void internalClockCallback(void* arg) {
-    if (syncMode != SYNC_INTERNAL) {
+    if (syncMode != SYNC_INTERNAL || !midiRunning) {
         return;
     }
     sequencerPulse();
@@ -321,58 +343,52 @@ void restartInternalClock() {
     esp_timer_start_periodic(internalClockTimer, interval);
 }
 
-void updateEncoderButton() {
+ButtonEvent updateButton(Button& b) {
+    bool reading = digitalRead(b.pin);
 
-	bool reading = digitalRead(ENCODER_SW);
-
-    if (reading != lastButtonReading) {
-        lastButtonChange = millis();
-        lastButtonReading = reading;
+    if (reading != b.lastReading) {
+        b.lastChange = millis();
+        b.lastReading = reading;
     }
 
-    if ((millis() - lastButtonChange) >= ENCODER_DEBOUNCE_MS) {
-        if (reading != stableButtonState) {
-            stableButtonState = reading;
-
-            // Trigger only once when button is pressed
-            if (stableButtonState == LOW) {
-                pattern[selectedStep].active =
-                    !pattern[selectedStep].active;
-
-                displayDirty = true;
-
-								/*                Serial.printf("Step %d active: %d\n",
-                              selectedStep + 1,
-                              pattern[selectedStep].active); */
-            }
-        }
+    if ((millis() - b.lastChange) >= ENCODER_DEBOUNCE_MS &&
+        reading != b.stableState) {
+        b.stableState = reading;
+        return reading == LOW ? BTN_PRESSED : BTN_RELEASED;
     }
 
-	reading = digitalRead(ENCODER2_SW);
-
-    if (reading != lastButton2Reading) {
-        lastButton2Change = millis();
-        lastButton2Reading = reading;
-    }
-
-    if ((millis() - lastButton2Change) >= ENCODER_DEBOUNCE_MS) {
-        if (reading != stableButton2State) {
-            stableButton2State = reading;
-
-            if (stableButton2State == LOW) {
-                // Pressed: start tracking whether it gets turned.
-                encoder2Turned = false;
-            } else if (!encoder2Turned) {
-                // Released without turning: toggle slide.
-                pattern[selectedStep].slide =
-                    !pattern[selectedStep].slide;
-                displayDirty = true;
-            }
-        }			
-    }
-		
+    return BTN_NONE;
 }
 
+void toggleInternalRun();   // defined below
+
+void updateButtons() {
+    // Encoder 1 button: toggle step active
+    if (updateButton(encoder1Button) == BTN_PRESSED) {
+        pattern[selectedStep].active = !pattern[selectedStep].active;
+        displayDirty = true;
+    }
+
+    // Encoder 2 button: slide on release, unless it was used for tempo
+    ButtonEvent e2 = updateButton(encoder2Button);
+    if (e2 == BTN_PRESSED) {
+        encoder2Turned = false;
+    } else if (e2 == BTN_RELEASED && !encoder2Turned) {
+        pattern[selectedStep].slide = !pattern[selectedStep].slide;
+        displayDirty = true;
+    }
+
+    // Accent button: toggle accent on the selected step
+    if (updateButton(accentButton) == BTN_PRESSED) {
+        pattern[selectedStep].accent = !pattern[selectedStep].accent;
+        displayDirty = true;
+    }
+
+    // Start/stop button (internal clock only)
+    if (updateButton(startButton) == BTN_PRESSED) {
+        toggleInternalRun();
+    }
+}
 
 float processFilter(
     float input,
@@ -493,6 +509,8 @@ void updateSynthVoice(RetriggerMode mode) {
         filterEnvelopeTrigger = true;
     }
 
+		accentActive = (manualNote < 0) && sequencerAccent;
+
     activeNote = note;
 
     targetPhaseIncrement = increment;
@@ -525,6 +543,7 @@ void setNoteOff(int note) {
 }
 
 void triggerSequencerStep() {
+	
     Step& step = pattern[currentStep];
 
     if (!step.active) {
@@ -542,6 +561,7 @@ void triggerSequencerStep() {
 
     sequencerNote = step.note;
     sequencerVelocity = step.accent ? 127 : 100;
+		sequencerAccent = step.accent;
 
     updateSynthVoice(legato ? RETRIG_NEVER : RETRIG_ALWAYS);
 }
@@ -652,6 +672,7 @@ void audioTask(void* parameter) {
 		bool triggerEnvelope;
 		float blockTargetInc;
 		bool blockGlide;
+		bool blockAccent;
 
     portENTER_CRITICAL(&synthMux);
 
@@ -661,13 +682,20 @@ void audioTask(void* parameter) {
 		blockEnvDepth = filterEnvDepth;
 		blockDecay = envelopeDecay;
     blockTargetInc = targetPhaseIncrement;
-    blockGlide = glideActive;		
+    blockGlide = glideActive;
+		blockAccent = accentActive;
 
 		// consume the trigger
 		triggerEnvelope = filterEnvelopeTrigger;
 		filterEnvelopeTrigger = false;
 
     portEXIT_CRITICAL(&synthMux);
+
+		if (blockAccent) {
+			blockEnvDepth *= ACCENT_ENV_MULT;
+			blockDecay = max(blockDecay * ACCENT_DECAY_MULT, 20.0f);
+			blockResonance = min(blockResonance + ACCENT_RES_BOOST, 0.9f);
+    }
 
 		float incStart = phaseIncrement;
     float incEnd;
@@ -1157,6 +1185,29 @@ void updateDisplay() {
     display.display();
 }
 
+void toggleInternalRun() {
+    if (syncMode != SYNC_INTERNAL) {
+        return;
+    }
+
+    if (!midiRunning) {
+        // Start from step 1.
+        clockCount = 0;
+        currentStep = 0;
+        midiRunning = true;
+        triggerSequencerStep();
+        restartInternalClock();
+    } else {
+        midiRunning = false;
+        if (esp_timer_is_active(internalClockTimer)) {
+            esp_timer_stop(internalClockTimer);
+        }
+        stopSequencerNote();
+    }
+
+    displayDirty = true;
+}
+
 void updateSyncSwitch() {
 
     static int lastReading = HIGH;
@@ -1207,9 +1258,9 @@ void updateSyncSwitch() {
     if (syncMode == SYNC_INTERNAL) {
 
         // Trigger the first step immediately.
-        triggerSequencerStep();
+			//        triggerSequencerStep();
 
-        restartInternalClock();
+			//        restartInternalClock();
 
         Serial.println("SYNC: INTERNAL");
 
