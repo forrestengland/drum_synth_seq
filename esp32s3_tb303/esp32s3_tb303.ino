@@ -133,6 +133,9 @@ uint8_t selectedStep = 0;
 bool sequencerAccent = false;   // set per step
 bool accentActive = false;      // read by the audio task
 
+volatile uint8_t loopLength = NUM_STEPS;   // steps 0..loopLength-1 play
+bool chordUsed = false;
+
 // 5 pin midi in
 #define MIDI_RX_PIN 16
 #define MIDI_TX_PIN -1
@@ -378,16 +381,36 @@ void updateButtons() {
         displayDirty = true;
     }
 
-    // Accent button: toggle accent on the selected step
-    if (updateButton(accentButton) == BTN_PRESSED) {
+    // Accent + Start chord: set loop end to the current step.
+    ButtonEvent accentEvent = updateButton(accentButton);
+    ButtonEvent startEvent  = updateButton(startButton);
+
+    bool accentDown = (accentButton.stableState == LOW);
+    bool startDown  = (startButton.stableState == LOW);
+
+    if (accentDown && startDown && !chordUsed) {
+        chordUsed = true;
+
+        // While running use the playing step, otherwise the selected step.
+        uint8_t endStep = selectedStep;
+        loopLength = endStep + 1;
+        displayDirty = true;
+    }
+
+    // Single-button actions fire on release, unless the chord happened.
+    if (accentEvent == BTN_RELEASED && !chordUsed) {
         pattern[selectedStep].accent = !pattern[selectedStep].accent;
         displayDirty = true;
     }
 
-    // Start/stop button (internal clock only)
-    if (updateButton(startButton) == BTN_PRESSED) {
+    if (startEvent == BTN_RELEASED && !chordUsed) {
         toggleInternalRun();
     }
+
+    if (!accentDown && !startDown) {
+        chordUsed = false;
+    }		
+
 }
 
 float processFilter(
@@ -573,7 +596,7 @@ void gateOffCurrentStep() {
     }
 
     // If the next step slides, hold the gate open into it.
-    Step& next = pattern[(currentStep + 1) % NUM_STEPS];
+    Step& next = pattern[(currentStep + 1 >= loopLength) ? 0 : currentStep + 1];		
     if (next.active && next.slide) {
         return;
     }
@@ -589,7 +612,7 @@ void sequencerPulse() {
 
     if (clockCount >= 6) {
         clockCount = 0;
-        currentStep = (currentStep + 1) % NUM_STEPS;
+				currentStep = (currentStep + 1 >= loopLength) ? 0 : currentStep + 1;
         triggerSequencerStep();
         displayDirty = true;
     } else if (clockCount == GATE_PULSES) {
@@ -1126,6 +1149,10 @@ void updateDisplay() {
         // Editing selection.
         if (selectedStep == i) {
             display.drawFastHLine(x, 27, 7, SSD1306_WHITE);
+        }
+
+				if (loopLength < NUM_STEPS && i == loopLength - 1) {
+            display.drawFastVLine(x + 10, y - 1, 9, SSD1306_WHITE);
         }
     }
 
