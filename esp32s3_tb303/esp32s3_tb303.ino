@@ -15,6 +15,22 @@
 
 #include "esp_timer.h"
 
+bool encoder2Turned = false;   // set if encoder 2 was turned while its button was held
+
+float targetPhaseIncrement = 0.0f;
+bool glideActive = false;
+
+constexpr float GLIDE_TIME_MS = 25.0f;   // time constant; ~60-75 ms to settle
+
+enum RetriggerMode {
+    RETRIG_ON_PITCH,   // old behavior: only when the pitch changes
+    RETRIG_ALWAYS,     // new gated note
+    RETRIG_NEVER       // slide: keep envelope and gate running
+};
+
+// Gate closes after this many of the 6 pulses in a step.
+// 3 = 50%, 4 = 67%, 5 = 83%
+constexpr uint8_t GATE_PULSES = 4;
 
 // Sync mode switch
 #define SYNC_SWITCH_PIN 8
@@ -237,7 +253,8 @@ int32_t takeEncoderDetents(Encoder& e) {
 }
 
 void updateEncoder() {
-    updateEncoderButton();
+
+	updateEncoderButton();
 
     // Encoder 1: select step
     int32_t d1 = takeEncoderDetents(enc1);
@@ -252,6 +269,9 @@ void updateEncoder() {
         bool buttonHeld = (stableButton2State == LOW);
 
         if (buttonHeld) {
+
+					encoder2Turned = true;
+					
             // Tempo only applies to the internal clock.
             if (syncMode == SYNC_INTERNAL) {
                 internalBpm = constrain(internalBpm + d2, MIN_BPM, MAX_BPM);
@@ -284,34 +304,22 @@ void setupEncoder() {
 }
 
 void internalClockCallback(void* arg) {
-
     if (syncMode != SYNC_INTERNAL) {
         return;
     }
-
-    currentStep = (currentStep + 1) % NUM_STEPS;
-
-    triggerSequencerStep();
-
-    displayDirty = true;
+    sequencerPulse();
 }
 
 void restartInternalClock() {
-
     if (esp_timer_is_active(internalClockTimer)) {
         esp_timer_stop(internalClockTimer);
     }
 
     uint64_t interval =
-        (uint64_t)(60000000.0f / (internalBpm * 4.0f));
+        (uint64_t)(60000000.0f / (internalBpm * 24.0f));
 
-    esp_timer_start_periodic(
-        internalClockTimer,
-        interval
-    );
+    esp_timer_start_periodic(internalClockTimer, interval);
 }
-
-
 
 void updateEncoderButton() {
 
@@ -351,11 +359,16 @@ void updateEncoderButton() {
         if (reading != stableButton2State) {
             stableButton2State = reading;
 
-            // Trigger only once when button is pressed
             if (stableButton2State == LOW) {
-							//                Serial.printf("encoder 2 pressed\n");
+                // Pressed: start tracking whether it gets turned.
+                encoder2Turned = false;
+            } else if (!encoder2Turned) {
+                // Released without turning: toggle slide.
+                pattern[selectedStep].slide =
+                    !pattern[selectedStep].slide;
+                displayDirty = true;
             }
-        }
+        }			
     }
 		
 }
@@ -449,12 +462,17 @@ void setupAudio() {
 	//  Serial.println("I2S audio started.");
 }
 
-void updateSynthVoice() {
+void updateSynthVoice(RetriggerMode mode) {
     // Manual keyboard notes take priority.
     int note = manualNote >= 0 ? manualNote : sequencerNote;
     int velocity = manualNote >= 0
         ? manualVelocity
         : sequencerVelocity;
+
+    // Slide and forced retrigger only apply to sequencer notes.
+    if (manualNote >= 0) {
+        mode = RETRIG_ON_PITCH;
+    }
 
     if (note < 0) {
         portENTER_CRITICAL(&synthMux);
@@ -464,30 +482,25 @@ void updateSynthVoice() {
         return;
     }
 
-    float frequency = 440.0f *
-        powf(2.0f, (note - 69) / 12.0f);
-
-    float increment =
-        (frequency * WAVETABLE_SIZE) / SAMPLE_RATE;
-
-    float amplitude =
-        MAX_AMPLITUDE * (velocity / 127.0f);
+    float frequency = 440.0f * powf(2.0f, (note - 69) / 12.0f);
+    float increment = (frequency * WAVETABLE_SIZE) / SAMPLE_RATE;
+    float amplitude = MAX_AMPLITUDE * (velocity / 127.0f);
 
     portENTER_CRITICAL(&synthMux);
 
-    // Only retrigger the filter envelope if the pitch changes.
-    if (activeNote != note) {
+    if (mode == RETRIG_ALWAYS ||
+        (mode == RETRIG_ON_PITCH && activeNote != note)) {
         filterEnvelopeTrigger = true;
     }
 
     activeNote = note;
-    phaseIncrement = increment;
+
+    targetPhaseIncrement = increment;
+    glideActive = (mode == RETRIG_NEVER);
+		
     targetAmplitude = amplitude;
 
     portEXIT_CRITICAL(&synthMux);
-
-		//    Serial.printf("SYNTH NOTE: %d velocity: %d\n",
-		//                  note, velocity);
 }
 
 void setNoteOn(int note, int velocity) {
@@ -499,7 +512,7 @@ void setNoteOn(int note, int velocity) {
     manualNote = note;
     manualVelocity = velocity;
 
-    updateSynthVoice();
+    updateSynthVoice(RETRIG_ALWAYS);
 }
 
 void setNoteOff(int note) {
@@ -507,44 +520,68 @@ void setNoteOff(int note) {
         manualNote = -1;
         manualVelocity = 0;
 
-        updateSynthVoice();
+        updateSynthVoice(RETRIG_ALWAYS);
     }
 }
 
 void triggerSequencerStep() {
-    // Release the previous sequencer note.
-    sequencerNote = -1;
-    sequencerVelocity = 0;
-
     Step& step = pattern[currentStep];
 
-    if (step.active) {
-        sequencerNote = step.note;
-
-        // Accent steps use maximum velocity.
-        sequencerVelocity = step.accent ? 127 : 100;
-
-				/*        Serial.printf(
-            "SEQUENCER STEP %d: NOTE ON %d velocity %d\n",
-            currentStep + 1,
-            sequencerNote,
-            sequencerVelocity */
-				//        );
-    } else {
-	/*        Serial.printf(
-            "SEQUENCER STEP %d: REST\n",
-            currentStep + 1
-						); */
+    if (!step.active) {
+        // Rest: close the gate.
+        sequencerNote = -1;
+        sequencerVelocity = 0;
+        updateSynthVoice(RETRIG_ALWAYS);
+        return;
     }
 
-    updateSynthVoice();
+    // A slide only ties to the previous note if that gate is still open.
+    // The previous step's gate-off is skipped when the next step slides,
+    // so sequencerNote is still >= 0 here in that case.
+    bool legato = step.slide && sequencerNote >= 0;
+
+    sequencerNote = step.note;
+    sequencerVelocity = step.accent ? 127 : 100;
+
+    updateSynthVoice(legato ? RETRIG_NEVER : RETRIG_ALWAYS);
+}
+
+// Called partway through each step to end the note.
+void gateOffCurrentStep() {
+    if (sequencerNote < 0) {
+        return;
+    }
+
+    // If the next step slides, hold the gate open into it.
+    Step& next = pattern[(currentStep + 1) % NUM_STEPS];
+    if (next.active && next.slide) {
+        return;
+    }
+
+    sequencerNote = -1;
+    sequencerVelocity = 0;
+    updateSynthVoice(RETRIG_ALWAYS);
+}
+
+// One MIDI-clock-equivalent pulse (24 per quarter note).
+void sequencerPulse() {
+    clockCount++;
+
+    if (clockCount >= 6) {
+        clockCount = 0;
+        currentStep = (currentStep + 1) % NUM_STEPS;
+        triggerSequencerStep();
+        displayDirty = true;
+    } else if (clockCount == GATE_PULSES) {
+        gateOffCurrentStep();
+    }
 }
 
 void stopSequencerNote() {
     sequencerNote = -1;
     sequencerVelocity = 0;
 
-    updateSynthVoice();
+    updateSynthVoice(RETRIG_ALWAYS);
 }
 
 void processMidi() {
@@ -591,6 +628,7 @@ void processMidi() {
 }
 
 void audioTask(void* parameter) {
+	
   int16_t buffer[BLOCK_FRAMES * 2];
 
   // Approximately 5 ms amplitude ramp.
@@ -598,6 +636,11 @@ void audioTask(void* parameter) {
       1.0f / (SAMPLE_RATE * 0.005f);
 
 	float filterEnvelope = 0.0f;
+
+  // Fraction of the remaining pitch distance covered per block.
+  const float glideBlockCoeff =
+      1.0f - expf(-(float)BLOCK_FRAMES /
+                  (GLIDE_TIME_MS * 0.001f * SAMPLE_RATE));	
 
 	for (;;) {
     float blockTargetAmplitude;
@@ -607,21 +650,38 @@ void audioTask(void* parameter) {
 		float blockDecay;
 		float blockEnvDepth;
 		bool triggerEnvelope;
+		float blockTargetInc;
+		bool blockGlide;
 
     portENTER_CRITICAL(&synthMux);
 
     blockTargetAmplitude = targetAmplitude;
-		//    blockPhaseIncrement = phaseIncrement;
     blockCutoff = filterCutoff;
     blockResonance = filterResonance;
 		blockEnvDepth = filterEnvDepth;
 		blockDecay = envelopeDecay;
+    blockTargetInc = targetPhaseIncrement;
+    blockGlide = glideActive;		
 
 		// consume the trigger
 		triggerEnvelope = filterEnvelopeTrigger;
 		filterEnvelopeTrigger = false;
 
     portEXIT_CRITICAL(&synthMux);
+
+		float incStart = phaseIncrement;
+    float incEnd;
+
+    if (!blockGlide || incStart <= 0.0f) {
+			// Normal note: jump straight to the new pitch.
+			incStart = blockTargetInc;
+			incEnd = blockTargetInc;
+    } else {
+			// Glide in the pitch (ratio) domain so it sounds even across octaves.
+			incEnd = incStart * powf(blockTargetInc / incStart, glideBlockCoeff);
+    }
+
+    const float incStep = (incEnd - incStart) / BLOCK_FRAMES;
 
 		// Restart envelope when a new MIDI note arrives.
 		if (triggerEnvelope) {
@@ -652,6 +712,9 @@ void audioTask(void* parameter) {
 
 
     for (int i = 0; i < BLOCK_FRAMES; i++) {
+
+			phaseIncrement = incStart + incStep * (i + 1);
+			
       if (currentAmplitude < blockTargetAmplitude) {
         currentAmplitude += RAMP_STEP;
 
@@ -940,18 +1003,9 @@ void handleMidiClock(uint8_t data, uint32_t now) {
                 clockTimeCount++;
             }
 
-            if (midiRunning) {
-                clockCount++;
-
-                // Six MIDI clock pulses = one sixteenth note.
-                if (clockCount >= 6) {
-                    clockCount = 0;
-                    currentStep = (currentStep + 1) % NUM_STEPS;
-                    triggerSequencerStep();
-                    displayDirty = true;
-                }
+						if (midiRunning) {
+                sequencerPulse();
             }
-            break;
         }
     }
 }
