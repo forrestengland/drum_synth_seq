@@ -14,6 +14,7 @@
 
 #include "delay.h"
 #include "effect.h"
+#include "reverb.h"
 #include "ui.h"
 
 #define MAX_FX 16
@@ -81,12 +82,16 @@ int main(int argc, char **argv)
     int rc = 1;
     float sr = (float)jack_get_sample_rate(client);
 
-    /* build the rack (more effects later: just append here) */
-    if (!(rack[nfx] = delay_create(sr))) {
-        fprintf(stderr, "out of memory\n");
-        goto done;
+    /* Build the rack, in signal-flow order. To add an effect, write its
+     * *_create() and append it here. */
+    Effect *(*const factories[])(float) = { delay_create, reverb_create };
+    for (size_t i = 0; i < sizeof factories / sizeof factories[0] && nfx < MAX_FX; i++) {
+        if (!(rack[nfx] = factories[i](sr))) {
+            fprintf(stderr, "out of memory\n");
+            goto done;
+        }
+        nfx++;
     }
-    nfx++;
 
     const char *in_names[2]  = { "in_1", "in_2" };
     const char *out_names[2] = { "out_1", "out_2" };

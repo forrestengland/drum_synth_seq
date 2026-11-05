@@ -9,7 +9,7 @@ SDL_LIBS    := $(shell pkg-config --libs sdl2 SDL2_ttf 2>/dev/null)
 NC_CFLAGS   := $(shell pkg-config --cflags ncurses 2>/dev/null)
 NC_LIBS     := $(shell pkg-config --libs ncurses 2>/dev/null)
 
-COMMON = main.o delay.o
+COMMON = main.o delay.o reverb.o
 
 all: fxrack fxrack-tui
 sdl: fxrack
@@ -25,7 +25,7 @@ main.o delay.o: CFLAGS += $(JACK_CFLAGS)
 ui.o:  CFLAGS += $(SDL_CFLAGS)
 tui.o: CFLAGS += $(NC_CFLAGS)
 
-%.o: %.c effect.h delay.h ui.h
+%.o: %.c effect.h delay.h reverb.h ui.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
