@@ -15,6 +15,8 @@
 
 #include "esp_timer.h"
 
+#include <Preferences.h>
+
 float targetPhaseIncrement = 0.0f;
 bool glideActive = false;
 
@@ -132,6 +134,23 @@ uint8_t selectedStep = 0;
 
 bool sequencerAccent = false;   // set per step
 bool accentActive = false;      // read by the audio task
+
+// ---------- Autosave to flash ----------
+constexpr uint32_t SAVE_DELAY_MS = 3000;
+constexpr uint8_t  SAVE_VERSION  = 1;   // bump when SavedState or Step changes
+
+struct SavedState {
+    uint8_t version;
+    uint8_t loopLength;
+    float   internalBpm;
+    Step    pattern[NUM_STEPS];
+};
+
+Preferences prefs;
+SavedState lastSeenState;    // what we saw on the previous loop
+SavedState lastSavedState;   // what is in flash
+bool saveDirty = false;
+uint32_t lastChangeMs = 0;
 
 volatile uint8_t loopLength = NUM_STEPS;   // steps 0..loopLength-1 play
 bool chordUsed = false;
@@ -261,6 +280,57 @@ void IRAM_ATTR encoderISR(void* arg) {
     } else if (e->accumulator <= -ENCODER_TRANSITIONS_PER_DETENT) {
         e->accumulator = 0;
         e->detents--;
+    }
+}
+
+SavedState captureState() {
+    SavedState s;
+    memset(&s, 0, sizeof(s));   // zero padding so memcmp is reliable
+    s.version = SAVE_VERSION;
+    s.loopLength = loopLength;
+    s.internalBpm = internalBpm;
+    memcpy(s.pattern, pattern, sizeof(pattern));
+    return s;
+}
+
+void loadState() {
+    prefs.begin("tb303", false);
+
+    SavedState s;
+    if (prefs.getBytesLength("state") == sizeof(s) &&
+        prefs.getBytes("state", &s, sizeof(s)) == sizeof(s) &&
+        s.version == SAVE_VERSION &&
+        s.loopLength >= 1 && s.loopLength <= NUM_STEPS &&
+        s.internalBpm >= MIN_BPM && s.internalBpm <= MAX_BPM) {
+
+        loopLength = s.loopLength;
+        internalBpm = s.internalBpm;
+        memcpy(pattern, s.pattern, sizeof(pattern));
+        Serial.println("Pattern loaded from flash.");
+    }
+
+    lastSeenState = captureState();
+    lastSavedState = lastSeenState;
+}
+
+void updateAutosave() {
+    SavedState now = captureState();
+
+    if (memcmp(&now, &lastSeenState, sizeof(now)) != 0) {
+        lastSeenState = now;
+        lastChangeMs = millis();
+        saveDirty = true;
+    }
+
+    if (saveDirty && (millis() - lastChangeMs) >= SAVE_DELAY_MS) {
+        saveDirty = false;
+
+        // Skip the write if the state ended up back where it was saved.
+        if (memcmp(&now, &lastSavedState, sizeof(now)) != 0) {
+            prefs.putBytes("state", &now, sizeof(now));
+            lastSavedState = now;
+            Serial.println("Pattern saved.");
+        }
     }
 }
 
@@ -1304,6 +1374,9 @@ void setup() {
 	pinMode(SYNC_SWITCH_PIN, INPUT_PULLUP);
 
   Serial.begin(115200);
+
+	loadState();
+
   delay(500);
 
   Serial.println();
@@ -1385,15 +1458,6 @@ void setup() {
 		while (true);
 	}
 
- 
-	/*	display.clearDisplay();
-	display.setTextColor(SSD1306_WHITE);
-	display.setTextSize(1);
-	display.setCursor(0, 0);
-	display.println("TB-303");
-	display.println("OLED ready");
-	display.display();  */
-
 	setupEncoder();
 
 	esp_timer_create_args_t timerArgs = {
@@ -1405,7 +1469,7 @@ void setup() {
 
 	ESP_ERROR_CHECK(
 									esp_timer_create(&timerArgs, &internalClockTimer)
-									);	
+									);
  
 }
 
@@ -1413,11 +1477,13 @@ void loop() {
 
 	processMidi();
 
-    updateWaveformSwitch();
-    updateSynthControls();
+	updateWaveformSwitch();
+	updateSynthControls();
 
-		updateEncoder();
-		updateSyncSwitch();		
+	updateEncoder();
+	updateSyncSwitch();		
 
-    updateDisplay();
+	updateDisplay();
+
+	updateAutosave();
 }
