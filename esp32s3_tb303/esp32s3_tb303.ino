@@ -17,6 +17,9 @@
 
 #include <Preferences.h>
 
+#define NUM_PATTERNS 16
+#define PATTERN_BUTTON_PIN 47
+
 float targetPhaseIncrement = 0.0f;
 bool glideActive = false;
 
@@ -60,12 +63,6 @@ SyncMode syncMode = SYNC_EXTERNAL;
 int encoderPosition = 0;
 int encoder2Position = 0;
 
-/*int lastEncoderCLK = HIGH;
-int encoderPosition = 0;
-
-int lastEncoder2CLK = HIGH;
-int encoder2Position = 0; */
-
 #define ACCENT_BUTTON_PIN 1
 #define START_BUTTON_PIN  2
 
@@ -84,6 +81,7 @@ Button encoder1Button(ENCODER_SW);       // defined after the encoder pin #defin
 Button encoder2Button(ENCODER2_SW);
 Button accentButton(ACCENT_BUTTON_PIN);
 Button startButton(START_BUTTON_PIN);
+Button patternButton(PATTERN_BUTTON_PIN);
 
 bool encoder2Turned = false;
 
@@ -128,7 +126,12 @@ struct Step {
     bool slide = false;
 };
 
-Step pattern[NUM_STEPS];
+Step patternBank[NUM_PATTERNS][NUM_STEPS];
+Step* pattern = patternBank[0];          // the pattern currently playing/editing
+uint8_t loopLengths[NUM_PATTERNS];       // loopLength is stored per pattern
+uint8_t currentPattern = 0;
+uint8_t pendingPattern = 0;
+bool patternSelectMode = false;
 
 uint8_t selectedStep = 0;
 
@@ -137,9 +140,18 @@ bool accentActive = false;      // read by the audio task
 
 // ---------- Autosave to flash ----------
 constexpr uint32_t SAVE_DELAY_MS = 3000;
-constexpr uint8_t  SAVE_VERSION  = 1;   // bump when SavedState or Step changes
+constexpr uint8_t  SAVE_VERSION  = 2;   // bump when SavedState or Step changes
 
 struct SavedState {
+	uint8_t version;
+	uint8_t currentPattern;
+	uint8_t loopLengths[NUM_PATTERNS];
+	float   internalBpm;
+	Step    patterns[NUM_PATTERNS][NUM_STEPS];
+};
+
+// Old single-pattern format, for migration.
+struct SavedStateV1 {
     uint8_t version;
     uint8_t loopLength;
     float   internalBpm;
@@ -284,37 +296,72 @@ void IRAM_ATTR encoderISR(void* arg) {
 }
 
 SavedState captureState() {
-    SavedState s;
-    memset(&s, 0, sizeof(s));   // zero padding so memcmp is reliable
+
+	SavedState s;
+    memset(&s, 0, sizeof(s));
     s.version = SAVE_VERSION;
-    s.loopLength = loopLength;
+    s.currentPattern = currentPattern;
+    memcpy(s.loopLengths, loopLengths, sizeof(loopLengths));
+    s.loopLengths[currentPattern] = loopLength;   // include unsaved live value
     s.internalBpm = internalBpm;
-    memcpy(s.pattern, pattern, sizeof(pattern));
+    memcpy(s.patterns, patternBank, sizeof(patternBank));
     return s;
 }
 
 void loadState() {
+
+	for (int p = 0; p < NUM_PATTERNS; p++) loopLengths[p] = NUM_STEPS;
+
     prefs.begin("tb303", false);
+    size_t len = prefs.getBytesLength("state");
 
     SavedState s;
-    if (prefs.getBytesLength("state") == sizeof(s) &&
+    SavedStateV1 old;
+
+    if (len == sizeof(s) &&
         prefs.getBytes("state", &s, sizeof(s)) == sizeof(s) &&
         s.version == SAVE_VERSION &&
-        s.loopLength >= 1 && s.loopLength <= NUM_STEPS &&
+        s.currentPattern < NUM_PATTERNS &&
         s.internalBpm >= MIN_BPM && s.internalBpm <= MAX_BPM) {
 
-        loopLength = s.loopLength;
+        for (int p = 0; p < NUM_PATTERNS; p++) {
+            loopLengths[p] = (s.loopLengths[p] >= 1 && s.loopLengths[p] <= NUM_STEPS)
+                                 ? s.loopLengths[p] : NUM_STEPS;
+        }
+        memcpy(patternBank, s.patterns, sizeof(patternBank));
         internalBpm = s.internalBpm;
-        memcpy(pattern, s.pattern, sizeof(pattern));
-        Serial.println("Pattern loaded from flash.");
+        currentPattern = s.currentPattern;
+        Serial.println("Patterns loaded from flash.");
+
+    } else if (len == sizeof(old) &&
+               prefs.getBytes("state", &old, sizeof(old)) == sizeof(old) &&
+               old.version == 1 &&
+               old.loopLength >= 1 && old.loopLength <= NUM_STEPS &&
+               old.internalBpm >= MIN_BPM && old.internalBpm <= MAX_BPM) {
+
+        // Keep the existing pattern as pattern 1.
+        memcpy(patternBank[0], old.pattern, sizeof(old.pattern));
+        loopLengths[0] = old.loopLength;
+        internalBpm = old.internalBpm;
+        currentPattern = 0;
+        Serial.println("Migrated v1 pattern into slot 1.");
     }
+
+    pattern = patternBank[currentPattern];
+    loopLength = loopLengths[currentPattern];
 
     lastSeenState = captureState();
     lastSavedState = lastSeenState;
+
+    // Write the new format immediately after a migration.
+    if (len == sizeof(old)) {
+        prefs.putBytes("state", &lastSavedState, sizeof(lastSavedState));
+    }
 }
 
 void updateAutosave() {
-    SavedState now = captureState();
+
+	SavedState now = captureState();
 
     if (memcmp(&now, &lastSeenState, sizeof(now)) != 0) {
         lastSeenState = now;
@@ -344,27 +391,33 @@ int32_t takeEncoderDetents(Encoder& e) {
 }
 
 void updateEncoder() {
+    updateButtons();
 
-	updateButtons();
+    int32_t d1 = takeEncoderDetents(enc1);
+    int32_t d2 = takeEncoderDetents(enc2);
+
+    if (patternSelectMode) {
+        if (d1 != 0) {
+            pendingPattern =
+                (pendingPattern + NUM_PATTERNS + (d1 % NUM_PATTERNS)) % NUM_PATTERNS;
+            displayDirty = true;
+        }
+        return;   // encoder 2 is ignored while selecting
+    }
 
     // Encoder 1: select step
-    int32_t d1 = takeEncoderDetents(enc1);
     if (d1 != 0) {
         selectedStep = (selectedStep + NUM_STEPS + (d1 % NUM_STEPS)) % NUM_STEPS;
         displayDirty = true;
     }
 
     // Encoder 2: note, or tempo while its button is held
-    int32_t d2 = takeEncoderDetents(enc2);
     if (d2 != 0) {
-
-			bool buttonHeld = (encoder2Button.stableState == LOW);
+        bool buttonHeld = (encoder2Button.stableState == LOW);
 
         if (buttonHeld) {
+            encoder2Turned = true;
 
-					encoder2Turned = true;
-					
-            // Tempo only applies to the internal clock.
             if (syncMode == SYNC_INTERNAL) {
                 internalBpm = constrain(internalBpm + d2, MIN_BPM, MAX_BPM);
                 if (midiRunning) restartInternalClock();
@@ -379,6 +432,7 @@ void updateEncoder() {
 }
 
 void setupEncoder() {
+	
     pinMode(ENCODER_CLK,  INPUT_PULLUP);
     pinMode(ENCODER_DT,   INPUT_PULLUP);
     pinMode(ENCODER_SW,   INPUT_PULLUP);
@@ -388,7 +442,8 @@ void setupEncoder() {
 
 		pinMode(ACCENT_BUTTON_PIN, INPUT_PULLUP);
 		pinMode(START_BUTTON_PIN,  INPUT_PULLUP);		
-
+		pinMode(PATTERN_BUTTON_PIN, INPUT_PULLUP);
+		
     enc1.state = (digitalRead(ENCODER_CLK) << 1) | digitalRead(ENCODER_DT);
     enc2.state = (digitalRead(ENCODER2_CLK) << 1) | digitalRead(ENCODER2_DT);
 
@@ -435,7 +490,64 @@ ButtonEvent updateButton(Button& b) {
 
 void toggleInternalRun();   // defined below
 
+void switchPattern(uint8_t n) {
+	
+    loopLengths[currentPattern] = loopLength;   // remember the old pattern's loop
+    currentPattern = n;
+    pattern = patternBank[n];
+    loopLength = loopLengths[n];
+}
+
+void confirmPatternSelect() {
+	
+    patternSelectMode = false;
+
+    // Stop the internal clock first so its task can't race the switch.
+    if (syncMode == SYNC_INTERNAL && esp_timer_is_active(internalClockTimer)) {
+        esp_timer_stop(internalClockTimer);
+    }
+
+    stopSequencerNote();              // release the old pattern's note
+    switchPattern(pendingPattern);
+
+    if (syncMode == SYNC_INTERNAL) {
+        // Start the new pattern from step 1, right now.
+        clockCount = 0;
+        currentStep = 0;
+        midiRunning = true;
+        triggerSequencerStep();
+        restartInternalClock();
+    } else if (currentStep >= loopLength) {
+        // External: stay locked to the incoming clock, wrap if needed.
+        currentStep = 0;
+    }
+
+    displayDirty = true;
+}
+
 void updateButtons() {
+
+    // Pattern button: fires on press, works in both modes.
+    if (updateButton(patternButton) == BTN_PRESSED) {
+        if (!patternSelectMode) {
+            patternSelectMode = true;
+            pendingPattern = currentPattern;
+            displayDirty = true;
+        } else {
+            confirmPatternSelect();
+        }
+        return;
+    }
+
+    // While selecting, ignore the other buttons so nothing is edited by accident.
+    if (patternSelectMode) {
+        updateButton(encoder1Button);
+        updateButton(encoder2Button);
+        updateButton(accentButton);
+        updateButton(startButton);
+        return;
+    }	
+	
     // Encoder 1 button: toggle step active
     if (updateButton(encoder1Button) == BTN_PRESSED) {
         pattern[selectedStep].active = !pattern[selectedStep].active;
@@ -1131,8 +1243,47 @@ void handleMidiClock(uint8_t data, uint32_t now) {
     }
 }
 
+bool patternHasNotes(uint8_t p) {
+    for (int i = 0; i < NUM_STEPS; i++) {
+        if (patternBank[p][i].active) return true;
+    }
+    return false;
+}
+
+void drawPatternSelect() {
+    for (int i = 0; i < NUM_PATTERNS; i++) {
+        int x = 2 + ((i % 8) * 16);
+        int numY = (i < 8) ? 10 : 29;
+        int y    = (i < 8) ? 19 : 38;
+
+        display.setCursor(x, numY);
+        display.print(i + 1);
+
+        if (patternHasNotes(i)) {
+            display.fillRect(x, y, 7, 7, SSD1306_WHITE);
+        } else {
+            display.drawPixel(x + 3, y + 3, SSD1306_WHITE);
+        }
+
+        if (i == currentPattern) {
+            display.drawRect(x - 1, y - 1, 9, 9, SSD1306_WHITE);
+        }
+
+        if (i == pendingPattern) {
+            display.drawFastHLine(x, y + 8, 7, SSD1306_WHITE);
+        }
+    }
+
+    char text[24];
+    snprintf(text, sizeof(text), "SELECT P%02d  NOW P%02d",
+             pendingPattern + 1, currentPattern + 1);
+    display.setCursor(0, 55);
+    display.print(text);
+}
+
 void updateDisplay() {
-    // Only refresh when something has changed.
+
+	// Only refresh when something has changed.
     if (!displayDirty) {
         return;
     }
@@ -1190,6 +1341,12 @@ void updateDisplay() {
         display.fillCircle(60, 4, 2, SSD1306_WHITE);
     } else {
         display.drawCircle(60, 4, 2, SSD1306_WHITE);
+    }
+
+		if (patternSelectMode) {
+        drawPatternSelect();
+        display.display();
+        return;
     }
 
     // --------------------------------
@@ -1254,6 +1411,10 @@ void updateDisplay() {
         if (selectedStep == i) {
             display.drawFastHLine(x, 46, 7, SSD1306_WHITE);
         }
+
+				if (loopLength < NUM_STEPS && i == loopLength - 1) {
+					display.drawFastVLine(x + 10, y - 1, 9, SSD1306_WHITE);
+        }
     }
 
     // --------------------------------
@@ -1278,6 +1439,11 @@ void updateDisplay() {
     );
 
     display.print(statusText);
+
+    char patText[8];
+    snprintf(patText, sizeof(patText), "P%02d", currentPattern + 1);
+    display.setCursor(108, 55);
+    display.print(patText);		
 
     display.display();
 }
