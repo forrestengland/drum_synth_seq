@@ -7,8 +7,8 @@
 //
 // Controls (step buttons 1-16 = index 0-15):
 //   none      : toggle step in viewed bank (current channel)
-//   Shift A   : 1-8 channel, 9-12 bank 1-4, 13-16 spare
-//   Shift B   : 1-8 pattern, 9-15 spare, 16 (hold 1 s) = save to EEPROM
+//   Shift A   : 1-8 channel, 9-12 bank 1-4, 13-15 spare, 16 (hold 1 s) = save to EEPROM
+//   Shift B   : 1-16 pattern (flat selection)
 //   Encoder   : turn = tempo (40-240 BPM, accelerates), push + turn = swing (0-66%).
 //               LEDs show a bar graph of the value for 1 s. Tempo/swing are saved with the pattern save.
 //   Accent held (no shift): step buttons toggle accents for the viewed bank. One accent
@@ -27,7 +27,7 @@ const uint8_t PLAY_PIN = 5;
 const uint8_t ACCENT_PIN = 4;
 const uint8_t ENC_A = 2;                        // interrupt pins (INT4 / INT5)
 const uint8_t ENC_B = 3;
-const uint8_t ENC_SW = 8;
+const uint8_t ENC_SW = 20;                       // D20 (SDA pin, unused for I2C here)
 const uint8_t LEAD_POT = A1;                    // sync timing advance (clock lead), 0-20 ms
 
 // ---------- MIDI config ----------
@@ -44,9 +44,9 @@ const uint16_t BUSY_FRAME_MS = 150;             // time per frame
 const uint16_t BOOT_ANIM_MS = 600;              // minimum time the pattern shows at power-up (0 = off)
 
 // ---------- Data ----------
-uint16_t steps[8][8][4];     // [pattern][channel][bank] -> 16 step bits
-uint16_t accents[8][4];      // [pattern][bank] -> 16 accent bits, shared by all channels
-uint8_t lastStep[8][8];      // [pattern][channel] -> 0..63 (loop length - 1)
+uint16_t steps[16][8][4];    // [pattern][channel][bank] -> 16 step bits
+uint16_t accents[16][4];     // [pattern][bank] -> 16 accent bits, shared by all channels
+uint8_t lastStep[16][8];     // [pattern][channel] -> 0..63 (loop length - 1)
 
 uint8_t curPat = 0, curCh = 0, viewBank = 0;
 
@@ -287,13 +287,14 @@ void runClock() {
 }
 
 // ---------- Save / load (EEPROM) ----------
-// Layout: magic(4) | steps(512) | lastStep(64) | accents(64) | checksum(2) = 646 bytes
-const uint32_t SAVE_MAGIC = 0x53455133UL;       // change this to invalidate old saves
-const int EE_MAGIC = 0;
-const int EE_STEPS = EE_MAGIC + sizeof(SAVE_MAGIC);
-const int EE_LAST  = EE_STEPS + sizeof(steps);
-const int EE_ACC   = EE_LAST + sizeof(lastStep);
-const int EE_SUM   = EE_ACC + sizeof(accents);
+// Two blocks of 8 patterns each. Block 0 (patterns 1-8) keeps the original address and format,
+// so an existing save still loads. Block 1 (patterns 9-16) is new. Each has its own magic + checksum.
+//   +0 magic(4) | +4 steps(512) | +516 lastStep(64) | +580 accents(64) | +644 checksum(2)
+const int EE_BLOCK[2] = {0, 800};
+const uint32_t BLOCK_MAGIC[2] = {0x53455133UL, 0x53455134UL};   // change to invalidate a block
+const int BLK_STEPS = 4, BLK_LAST = 516, BLK_ACC = 580, BLK_SUM = 644;
+const size_t BLK_STEPS_N = 512, BLK_LAST_N = 64, BLK_ACC_N = 64;   // bytes per 8 patterns
+static_assert(sizeof(steps) == 2 * 512, "pattern array size must match the save blocks");
 
 // Tempo + swing live in their own block so the pattern save stays valid.
 const int EE_SET = 700;
@@ -301,14 +302,14 @@ uint8_t settingsCheck(const Settings &st) { return (st.bpm & 0xFF) ^ (st.bpm >> 
 
 uint32_t flashUntil = 0;                        // all LEDs on until this time (save confirmation)
 
-uint16_t dataChecksum() {
+uint16_t blockChecksum(uint8_t p0) {            // p0 = first pattern of the block (0 or 8)
   uint16_t sum = 0;
-  const uint8_t *p = (const uint8_t *)steps;
-  for (size_t i = 0; i < sizeof(steps); i++) sum = ((sum << 1) | (sum >> 15)) ^ p[i];
-  p = (const uint8_t *)lastStep;
-  for (size_t i = 0; i < sizeof(lastStep); i++) sum = ((sum << 1) | (sum >> 15)) ^ p[i];
-  p = (const uint8_t *)accents;
-  for (size_t i = 0; i < sizeof(accents); i++) sum = ((sum << 1) | (sum >> 15)) ^ p[i];
+  const uint8_t *p = (const uint8_t *)&steps[p0][0][0];
+  for (size_t i = 0; i < BLK_STEPS_N; i++) sum = ((sum << 1) | (sum >> 15)) ^ p[i];
+  p = (const uint8_t *)&lastStep[p0][0];
+  for (size_t i = 0; i < BLK_LAST_N; i++) sum = ((sum << 1) | (sum >> 15)) ^ p[i];
+  p = (const uint8_t *)&accents[p0][0];
+  for (size_t i = 0; i < BLK_ACC_N; i++) sum = ((sum << 1) | (sum >> 15)) ^ p[i];
   return sum;
 }
 
@@ -318,20 +319,39 @@ void initDefaults() {
   memset(lastStep, 15, sizeof(lastStep));       // default 16-step loops
 }
 
-bool loadState() {
+void eeRead(int addr, void *dst, size_t n) {
+  uint8_t *p = (uint8_t *)dst;
+  for (size_t i = 0; i < n; i++) p[i] = EEPROM.read(addr + i);
+}
+
+void clearBlock(uint8_t p0) {
+  memset(&steps[p0][0][0], 0, BLK_STEPS_N);
+  memset(&lastStep[p0][0], 15, BLK_LAST_N);     // default 16-step loops
+  memset(&accents[p0][0], 0, BLK_ACC_N);
+}
+
+bool loadBlock(uint8_t b) {
+  int base = EE_BLOCK[b];
+  uint8_t p0 = b * 8;
   uint32_t magic;
   uint16_t stored;
-  EEPROM.get(EE_MAGIC, magic);
-  if (magic != SAVE_MAGIC) return false;
-  EEPROM.get(EE_STEPS, steps);
-  EEPROM.get(EE_LAST, lastStep);
-  EEPROM.get(EE_ACC, accents);
-  EEPROM.get(EE_SUM, stored);
-  if (stored != dataChecksum()) {               // corrupt or partial save
-    initDefaults();
+  EEPROM.get(base, magic);
+  if (magic != BLOCK_MAGIC[b]) return false;
+  eeRead(base + BLK_STEPS, &steps[p0][0][0], BLK_STEPS_N);
+  eeRead(base + BLK_LAST, &lastStep[p0][0], BLK_LAST_N);
+  eeRead(base + BLK_ACC, &accents[p0][0], BLK_ACC_N);
+  EEPROM.get(base + BLK_SUM, stored);
+  if (stored != blockChecksum(p0)) {            // corrupt or partial save
+    clearBlock(p0);
     return false;
   }
   return true;
+}
+
+bool loadState() {
+  bool a = loadBlock(0);
+  bool b = loadBlock(1);
+  return a || b;
 }
 
 void loadSettings() {
@@ -370,27 +390,34 @@ void saveSettings(uint32_t t0) {
   eeWrite(EE_SET, &st, sizeof(st), t0);
 }
 
+void saveBlock(uint8_t b, uint32_t t0) {
+  int base = EE_BLOCK[b];
+  uint8_t p0 = b * 8;
+  eeWrite(base + BLK_STEPS, &steps[p0][0][0], BLK_STEPS_N, t0);
+  eeWrite(base + BLK_LAST, &lastStep[p0][0], BLK_LAST_N, t0);
+  eeWrite(base + BLK_ACC, &accents[p0][0], BLK_ACC_N, t0);
+  uint16_t sum = blockChecksum(p0);
+  eeWrite(base + BLK_SUM, &sum, sizeof(sum), t0);
+  uint32_t magic = BLOCK_MAGIC[b];              // magic last, so a partial save is never valid
+  eeWrite(base, &magic, sizeof(magic), t0);
+}
+
 void saveState() {
   allNotesOff();                                // writes block for a moment
   uint32_t t0 = millis();
   lastBusyPhase = -1;
-  eeWrite(EE_STEPS, steps, sizeof(steps), t0);
-  eeWrite(EE_LAST, lastStep, sizeof(lastStep), t0);
-  eeWrite(EE_ACC, accents, sizeof(accents), t0);
-  uint16_t sum = dataChecksum();
-  eeWrite(EE_SUM, &sum, sizeof(sum), t0);
+  saveBlock(0, t0);
+  saveBlock(1, t0);
   saveSettings(t0);
-  uint32_t magic = SAVE_MAGIC;                  // magic last, so a partial save is never valid
-  eeWrite(EE_MAGIC, &magic, sizeof(magic), t0);
   if (running) tickTime = micros();             // resync clock after the blocking write
   flashUntil = millis() + 400;                  // all-on confirmation
 }
 
-// Shift B + step 16 held for 1 second = save
+// Shift A + step 16 held for 1 second = save
 void checkSaveCombo() {
   static uint32_t holdStart = 0;
   static bool done = false;
-  if (shiftB.down && !shiftA.down && stepB[15].down) {
+  if (shiftA.down && !shiftB.down && stepB[15].down) {
     if (holdStart == 0) holdStart = millis();
     else if (!done && millis() - holdStart >= 1000) {
       saveState();
@@ -417,7 +444,7 @@ void handleButtons() {
       if (i < 8) curCh = i;
       else if (i < 12) viewBank = i - 8;
     } else if (b) {                             // pattern
-      if (i < 8) curPat = i;
+      curPat = i;
     } else if (accentB.down) {                  // accent edit (shared track)
       accents[curPat][viewBank] ^= (1u << i);
     } else {                                    // edit
@@ -458,7 +485,7 @@ void updateLeds() {
       if (i < 8) on = (i == curCh);
       else if (i < 12) on = ((i - 8) == viewBank);
     } else if (b) {
-      if (i < 8) on = (i == curPat);
+      on = (i == curPat);
     } else {
       on = (accentB.down ? accents[curPat][viewBank] : steps[curPat][curCh][viewBank]) & (1u << i);
       if (playPos >= 0 && (playPos >> 4) == viewBank && (playPos & 15) == i) on = !on;

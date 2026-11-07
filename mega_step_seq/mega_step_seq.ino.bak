@@ -3,6 +3,7 @@
 // 8 "channels" = 8 notes on MIDI channel 0. Per-channel loop length (polyrhythm).
 // MIDI out (notes): Serial1 TX1 (pin 18) @31250 -> DIN-5 (5V-220R-pin4, TX1-220R-pin5, pin2 GND)
 // MIDI clock out:   Serial2 TX2 (pin 16) @31250 -> second DIN-5, same circuit (24 PPQN + start/stop)
+// MIDI out 3:       Serial3 TX3 (pin 14) @31250 -> third DIN-5, same circuit (clock + start/stop, optionally notes)
 //
 // Controls (step buttons 1-16 = index 0-15):
 //   none      : toggle step in viewed bank (current channel)
@@ -27,25 +28,20 @@ const uint8_t ACCENT_PIN = 4;
 const uint8_t ENC_A = 2;                        // interrupt pins (INT4 / INT5)
 const uint8_t ENC_B = 3;
 const uint8_t ENC_SW = 20;
+const uint8_t LEAD_POT = A1;                    // sync timing advance (clock lead), 0-20 ms
 
 // ---------- MIDI config ----------
 const uint8_t MIDI_CH = 0;                       // channel 1 on the wire
 const uint8_t NOTES[8] = {30, 31, 32, 33, 34, 35, 36, 37};
 const uint8_t VELOCITY_NORMAL = 100;
-
-//const uint8_t VELOCITY_ACCENT = 127;
-const uint8_t ACCENT_MIN = 1;
-const uint8_t ACCENT_MAX = 127;
-
-uint8_t accentLevel = 127;
-
+const uint8_t VELOCITY_ACCENT = 127;
+const bool OUT3_NOTES = false;                  // third DIN: true = also mirror the note stream (clock can jitter slightly behind note bursts)
 // EEPROM busy indicator: checkerboard flipping between two frames. Bit i = LED i.
 // Assumes two rows of 8 (LEDs 0-7 top row, 8-15 bottom row). For a single row of 16 use 0x5555 / 0xAAAA.
 const uint16_t LOAD_FRAME_A = 0xAA55;           // top row: even LEDs, bottom row: odd LEDs
 const uint16_t LOAD_FRAME_B = 0x55AA;           // inverse
 const uint16_t BUSY_FRAME_MS = 150;             // time per frame
 const uint16_t BOOT_ANIM_MS = 600;              // minimum time the pattern shows at power-up (0 = off)
-const uint32_t CLOCK_LEAD_US = 5000;             // clock leads the notes by this much (compensates slaved gear's latency; tune by ear)
 
 // ---------- Data ----------
 uint16_t steps[8][8][4];     // [pattern][channel][bank] -> 16 step bits
@@ -53,6 +49,10 @@ uint16_t accents[8][4];      // [pattern][bank] -> 16 accent bits, shared by all
 uint8_t lastStep[8][8];      // [pattern][channel] -> 0..63 (loop length - 1)
 
 uint8_t curPat = 0, curCh = 0, viewBank = 0;
+
+// Defined up here on purpose: the Arduino builder inserts auto-generated function prototypes
+// before the first function, so any struct used in a function signature must come before it.
+struct Settings { uint16_t bpm; uint8_t swing; uint8_t check; };
 
 // ---------- Transport ----------
 bool running = false;
@@ -65,10 +65,6 @@ uint8_t swingPct = 0;
 
 bool noteOn[8];
 uint32_t offTime[8];
-
-// 1. Force a forward declaration at the absolute top of the file
-struct Settings_t; 
-typedef struct Settings_t Settings;
 
 // ---------- Buttons ----------
 struct Btn {
@@ -96,8 +92,17 @@ bool pressed(Btn &b) {
 }
 
 // ---------- MIDI ----------
-inline void midiOn(uint8_t note, uint8_t vel) { Serial1.write(0x90 | MIDI_CH); Serial1.write(note); Serial1.write(vel); }
-inline void midiOff(uint8_t note) { Serial1.write(0x80 | MIDI_CH); Serial1.write(note); Serial1.write((uint8_t)0); }
+inline void midiOn(uint8_t note, uint8_t vel) {
+  Serial1.write(0x90 | MIDI_CH); Serial1.write(note); Serial1.write(vel);
+  if (OUT3_NOTES) { Serial3.write(0x90 | MIDI_CH); Serial3.write(note); Serial3.write(vel); }
+}
+inline void midiOff(uint8_t note) {
+  Serial1.write(0x80 | MIDI_CH); Serial1.write(note); Serial1.write((uint8_t)0);
+  if (OUT3_NOTES) { Serial3.write(0x80 | MIDI_CH); Serial3.write(note); Serial3.write((uint8_t)0); }
+}
+
+// Clock / start / stop go to both sync outputs (Serial2 and Serial3)
+inline void sendRealtime(uint8_t b) { Serial2.write(b); Serial3.write(b); }
 
 void allNotesOff() {
   for (uint8_t c = 0; c < 8; c++) {
@@ -131,7 +136,7 @@ volatile uint8_t encState = R_START;
 volatile int8_t encDelta = 0;                   // detents since last read (+ = clockwise)
 
 uint16_t bpm = 120;
-bool readoutSwing = false;                      // which value the LED bar graph shows
+uint8_t readoutMode = 0;                        // LED bar graph shows: 0 tempo, 1 swing, 2 clock lead
 uint32_t readoutUntil = 0;                      // LED bar graph visible until this time (millis)
 
 void encISR() {
@@ -155,7 +160,21 @@ void initEncoder() {
 }
 
 void handleEncoder() {
+
+	static uint32_t dbgT = 0;
+	if (millis() - dbgT > 1000) {
+		dbgT = millis();
+		Serial.print("raw D8 = ");
+		Serial.println(digitalRead(8));
+	}	
+
+	bool oldDown = encSw.down;
   pressed(encSw);                               // keep debounce state current
+	if (oldDown != encSw.down) {
+		Serial.print("encSw changed: ");
+		Serial.print(encSw.down);
+		Serial.println("");
+	}
 
   noInterrupts();
   int8_t d = encDelta;
@@ -175,13 +194,45 @@ void handleEncoder() {
 
   if (encSw.down) {                             // push + turn = swing
     swingPct = constrain((int16_t)swingPct + delta, 0, 66);
-    readoutSwing = true;
+    readoutMode = 1;
   } else {                                      // turn = tempo
     bpm = constrain((int16_t)bpm + delta, 40, 240);
-    readoutSwing = false;
+    readoutMode = 0;
     applyTempo();
   }
   readoutUntil = now + 1000;
+}
+
+// ---------- Clock lead pot (sync timing advance) ----------
+// The sync clock is sent this much BEFORE the notes, to compensate for slaved gear / DAW latency.
+// Pot on A1: 0-20 ms in 0.1 ms units, smoothed with a deadband so it holds steady. The LED bar graph
+// shows the value for 1 s when it changes. Not saved: it is set by the pot position at power-up.
+const uint16_t CLOCK_LEAD_MAX_US = 20000;
+uint32_t clockLeadUs = 5000;
+uint8_t leadUnits = 50;                         // 0..200 (100 us each)
+int32_t leadAcc = 0;                            // smoothed reading x16
+
+float leadPotUnits() {                          // dead ends trimmed so 0 and max are reachable
+  float v = (leadAcc / 16.0f - 8.0f) / 1007.0f;
+  return constrain(v, 0.0f, 1.0f) * (CLOCK_LEAD_MAX_US / 100);
+}
+
+void initLeadPot() {
+  analogRead(LEAD_POT);                         // discard first read
+  leadAcc = (int32_t)analogRead(LEAD_POT) * 16;
+  leadUnits = (uint8_t)(leadPotUnits() + 0.5f);
+  clockLeadUs = leadUnits * 100UL;
+}
+
+void readLeadPot() {                            // call every ~4 ms
+  leadAcc += ((int32_t)analogRead(LEAD_POT) * 16 - leadAcc) >> 3;
+  float u = leadPotUnits();
+  if (fabs(u - leadUnits) > 0.75f) {            // deadband
+    leadUnits = (uint8_t)(u + 0.5f);
+    clockLeadUs = leadUnits * 100UL;
+    readoutMode = 2;
+    readoutUntil = millis() + 1000;
+  }
 }
 
 // ---------- Sequencer ----------
@@ -194,16 +245,7 @@ void playStep() {
     uint8_t p = stepCounter % chLen(curPat, c);
     if (steps[curPat][c][p >> 4] & (1u << (p & 15))) {
       if (noteOn[c]) midiOff(NOTES[c]);
-
-			//      midiOn(NOTES[c], (accents[curPat][p >> 4] & (1u << (p & 15))) ? VELOCITY_ACCENT : VELOCITY_NORMAL);
-
-			uint8_t velocity =
-				(accents[curPat][p >> 4] & (1u << (p & 15)))
-				? VELOCITY_NORMAL
-				: accentLevel;
-
-			midiOn(NOTES[c], velocity);
-			
+      midiOn(NOTES[c], (accents[curPat][p >> 4] & (1u << (p & 15))) ? VELOCITY_ACCENT : VELOCITY_NORMAL);
       noteOn[c] = true;
       offTime[c] = now + gate;
     }
@@ -215,19 +257,19 @@ void startSeq() {
   stepCounter = 0;
   tickIdx = 0;
   stepPending = false;
-  Serial2.write(0xFA);                          // MIDI start
+  sendRealtime(0xFA);                          // MIDI start
   tickTime = micros() + 1000;                   // >= 1 ms between start and first clock
 }
 
 void stopSeq() {
   running = false;
   stepPending = false;
-  Serial2.write(0xFC);                          // MIDI stop
+  sendRealtime(0xFC);                          // MIDI stop
   allNotesOff();
 }
 
 // The clock tick is the master timeline: 6 ticks per 16th step (24 PPQN).
-// Notes fire on step boundaries, delayed by CLOCK_LEAD_US plus swing on odd steps. The clock itself never swings.
+// Notes fire on step boundaries, delayed by clockLeadUs plus swing on odd steps. The clock itself never swings.
 void runClock() {
   uint32_t now = micros();
   for (uint8_t c = 0; c < 8; c++) {
@@ -239,9 +281,9 @@ void runClock() {
   if (!running) return;
 
   if ((int32_t)(now - tickTime) >= 0) {
-    Serial2.write(0xF8);                        // MIDI clock
+    sendRealtime(0xF8);                        // MIDI clock
     if (tickIdx == 0) {                         // step boundary
-      uint32_t d = CLOCK_LEAD_US + ((stepCounter & 1) ? (stepLenUs * swingPct) / 100 : 0);
+      uint32_t d = clockLeadUs + ((stepCounter & 1) ? (stepLenUs * swingPct) / 100 : 0);
       uint32_t maxD = stepLenUs - stepLenUs / 8;   // must fire before the next step boundary
       if (d > maxD) d = maxD;
       fireTime = tickTime + d;
@@ -269,16 +311,7 @@ const int EE_SUM   = EE_ACC + sizeof(accents);
 
 // Tempo + swing live in their own block so the pattern save stays valid.
 const int EE_SET = 700;
-
-typedef struct Settings_t {
-  uint16_t bpm;
-  uint8_t swing;
-  uint8_t check;
-} Settings;
-
-uint8_t settingsCheck(const Settings &st) {
-  return (st.bpm & 0xFF) ^ (st.bpm >> 8) ^ st.swing ^ 0x5A;
-}
+uint8_t settingsCheck(const Settings &st) { return (st.bpm & 0xFF) ^ (st.bpm >> 8) ^ st.swing ^ 0x5A; }
 
 uint32_t flashUntil = 0;                        // all LEDs on until this time (save confirmation)
 
@@ -417,7 +450,10 @@ void updateLeds() {
     return;
   }
   if ((int32_t)(millis() - readoutUntil) < 0) { // encoder readout: bar graph from the left
-    uint8_t n = readoutSwing ? 1 + (swingPct * 15) / 66 : 1 + ((bpm - 40) * 15) / 200;
+    uint8_t n;
+    if (readoutMode == 1) n = 1 + (swingPct * 15) / 66;
+    else if (readoutMode == 2) n = 1 + (leadUnits * 15) / 200;
+    else n = 1 + ((bpm - 40) * 15) / 200;
     for (uint8_t i = 0; i < 16; i++) digitalWrite(STEP_LED[i], i < n);
     return;
   }
@@ -445,22 +481,14 @@ void updateLeds() {
   }
 }
 
-void updateAccentLevel() {
-  static uint32_t lastRead = 0;
-
-  if (millis() - lastRead < 20) return;
-  lastRead = millis();
-
-  int potValue = analogRead(A0);
-
-  accentLevel = map(potValue, 0, 1023,
-                    ACCENT_MIN, ACCENT_MAX);
-}
-
 // ---------- Setup / loop ----------
 void setup() {
+	
+	Serial.begin(115200);
+	Serial.println("mega step sequencer started");
   Serial1.begin(31250);                         // MIDI notes out
   Serial2.begin(31250);                         // MIDI clock out
+  Serial3.begin(31250);                         // MIDI out 3 (clock, optionally notes)
   for (uint8_t i = 0; i < 16; i++) {
     initBtn(stepB[i], STEP_BTN[i]);
     pinMode(STEP_LED[i], OUTPUT);
@@ -477,7 +505,12 @@ void setup() {
   loadState();                                  // restore last save if present
 
   initEncoder();
+
+	Serial.print("encSw pin = ");
+	Serial.println(encSw.pin);	
+	
   loadSettings();                               // restore saved tempo/swing, else 120 BPM / 0%
+  initLeadPot();
   while (millis() - bootT0 < BOOT_ANIM_MS) busyAnim(bootT0);   // hold so it is visible
   for (uint8_t i = 0; i < 16; i++) digitalWrite(STEP_LED[i], LOW);
 }
@@ -487,6 +520,7 @@ void loop() {
   handleButtons();
   checkSaveCombo();
   handleEncoder();
-	updateAccentLevel();
+  static uint32_t leadT = 0;
+  if (millis() - leadT >= 4) { leadT = millis(); readLeadPot(); }
   updateLeds();
 }
