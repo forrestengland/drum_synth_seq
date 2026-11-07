@@ -28,6 +28,7 @@ const uint8_t ACCENT_PIN = 4;
 const uint8_t ENC_A = 2;                        // interrupt pins (INT4 / INT5)
 const uint8_t ENC_B = 3;
 const uint8_t ENC_SW = 8;
+const uint8_t LEAD_POT = A1;                    // sync timing advance (clock lead), 0-20 ms
 
 // ---------- MIDI config ----------
 const uint8_t MIDI_CH = 0;                       // channel 1 on the wire
@@ -41,7 +42,6 @@ const uint16_t LOAD_FRAME_A = 0xAA55;           // top row: even LEDs, bottom ro
 const uint16_t LOAD_FRAME_B = 0x55AA;           // inverse
 const uint16_t BUSY_FRAME_MS = 150;             // time per frame
 const uint16_t BOOT_ANIM_MS = 600;              // minimum time the pattern shows at power-up (0 = off)
-const uint32_t CLOCK_LEAD_US = 5000;             // clock leads the notes by this much (compensates slaved gear's latency; tune by ear)
 
 // ---------- Data ----------
 uint16_t steps[8][8][4];     // [pattern][channel][bank] -> 16 step bits
@@ -136,7 +136,7 @@ volatile uint8_t encState = R_START;
 volatile int8_t encDelta = 0;                   // detents since last read (+ = clockwise)
 
 uint16_t bpm = 120;
-bool readoutSwing = false;                      // which value the LED bar graph shows
+uint8_t readoutMode = 0;                        // LED bar graph shows: 0 tempo, 1 swing, 2 clock lead
 uint32_t readoutUntil = 0;                      // LED bar graph visible until this time (millis)
 
 void encISR() {
@@ -180,13 +180,45 @@ void handleEncoder() {
 
   if (encSw.down) {                             // push + turn = swing
     swingPct = constrain((int16_t)swingPct + delta, 0, 66);
-    readoutSwing = true;
+    readoutMode = 1;
   } else {                                      // turn = tempo
     bpm = constrain((int16_t)bpm + delta, 40, 240);
-    readoutSwing = false;
+    readoutMode = 0;
     applyTempo();
   }
   readoutUntil = now + 1000;
+}
+
+// ---------- Clock lead pot (sync timing advance) ----------
+// The sync clock is sent this much BEFORE the notes, to compensate for slaved gear / DAW latency.
+// Pot on A1: 0-20 ms in 0.1 ms units, smoothed with a deadband so it holds steady. The LED bar graph
+// shows the value for 1 s when it changes. Not saved: it is set by the pot position at power-up.
+const uint16_t CLOCK_LEAD_MAX_US = 20000;
+uint32_t clockLeadUs = 5000;
+uint8_t leadUnits = 50;                         // 0..200 (100 us each)
+int32_t leadAcc = 0;                            // smoothed reading x16
+
+float leadPotUnits() {                          // dead ends trimmed so 0 and max are reachable
+  float v = (leadAcc / 16.0f - 8.0f) / 1007.0f;
+  return constrain(v, 0.0f, 1.0f) * (CLOCK_LEAD_MAX_US / 100);
+}
+
+void initLeadPot() {
+  analogRead(LEAD_POT);                         // discard first read
+  leadAcc = (int32_t)analogRead(LEAD_POT) * 16;
+  leadUnits = (uint8_t)(leadPotUnits() + 0.5f);
+  clockLeadUs = leadUnits * 100UL;
+}
+
+void readLeadPot() {                            // call every ~4 ms
+  leadAcc += ((int32_t)analogRead(LEAD_POT) * 16 - leadAcc) >> 3;
+  float u = leadPotUnits();
+  if (fabs(u - leadUnits) > 0.75f) {            // deadband
+    leadUnits = (uint8_t)(u + 0.5f);
+    clockLeadUs = leadUnits * 100UL;
+    readoutMode = 2;
+    readoutUntil = millis() + 1000;
+  }
 }
 
 // ---------- Sequencer ----------
@@ -223,7 +255,7 @@ void stopSeq() {
 }
 
 // The clock tick is the master timeline: 6 ticks per 16th step (24 PPQN).
-// Notes fire on step boundaries, delayed by CLOCK_LEAD_US plus swing on odd steps. The clock itself never swings.
+// Notes fire on step boundaries, delayed by clockLeadUs plus swing on odd steps. The clock itself never swings.
 void runClock() {
   uint32_t now = micros();
   for (uint8_t c = 0; c < 8; c++) {
@@ -237,7 +269,7 @@ void runClock() {
   if ((int32_t)(now - tickTime) >= 0) {
     sendRealtime(0xF8);                        // MIDI clock
     if (tickIdx == 0) {                         // step boundary
-      uint32_t d = CLOCK_LEAD_US + ((stepCounter & 1) ? (stepLenUs * swingPct) / 100 : 0);
+      uint32_t d = clockLeadUs + ((stepCounter & 1) ? (stepLenUs * swingPct) / 100 : 0);
       uint32_t maxD = stepLenUs - stepLenUs / 8;   // must fire before the next step boundary
       if (d > maxD) d = maxD;
       fireTime = tickTime + d;
@@ -404,7 +436,10 @@ void updateLeds() {
     return;
   }
   if ((int32_t)(millis() - readoutUntil) < 0) { // encoder readout: bar graph from the left
-    uint8_t n = readoutSwing ? 1 + (swingPct * 15) / 66 : 1 + ((bpm - 40) * 15) / 200;
+    uint8_t n;
+    if (readoutMode == 1) n = 1 + (swingPct * 15) / 66;
+    else if (readoutMode == 2) n = 1 + (leadUnits * 15) / 200;
+    else n = 1 + ((bpm - 40) * 15) / 200;
     for (uint8_t i = 0; i < 16; i++) digitalWrite(STEP_LED[i], i < n);
     return;
   }
@@ -454,6 +489,7 @@ void setup() {
 
   initEncoder();
   loadSettings();                               // restore saved tempo/swing, else 120 BPM / 0%
+  initLeadPot();
   while (millis() - bootT0 < BOOT_ANIM_MS) busyAnim(bootT0);   // hold so it is visible
   for (uint8_t i = 0; i < 16; i++) digitalWrite(STEP_LED[i], LOW);
 }
@@ -463,5 +499,7 @@ void loop() {
   handleButtons();
   checkSaveCombo();
   handleEncoder();
+  static uint32_t leadT = 0;
+  if (millis() - leadT >= 4) { leadT = millis(); readLeadPot(); }
   updateLeds();
 }
