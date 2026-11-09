@@ -18,14 +18,16 @@
  *   F1 pattern view        F2 instrument view
  *   F3/F4 octave -/+       F5 save project   F6 load project
  *   F7 edit mode on/off (off = pattern is read-only; notes just audition)
- *   F8 track view: per-track MIDI out channel (OFF,1-16) and internal audio on/off
+ *   F8 track view: per-track MIDI out channel (OFF,1-16), internal audio on/off, mute
+ *   1..4   toggle mute on track 1..4 (any view; in the pattern view while editing
+ *          the instrument/volume fields the digits are data entry instead)
  *   F9 sync INT <-> MIDI   F10 or Ctrl-C quit
  *   Space play/stop        < > BPM -/+  (internal sync)
  *
  * Pattern view
  *   arrows / PgUp PgDn / Home End   move       Tab / Shift-Tab   next/prev channel
- *   note field: piano keys  (z s x d c v g b h n j m = C..B of current octave,
- *               q 2 w 3 e r 5 t 6 y 7 u i 9 o 0 p = one octave up),  1 = note off
+ *   note field: piano keys, one octave:  z s x d c v g b h n j m = C C# D D# E F F# G G# A A# B
+ *               (F3/F4 change the octave),  q = note off
  *   inst field: 1-8        volume fields: 0-9 a-f (hex)
  *   [ ]   previous/next instrument     ( )  edit step -/+
  *   Del   clear field (clears whole cell on note field)
@@ -36,7 +38,7 @@
  *                         att dec sus rel (amplitude envelope, times in ms)
  *   Left/Right adjust     PgUp/PgDn big adjust    , .  1-frame adjust (loop points)
  *   L or Enter load sample    Del unload
- *   piano keys audition the selected instrument, 1 stops the audition
+ *   piano keys audition the selected instrument, q stops the audition
  */
 #define _GNU_SOURCE
 #include <ncurses.h>
@@ -108,6 +110,7 @@ static const float pan[NVOICE] = { 0.25f, 0.75f, 0.75f, 0.25f, 0.5f };
 /* per-track routing (edited from the track view) */
 static int trk_midi[NCHAN];                      /* 0 = MIDI off, 1..16 = channel */
 static int trk_audio[NCHAN] = { 1, 1, 1, 1 };    /* internal sample playback */
+static atomic_int trk_mute[NCHAN];               /* muted: no audio and no MIDI from the sequencer */
 
 /* instrument table / pattern swaps are guarded by this; audio thread only try-locks */
 static pthread_mutex_t ins_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -136,6 +139,7 @@ static void           *midi_out_buf;   /* this cycle's MIDI out buffer */
 static jack_nframes_t  cur_time, midi_last;   /* frame offset for outgoing events */
 static int      midi_note[NCHAN] = { -1, -1, -1, -1 };   /* sounding MIDI note per track */
 static int      midi_chan[NCHAN];                        /* channel it was sent on */
+static int      was_muted[NCHAN];
 static int      pv_note = -1, pv_chan;                   /* MIDI audition note */
 static int64_t  pv_left;
 
@@ -172,6 +176,15 @@ static void voice_release(Voice *vc)
     float minf   = (float)srate * 0.002f;
     if (frames < minf) frames = minf;
     vc->rel_step = vc->level / frames;
+    vc->stage = ENV_REL;
+}
+
+/* mute: fade out over 5 ms, ignoring the instrument's release time */
+static void voice_fade(Voice *vc)
+{
+    if (!vc->active) return;
+    if (vc->level <= 0.0f) { vc->active = 0; return; }
+    vc->rel_step = vc->level / ((float)srate * 0.005f);
     vc->stage = ENV_REL;
 }
 
@@ -228,6 +241,7 @@ static void step_row(void)
 
     for (int c = 0; c < NCHAN; c++) {
         Cell *ce = &pat[r][c];
+        if (atomic_load(&trk_mute[c])) continue;
         if (ce->note == NOTE_OFF) {
             voice_release(&voices[c]);
             midi_note_off(c);
@@ -376,6 +390,12 @@ static int process(jack_nframes_t n, void *arg)
     if (c == 1 && !ext) { next_row = atomic_load(&cmd_row) % PAT_LEN; acc = spr; running = 1; }
     else if (c == 2)    { running = 0; kill_voices(); midi_all_off(); }
 
+    for (int t = 0; t < NCHAN; t++) {             /* newly muted track: silence it now */
+        int m = atomic_load(&trk_mute[t]);
+        if (m && !was_muted[t]) { voice_fade(&voices[t]); midi_note_off(t); }
+        was_muted[t] = m;
+    }
+
     int pr = atomic_exchange(&preview_req, 0);
     if (pr) {
         int i = (pr >> 8) - 1, note = pr & 0xff;
@@ -510,7 +530,8 @@ static int project_save(const char *path, char *err, size_t el)
 
     fprintf(f, "XTRACK 1\nbpm %d\n", atomic_load(&bpm));
     for (int c = 0; c < NCHAN; c++)
-        fprintf(f, "track %d audio=%d midi=%d\n", c + 1, trk_audio[c], trk_midi[c]);
+        fprintf(f, "track %d audio=%d midi=%d mute=%d\n", c + 1, trk_audio[c], trk_midi[c],
+                atomic_load(&trk_mute[c]));
     for (int i = 0; i < NINST; i++) {
         Inst *in = &ins[i];
         fprintf(f, "inst %d tune=%d fine=%d vol=%d loop=%d ls=%u le=%u a=%d d=%d s=%d r=%d path=%s\n",
@@ -544,7 +565,7 @@ static int project_load(const char *file, char *err, size_t el, int *missing)
     Cell tmp[PAT_LEN][NCHAN];
     char line[1024];
     int newbpm = 0;
-    int t_audio[NCHAN] = { 1, 1, 1, 1 }, t_midi[NCHAN] = { 0, 0, 0, 0 };
+    int t_audio[NCHAN] = { 1, 1, 1, 1 }, t_midi[NCHAN] = { 0, 0, 0, 0 }, t_mute[NCHAN] = { 0, 0, 0, 0 };
 
     *missing = 0;
     FILE *f = fopen(file, "r");
@@ -595,6 +616,8 @@ static int project_load(const char *file, char *err, size_t el, int *missing)
             if (sscanf(line, "track %d audio=%d midi=%d", &n, &au, &mi) == 3 && n >= 1 && n <= NCHAN) {
                 t_audio[n - 1] = au ? 1 : 0;
                 t_midi[n - 1]  = mi < 0 ? 0 : mi > 16 ? 16 : mi;
+                int mu;                              /* mute is optional (older files) */
+                if (sscanf(line, "track %*d audio=%*d midi=%*d mute=%d", &mu) == 1) t_mute[n - 1] = mu ? 1 : 0;
             }
         } else if (!strncmp(line, "row ", 4)) {
             int r, off = 0;
@@ -622,7 +645,11 @@ static int project_load(const char *file, char *err, size_t el, int *missing)
     memcpy(pat, tmp, sizeof pat);
     pthread_mutex_unlock(&ins_lock);
     if (newbpm >= 32 && newbpm <= 300) atomic_store(&bpm, newbpm);
-    for (int c = 0; c < NCHAN; c++) { trk_audio[c] = t_audio[c]; trk_midi[c] = t_midi[c]; }
+    for (int c = 0; c < NCHAN; c++) {
+        trk_audio[c] = t_audio[c];
+        trk_midi[c]  = t_midi[c];
+        atomic_store(&trk_mute[c], t_mute[c]);
+    }
 
     for (int i = 0; i < NINST; i++) {
         struct Cfg *c = &cfg[i];
@@ -688,13 +715,11 @@ static void note_str(int n, char *o)
 
 static int key_to_note(int k, int oct)
 {
-    static const char lower[] = "zsxdcvgbhnjm";
-    static const char upper[] = "q2w3er5t6y7ui9o0p";
+    static const char lower[] = "zsxdcvgbhnjm";      /* one octave, C..B */
     if (k <= 0 || k >= 128) return 0;
-    const char *p;
-    int n = 0;
-    if ((p = strchr(lower, k)) && *p)      n = 1 + oct * 12 + (int)(p - lower);
-    else if ((p = strchr(upper, k)) && *p) n = 1 + (oct + 1) * 12 + (int)(p - upper);
+    const char *p = strchr(lower, k);
+    if (!p || !*p) return 0;
+    int n = 1 + oct * 12 + (int)(p - lower);
     return (n >= 1 && n <= 96) ? n : 0;
 }
 
@@ -711,9 +736,20 @@ static void audition(int inst, int note)
     atomic_store(&preview_req, ((inst + 1) << 8) | note);
 }
 
+static void toggle_mute(int tr)
+{
+    int m = !atomic_load(&trk_mute[tr]);
+    atomic_store(&trk_mute[tr], m);
+    snprintf(status, sizeof status, "Track %d %s", tr + 1, m ? "muted" : "unmuted");
+}
+
 /* audition a note the way track `tr` is routed: internal sample and/or MIDI out */
 static void audition_track(int tr, int note)
 {
+    if (atomic_load(&trk_mute[tr])) {
+        snprintf(status, sizeof status, "Track %d is muted", tr + 1);
+        return;
+    }
     if (trk_audio[tr] || note == NOTE_OFF) audition(cur_inst, note);
     if (trk_midi[tr]) atomic_store(&preview_midi, (trk_midi[tr] << 8) | note);
 }
@@ -767,7 +803,14 @@ static void draw_pattern(void)
     for (int c = 0; c < NCHAN; c++) {
         char m[8];
         if (trk_midi[c]) snprintf(m, sizeof m, "%02d", trk_midi[c]); else strcpy(m, "--");
-        mvprintw(1, 5 + c * 12, "CH%d %c M%s", c + 1, trk_audio[c] ? 'A' : '-', m);
+        if (atomic_load(&trk_mute[c])) {
+            attron(COLOR_PAIR(5) | A_BOLD);
+            mvprintw(1, 5 + c * 12, "CH%d MUTED", c + 1);
+            attroff(COLOR_PAIR(5) | A_BOLD);
+            attron(COLOR_PAIR(4) | A_BOLD);
+        } else {
+            mvprintw(1, 5 + c * 12, "CH%d %c M%s", c + 1, trk_audio[c] ? 'A' : '-', m);
+        }
     }
     attroff(COLOR_PAIR(4) | A_BOLD);
     attron(A_DIM);
@@ -797,8 +840,11 @@ static void draw_pattern(void)
             if (ce->vol >= 0) snprintf(vv, sizeof vv, "%02X", ce->vol); else strcpy(vv, "--");
             snprintf(s, sizeof s, "%s %s %s", nn, ii, vv);
             int x = 5 + c * 12;
+            int mut = atomic_load(&trk_mute[c]);
             mvaddstr(y, x - 2, "|");
+            if (mut) attron(A_DIM);
             mvaddstr(y, x, s);
+            if (mut) attroff(A_DIM);
             if (r == cur_row && c == cur_ch) {
                 attron(A_REVERSE);
                 mvaddnstr(y, x + foff[cur_field], s + foff[cur_field], flen[cur_field]);
@@ -808,7 +854,7 @@ static void draw_pattern(void)
         attroff(attr);
     }
     footer(HELP_GLOBAL,
-           "Space play  Enter play@cursor  [ ]inst  ( )step  Del clear  1=note off  <>bpm");
+           "Spc play Ret play@cur [ ]inst ( )step Del clr q=off <>bpm 1-4 mute");
 }
 
 static void compute_peaks(void)
@@ -920,7 +966,7 @@ static void draw_inst(void)
         mvaddch(20, 2 + xe, ']');
     }
     footer(HELP_GLOBAL,
-           "Up/Dn slot Tab param Lt/Rt adj PgUp/Dn big ,/. fine L load Del clr 1=stop");
+           "Up/Dn slot Tab param Lt/Rt adj PgUp/Dn big ,/. fine L load q=stop 1-4 mute");
 }
 
 /* ---- prompts / project actions */
@@ -1092,7 +1138,7 @@ static void inst_key(int k)
     case '.':       adjust_param(+1, 0); return;
     case KEY_PPAGE: adjust_param(+1, 2); return;
     case KEY_NPAGE: adjust_param(-1, 2); return;
-    case '1':       audition(inst_sel, NOTE_OFF); return;
+    case 'q':       audition(inst_sel, NOTE_OFF); return;
     case 'l': case 'L': case '\n': case KEY_ENTER: prompt_load_sample(); return;
     case KEY_DC:
         swap_sample(inst_sel, NULL, 0, 0, "");
@@ -1101,6 +1147,7 @@ static void inst_key(int k)
         snprintf(status, sizeof status, "Slot %d cleared", inst_sel + 1);
         return;
     }
+    if (k >= '1' && k < '1' + NCHAN) { toggle_mute(k - '1'); return; }
     int n = key_to_note(k, octave);
     if (n) audition(inst_sel, n);
 }
@@ -1137,17 +1184,23 @@ static void pattern_key(int k)
         return;
     }
 
+    /* 1..4 mute tracks, except when typing instrument/volume digits in edit mode */
+    if (k >= '1' && k < '1' + NCHAN && (!edit_mode || cur_field == 0)) {
+        toggle_mute(k - '1');
+        return;
+    }
+
     if (!edit_mode) {                 /* view mode: audition only, never touch the pattern */
         int n = key_to_note(k, octave);
         if (n)            audition_track(cur_ch, n);
-        else if (k == '1') audition_track(cur_ch, NOTE_OFF);
+        else if (k == 'q') audition_track(cur_ch, NOTE_OFF);
         else if (cur_field >= 1 && (hexval(k) >= 0))
             snprintf(status, sizeof status, "Edit mode is off - press F7 to edit");
         return;
     }
 
     if (cur_field == 0) {
-        if (k == '1') { ce->note = NOTE_OFF; ce->inst = 0; move_row(step); }
+        if (k == 'q') { ce->note = NOTE_OFF; ce->inst = 0; move_row(step); }
         else {
             int n = key_to_note(k, octave);
             if (n) {
@@ -1178,22 +1231,26 @@ static void draw_track(void)
 {
     title_bar("TRACKS");
     attron(COLOR_PAIR(4) | A_BOLD);
-    mvprintw(1, 1, "#   AUDIO  MIDI OUT");
+    mvprintw(1, 1, "#   AUDIO  MIDI OUT  MUTE");
     attroff(COLOR_PAIR(4) | A_BOLD);
 
     for (int c = 0; c < NCHAN; c++) {
         int y = 2 + c, sel = (c == trk_sel);
-        char a[8], m[12];
+        char a[8], m[12], mu[8];
         snprintf(a, sizeof a, "%-3s", trk_audio[c] ? "ON" : "OFF");
         if (trk_midi[c]) snprintf(m, sizeof m, "CH %02d", trk_midi[c]);
         else             snprintf(m, sizeof m, "OFF  ");
+        snprintf(mu, sizeof mu, "%s", atomic_load(&trk_mute[c]) ? "MUTED" : "off  ");
         if (sel) attron(A_BOLD);
         mvprintw(y, 0, "%c%d", sel ? '>' : ' ', c + 1);
         mvaddstr(y, 4, a);
         mvaddstr(y, 11, m);
+        mvaddstr(y, 21, mu);
         if (sel) {
             attron(A_REVERSE);
-            if (trk_param == 0) mvaddstr(y, 4, a); else mvaddstr(y, 11, m);
+            if (trk_param == 0)      mvaddstr(y, 4, a);
+            else if (trk_param == 1) mvaddstr(y, 11, m);
+            else                     mvaddstr(y, 21, mu);
             attroff(A_REVERSE);
             attroff(A_BOLD);
         }
@@ -1202,7 +1259,8 @@ static void draw_track(void)
     mvprintw(9,  1, "Tracker C-4 = MIDI note 60. Volume column = velocity (00-FF -> 1-127).");
     mvprintw(10, 1, "Empty volume = velocity 127. Instrument number is not sent over MIDI.");
     mvprintw(11, 1, "AUDIO OFF + MIDI on = a MIDI-only track.  Piano keys audition the track.");
-    footer(HELP_GLOBAL, "Up/Dn track  Tab param  Lt/Rt change  PgUp/PgDn x4  keys=audition  1=stop");
+    mvprintw(12, 1, "Mute: press 1-4 (not while typing inst/vol digits). Muted = silent, incl. audition.");
+    footer(HELP_GLOBAL, "Up/Dn track Tab param Lt/Rt change PgUp/Dn x4 keys=audition q=stop 1-4 mute");
 }
 
 static void track_key(int k)
@@ -1210,18 +1268,21 @@ static void track_key(int k)
     switch (k) {
     case KEY_UP:   trk_sel = (trk_sel + NCHAN - 1) % NCHAN; return;
     case KEY_DOWN: trk_sel = (trk_sel + 1) % NCHAN; return;
-    case '\t': case KEY_BTAB: trk_param = !trk_param; return;
+    case '\t':     trk_param = (trk_param + 1) % 3; return;
+    case KEY_BTAB: trk_param = (trk_param + 2) % 3; return;
     case KEY_LEFT: case KEY_RIGHT: case KEY_PPAGE: case KEY_NPAGE: {
         int d = (k == KEY_LEFT || k == KEY_NPAGE) ? -1 : 1;
         if (trk_param == 0) trk_audio[trk_sel] = !trk_audio[trk_sel];
+        else if (trk_param == 2) toggle_mute(trk_sel);
         else {
             int v = trk_midi[trk_sel] + d * ((k == KEY_PPAGE || k == KEY_NPAGE) ? 4 : 1);
             trk_midi[trk_sel] = v < 0 ? 0 : v > 16 ? 16 : v;
         }
         return;
     }
-    case '1': audition_track(trk_sel, NOTE_OFF); return;
+    case 'q': audition_track(trk_sel, NOTE_OFF); return;
     }
+    if (k >= '1' && k < '1' + NCHAN) { toggle_mute(k - '1'); return; }
     int n = key_to_note(k, octave);
     if (n) audition_track(trk_sel, n);
 }
@@ -1262,9 +1323,9 @@ static void demo_pattern(void)
 {
     for (int r = 0; r < PAT_LEN; r++)
         for (int c = 0; c < NCHAN; c++) pat[r][c] = (Cell){ 0, 0, -1 };
-    //    for (int r = 0; r < PAT_LEN; r += 4) pat[r][0] = (Cell){ 49, 1, 0xFF };
-    //    for (int r = 4; r < PAT_LEN; r += 8) pat[r][1] = (Cell){ 49, 2, 0xC0 };
-    //    for (int r = 2; r < PAT_LEN; r += 4) pat[r][2] = (Cell){ 49, 3, 0x60 };
+    for (int r = 0; r < PAT_LEN; r += 4) pat[r][0] = (Cell){ 49, 1, 0xFF };
+    for (int r = 4; r < PAT_LEN; r += 8) pat[r][1] = (Cell){ 49, 2, 0xC0 };
+    for (int r = 2; r < PAT_LEN; r += 4) pat[r][2] = (Cell){ 49, 3, 0x60 };
 }
 
 int main(int argc, char **argv)
