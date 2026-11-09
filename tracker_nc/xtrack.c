@@ -9,6 +9,8 @@
  *     fine tune (cents), volume, loop (off / forward / ping-pong, start+end),
  *     ADSR amplitude envelope
  *   - project save/load (text file, references samples by path)
+ *   - JACK MIDI out (port "midi_out"): each track can send notes on its own MIDI
+ *     channel; tracker C-4 = MIDI note 60, volume column = velocity (empty = 127)
  *
  * Usage:  ./xtrack [project.xtp] [sample1.wav ... sample8.wav]
  *
@@ -16,6 +18,7 @@
  *   F1 pattern view        F2 instrument view
  *   F3/F4 octave -/+       F5 save project   F6 load project
  *   F7 edit mode on/off (off = pattern is read-only; notes just audition)
+ *   F8 track view: per-track MIDI out channel (OFF,1-16) and internal audio on/off
  *   F9 sync INT <-> MIDI   F10 or Ctrl-C quit
  *   Space play/stop        < > BPM -/+  (internal sync)
  *
@@ -52,6 +55,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <locale.h>
+#include <unistd.h>
 
 #define NCHAN      4
 #define NINST      8
@@ -101,6 +105,10 @@ static Inst  ins[NINST];
 static Voice voices[NVOICE];
 static const float pan[NVOICE] = { 0.25f, 0.75f, 0.75f, 0.25f, 0.5f };
 
+/* per-track routing (edited from the track view) */
+static int trk_midi[NCHAN];                      /* 0 = MIDI off, 1..16 = channel */
+static int trk_audio[NCHAN] = { 1, 1, 1, 1 };    /* internal sample playback */
+
 /* instrument table / pattern swaps are guarded by this; audio thread only try-locks */
 static pthread_mutex_t ins_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -112,17 +120,24 @@ static atomic_int play_row   = 0;
 static atomic_int cmd        = 0;      /* 1 start, 2 stop */
 static atomic_int cmd_row    = 0;
 static atomic_int preview_req = 0;     /* ((inst+1)<<8) | note */
+static atomic_int preview_midi = 0;    /* (midi_ch<<8) | note */
 static atomic_int bpm_est10  = 0;      /* measured MIDI clock tempo * 10 */
 
 /* audio-thread private */
 static jack_client_t *client;
-static jack_port_t   *out_l, *out_r, *midi_in;
+static jack_port_t   *out_l, *out_r, *midi_in, *midi_out;
 static jack_nframes_t srate = 48000;
 static int      next_row, running, clk;
 static double   acc, spr, clk_avg;
 static uint64_t abs_frames, last_clk_abs;
 static int      last_inst[NCHAN] = { -1, -1, -1, -1 };
 static int64_t  preview_left;          /* frames remaining on audition voice */
+static void           *midi_out_buf;   /* this cycle's MIDI out buffer */
+static jack_nframes_t  cur_time, midi_last;   /* frame offset for outgoing events */
+static int      midi_note[NCHAN] = { -1, -1, -1, -1 };   /* sounding MIDI note per track */
+static int      midi_chan[NCHAN];                        /* channel it was sent on */
+static int      pv_note = -1, pv_chan;                   /* MIDI audition note */
+static int64_t  pv_left;
 
 /* ----------------------------------------------------------------- audio */
 
@@ -160,6 +175,51 @@ static void voice_release(Voice *vc)
     vc->stage = ENV_REL;
 }
 
+/* ---- MIDI out (all messages are 3 bytes; times are kept non-decreasing) */
+
+static void midi_send(unsigned char st, unsigned char d1, unsigned char d2)
+{
+    if (!midi_out_buf) return;
+    unsigned char m[3] = { st, d1, d2 };
+    jack_nframes_t t = cur_time < midi_last ? midi_last : cur_time;
+    if (jack_midi_event_write(midi_out_buf, t, m, 3) == 0) midi_last = t;
+}
+
+static int midi_pitch(int note)
+{
+    int n = (note - BASE_NOTE) + 60;           /* tracker C-4 -> MIDI 60 */
+    return n < 0 ? 0 : n > 127 ? 127 : n;
+}
+
+static void midi_note_off(int c)
+{
+    if (midi_note[c] < 0) return;
+    midi_send(0x80 | (midi_chan[c] - 1), midi_note[c], 0);
+    midi_note[c] = -1;
+}
+
+static void midi_note_on(int c, int ch, int note, int vol)
+{
+    midi_note_off(c);                          /* new note ends the previous one */
+    int vel = vol < 0 ? 127 : 1 + vol * 126 / 255;
+    midi_note[c] = midi_pitch(note);
+    midi_chan[c] = ch;
+    midi_send(0x90 | (ch - 1), midi_note[c], vel);
+}
+
+static void pv_off(void)
+{
+    if (pv_note < 0) return;
+    midi_send(0x80 | (pv_chan - 1), pv_note, 0);
+    pv_note = -1;
+}
+
+static void midi_all_off(void)
+{
+    for (int c = 0; c < NCHAN; c++) midi_note_off(c);
+    pv_off();
+}
+
 static void step_row(void)
 {
     int r = next_row;
@@ -170,7 +230,11 @@ static void step_row(void)
         Cell *ce = &pat[r][c];
         if (ce->note == NOTE_OFF) {
             voice_release(&voices[c]);
+            midi_note_off(c);
         } else if (ce->note >= 1 && ce->note <= 96) {
+            if (trk_midi[c]) midi_note_on(c, trk_midi[c], ce->note, ce->vol);
+            else             midi_note_off(c);
+            if (!trk_audio[c]) { voices[c].active = 0; continue; }
             int i = ce->inst ? ce->inst - 1 : last_inst[c];
             if (i < 0 || i >= NINST) continue;
             last_inst[c] = i;
@@ -258,6 +322,7 @@ static void handle_midi(const jack_midi_event_t *ev, int ext)
 {
     if (ev->size < 1) return;
     unsigned char st = ev->buffer[0];
+    cur_time = ev->time;
     switch (st) {
     case 0xF8: {                                   /* clock, 24 ppqn */
         uint64_t t = abs_frames + ev->time;
@@ -278,7 +343,7 @@ static void handle_midi(const jack_midi_event_t *ev, int ext)
     }
     case 0xFA: if (ext) { next_row = 0; clk = 0; running = 1; } break;   /* start */
     case 0xFB: if (ext) running = 1; break;                              /* continue */
-    case 0xFC: if (ext) { running = 0; kill_voices(); } break;           /* stop */
+    case 0xFC: if (ext) { running = 0; kill_voices(); midi_all_off(); } break;           /* stop */
     case 0xF2:                                                           /* SPP */
         if (ext && ev->size >= 3) {
             int spp = (ev->buffer[1] & 0x7f) | ((ev->buffer[2] & 0x7f) << 7);
@@ -297,6 +362,11 @@ static int process(jack_nframes_t n, void *arg)
     memset(L, 0, n * sizeof(float));
     memset(R, 0, n * sizeof(float));
 
+    midi_out_buf = jack_port_get_buffer(midi_out, n);
+    jack_midi_clear_buffer(midi_out_buf);          /* required every cycle */
+    midi_last = 0;
+    cur_time = 0;
+
     if (pthread_mutex_trylock(&ins_lock) != 0) { abs_frames += n; return 0; }
 
     int ext = atomic_load(&sync_ext);
@@ -304,7 +374,7 @@ static int process(jack_nframes_t n, void *arg)
 
     int c = atomic_exchange(&cmd, 0);
     if (c == 1 && !ext) { next_row = atomic_load(&cmd_row) % PAT_LEN; acc = spr; running = 1; }
-    else if (c == 2)    { running = 0; kill_voices(); }
+    else if (c == 2)    { running = 0; kill_voices(); midi_all_off(); }
 
     int pr = atomic_exchange(&preview_req, 0);
     if (pr) {
@@ -317,6 +387,18 @@ static int process(jack_nframes_t n, void *arg)
         }
     }
 
+    int pm = atomic_exchange(&preview_midi, 0);
+    if (pm) {
+        int ch = (pm >> 8) & 0xff, note = pm & 0xff;
+        pv_off();
+        if (note != NOTE_OFF && ch >= 1 && ch <= 16) {
+            pv_note = midi_pitch(note);
+            pv_chan = ch;
+            pv_left = (int64_t)(srate * PREVIEW_SECS);
+            midi_send(0x90 | (ch - 1), pv_note, 100);
+        }
+    }
+
     void *mb = jack_port_get_buffer(midi_in, n);
     uint32_t ne = jack_midi_get_event_count(mb), ei = 0;
     jack_midi_event_t ev;
@@ -325,7 +407,7 @@ static int process(jack_nframes_t n, void *arg)
 
     jack_nframes_t pos = 0;
     while (pos < n) {
-        if (!ext && running && acc >= spr) { acc -= spr; step_row(); }
+        if (!ext && running && acc >= spr) { acc -= spr; cur_time = pos; step_row(); }
 
         jack_nframes_t end = n;
         if (have && ev.time < end) end = ev.time;
@@ -345,6 +427,11 @@ static int process(jack_nframes_t n, void *arg)
             handle_midi(&ev, ext);
             have = (ei < ne && jack_midi_event_get(&ev, mb, ei++) == 0);
         }
+    }
+
+    if (pv_note >= 0) {                            /* end of MIDI audition note */
+        if (pv_left < (int64_t)n) { cur_time = (jack_nframes_t)pv_left; pv_off(); }
+        else pv_left -= n;
     }
 
     atomic_store(&playing, running);
@@ -422,6 +509,8 @@ static int project_save(const char *path, char *err, size_t el)
     if (!f) { snprintf(err, el, "%s", strerror(errno)); return -1; }
 
     fprintf(f, "XTRACK 1\nbpm %d\n", atomic_load(&bpm));
+    for (int c = 0; c < NCHAN; c++)
+        fprintf(f, "track %d audio=%d midi=%d\n", c + 1, trk_audio[c], trk_midi[c]);
     for (int i = 0; i < NINST; i++) {
         Inst *in = &ins[i];
         fprintf(f, "inst %d tune=%d fine=%d vol=%d loop=%d ls=%u le=%u a=%d d=%d s=%d r=%d path=%s\n",
@@ -455,6 +544,7 @@ static int project_load(const char *file, char *err, size_t el, int *missing)
     Cell tmp[PAT_LEN][NCHAN];
     char line[1024];
     int newbpm = 0;
+    int t_audio[NCHAN] = { 1, 1, 1, 1 }, t_midi[NCHAN] = { 0, 0, 0, 0 };
 
     *missing = 0;
     FILE *f = fopen(file, "r");
@@ -500,6 +590,12 @@ static int project_load(const char *file, char *err, size_t el, int *missing)
                 }
                 snprintf(c->path, sizeof c->path, "%s", path);
             }
+        } else if (!strncmp(line, "track ", 6)) {
+            int n, au, mi;
+            if (sscanf(line, "track %d audio=%d midi=%d", &n, &au, &mi) == 3 && n >= 1 && n <= NCHAN) {
+                t_audio[n - 1] = au ? 1 : 0;
+                t_midi[n - 1]  = mi < 0 ? 0 : mi > 16 ? 16 : mi;
+            }
         } else if (!strncmp(line, "row ", 4)) {
             int r, off = 0;
             if (sscanf(line, "row %d%n", &r, &off) == 1 && r >= 0 && r < PAT_LEN) {
@@ -526,6 +622,7 @@ static int project_load(const char *file, char *err, size_t el, int *missing)
     memcpy(pat, tmp, sizeof pat);
     pthread_mutex_unlock(&ins_lock);
     if (newbpm >= 32 && newbpm <= 300) atomic_store(&bpm, newbpm);
+    for (int c = 0; c < NCHAN; c++) { trk_audio[c] = t_audio[c]; trk_midi[c] = t_midi[c]; }
 
     for (int i = 0; i < NINST; i++) {
         struct Cfg *c = &cfg[i];
@@ -565,13 +662,14 @@ static int project_load(const char *file, char *err, size_t el, int *missing)
 
 /* -------------------------------------------------------------------- UI */
 
-enum { V_PATTERN, V_INST };
+enum { V_PATTERN, V_INST, V_TRACK };
 enum { P_TUNE, P_FINE, P_VOL, P_LOOP, P_LSTART, P_LEND, P_ATT, P_DEC, P_SUS, P_REL, NPARAM };
 
 static int  view = V_PATTERN;
 static int  cur_row, cur_ch, cur_field;        /* fields: 0 note 1 inst 2 volhi 3 vollo */
 static int  octave = 4, cur_inst, step = 1;
 static int  inst_sel, inst_param;
+static int  trk_sel, trk_param;                 /* track view cursor */
 static int  edit_mode = 0;                     /* 0 = view/audition only, 1 = pattern edits allowed */
 static char status[160] = "";
 static float peaks[PEAK_COLS];
@@ -613,6 +711,13 @@ static void audition(int inst, int note)
     atomic_store(&preview_req, ((inst + 1) << 8) | note);
 }
 
+/* audition a note the way track `tr` is routed: internal sample and/or MIDI out */
+static void audition_track(int tr, int note)
+{
+    if (trk_audio[tr] || note == NOTE_OFF) audition(cur_inst, note);
+    if (trk_midi[tr]) atomic_store(&preview_midi, (trk_midi[tr] << 8) | note);
+}
+
 static void move_row(int d) { cur_row = ((cur_row + d) % PAT_LEN + PAT_LEN) % PAT_LEN; }
 
 static const char *base_name(const char *p)
@@ -648,7 +753,7 @@ static void footer(const char *help1, const char *help2)
     attroff(A_DIM);
 }
 
-#define HELP_GLOBAL "F1 pattern F2 instr F3/F4 oct F5 save F6 load F7 edit F9 sync F10 quit"
+#define HELP_GLOBAL "F1 pattern F2 instr F3/F4 oct F5 save F6 load F7 edit F8 trk F9 sync F10 quit"
 
 static void draw_pattern(void)
 {
@@ -659,7 +764,11 @@ static void draw_pattern(void)
 
     attron(COLOR_PAIR(4) | A_BOLD);
     mvprintw(1, 0, "ROW");
-    for (int c = 0; c < NCHAN; c++) mvprintw(1, 5 + c * 12, "CH%d  nte in vl", c + 1);
+    for (int c = 0; c < NCHAN; c++) {
+        char m[8];
+        if (trk_midi[c]) snprintf(m, sizeof m, "%02d", trk_midi[c]); else strcpy(m, "--");
+        mvprintw(1, 5 + c * 12, "CH%d %c M%s", c + 1, trk_audio[c] ? 'A' : '-', m);
+    }
     attroff(COLOR_PAIR(4) | A_BOLD);
     attron(A_DIM);
     mvprintw(1, 58, "%.20s", proj_path[0] ? base_name(proj_path) : "untitled");
@@ -1030,8 +1139,8 @@ static void pattern_key(int k)
 
     if (!edit_mode) {                 /* view mode: audition only, never touch the pattern */
         int n = key_to_note(k, octave);
-        if (n)            audition(cur_inst, n);
-        else if (k == '1') audition(cur_inst, NOTE_OFF);
+        if (n)            audition_track(cur_ch, n);
+        else if (k == '1') audition_track(cur_ch, NOTE_OFF);
         else if (cur_field >= 1 && (hexval(k) >= 0))
             snprintf(status, sizeof status, "Edit mode is off - press F7 to edit");
         return;
@@ -1044,7 +1153,7 @@ static void pattern_key(int k)
             if (n) {
                 ce->note = n;
                 ce->inst = cur_inst + 1;
-                audition(cur_inst, n);
+                audition_track(cur_ch, n);
                 move_row(step);
             }
         }
@@ -1065,6 +1174,58 @@ static void pattern_key(int k)
     }
 }
 
+static void draw_track(void)
+{
+    title_bar("TRACKS");
+    attron(COLOR_PAIR(4) | A_BOLD);
+    mvprintw(1, 1, "#   AUDIO  MIDI OUT");
+    attroff(COLOR_PAIR(4) | A_BOLD);
+
+    for (int c = 0; c < NCHAN; c++) {
+        int y = 2 + c, sel = (c == trk_sel);
+        char a[8], m[12];
+        snprintf(a, sizeof a, "%-3s", trk_audio[c] ? "ON" : "OFF");
+        if (trk_midi[c]) snprintf(m, sizeof m, "CH %02d", trk_midi[c]);
+        else             snprintf(m, sizeof m, "OFF  ");
+        if (sel) attron(A_BOLD);
+        mvprintw(y, 0, "%c%d", sel ? '>' : ' ', c + 1);
+        mvaddstr(y, 4, a);
+        mvaddstr(y, 11, m);
+        if (sel) {
+            attron(A_REVERSE);
+            if (trk_param == 0) mvaddstr(y, 4, a); else mvaddstr(y, 11, m);
+            attroff(A_REVERSE);
+            attroff(A_BOLD);
+        }
+    }
+    mvprintw(8,  1, "MIDI out port: xtrack:midi_out   (connect it in your patchbay)");
+    mvprintw(9,  1, "Tracker C-4 = MIDI note 60. Volume column = velocity (00-FF -> 1-127).");
+    mvprintw(10, 1, "Empty volume = velocity 127. Instrument number is not sent over MIDI.");
+    mvprintw(11, 1, "AUDIO OFF + MIDI on = a MIDI-only track.  Piano keys audition the track.");
+    footer(HELP_GLOBAL, "Up/Dn track  Tab param  Lt/Rt change  PgUp/PgDn x4  keys=audition  1=stop");
+}
+
+static void track_key(int k)
+{
+    switch (k) {
+    case KEY_UP:   trk_sel = (trk_sel + NCHAN - 1) % NCHAN; return;
+    case KEY_DOWN: trk_sel = (trk_sel + 1) % NCHAN; return;
+    case '\t': case KEY_BTAB: trk_param = !trk_param; return;
+    case KEY_LEFT: case KEY_RIGHT: case KEY_PPAGE: case KEY_NPAGE: {
+        int d = (k == KEY_LEFT || k == KEY_NPAGE) ? -1 : 1;
+        if (trk_param == 0) trk_audio[trk_sel] = !trk_audio[trk_sel];
+        else {
+            int v = trk_midi[trk_sel] + d * ((k == KEY_PPAGE || k == KEY_NPAGE) ? 4 : 1);
+            trk_midi[trk_sel] = v < 0 ? 0 : v > 16 ? 16 : v;
+        }
+        return;
+    }
+    case '1': audition_track(trk_sel, NOTE_OFF); return;
+    }
+    int n = key_to_note(k, octave);
+    if (n) audition_track(trk_sel, n);
+}
+
 static void global_key(int k, int *handled)
 {
     *handled = 1;
@@ -1075,6 +1236,7 @@ static void global_key(int k, int *handled)
     case KEY_F(4): if (octave < 7) octave++; break;
     case KEY_F(5): do_save(); break;
     case KEY_F(6): do_load(); break;
+    case KEY_F(8): view = V_TRACK; break;
     case KEY_F(7):
         edit_mode = !edit_mode;
         snprintf(status, sizeof status, edit_mode ? "Edit mode ON" : "Edit mode OFF (view / audition only)");
@@ -1100,9 +1262,9 @@ static void demo_pattern(void)
 {
     for (int r = 0; r < PAT_LEN; r++)
         for (int c = 0; c < NCHAN; c++) pat[r][c] = (Cell){ 0, 0, -1 };
-    for (int r = 0; r < PAT_LEN; r += 4) pat[r][0] = (Cell){ 49, 1, 0xFF };
-    for (int r = 4; r < PAT_LEN; r += 8) pat[r][1] = (Cell){ 49, 2, 0xC0 };
-    for (int r = 2; r < PAT_LEN; r += 4) pat[r][2] = (Cell){ 49, 3, 0x60 };
+    //    for (int r = 0; r < PAT_LEN; r += 4) pat[r][0] = (Cell){ 49, 1, 0xFF };
+    //    for (int r = 4; r < PAT_LEN; r += 8) pat[r][1] = (Cell){ 49, 2, 0xC0 };
+    //    for (int r = 2; r < PAT_LEN; r += 4) pat[r][2] = (Cell){ 49, 3, 0x60 };
 }
 
 int main(int argc, char **argv)
@@ -1121,6 +1283,7 @@ int main(int argc, char **argv)
     out_l   = jack_port_register(client, "out_l",   JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
     out_r   = jack_port_register(client, "out_r",   JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
     midi_in = jack_port_register(client, "midi_in", JACK_DEFAULT_MIDI_TYPE,  JackPortIsInput,  0);
+    midi_out = jack_port_register(client, "midi_out", JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0);
     jack_set_process_callback(client, process, NULL);
 
     int slot = 0;
@@ -1171,7 +1334,8 @@ int main(int argc, char **argv)
         if (LINES < 24 || COLS < 80) {
             mvprintw(0, 0, "Terminal too small: need 80x24 (have %dx%d)", COLS, LINES);
         } else if (view == V_PATTERN) draw_pattern();
-        else draw_inst();
+        else if (view == V_INST) draw_inst();
+        else draw_track();
         refresh();
 
         int k = getch();
@@ -1182,10 +1346,14 @@ int main(int argc, char **argv)
         int handled;
         global_key(k, &handled);
         if (handled) continue;
-        if (view == V_PATTERN) pattern_key(k); else inst_key(k);
+        if (view == V_PATTERN) pattern_key(k);
+        else if (view == V_INST) inst_key(k);
+        else track_key(k);
     }
 
     endwin();
+    atomic_store(&cmd, 2);          /* stop + release any hanging MIDI notes */
+    usleep(100 * 1000);
     jack_client_close(client);
     return 0;
 }

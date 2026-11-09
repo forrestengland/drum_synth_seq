@@ -1,0 +1,12 @@
+XTRACK 1
+bpm 120
+inst 1 tune=0 fine=0 vol=255 loop=1 ls=0 le=1606 a=330 d=380 s=117 r=160 path=/home/forrest/programming_2026/drum_synth_seq/tracker_nc/sine.wav
+inst 2 tune=2 fine=0 vol=201 loop=1 ls=10184 le=18304 a=0 d=0 s=255 r=0 path=/home/forrest/Samples/sample.wav
+inst 3 tune=0 fine=0 vol=255 loop=0 ls=0 le=0 a=0 d=0 s=255 r=0 path=
+inst 4 tune=0 fine=0 vol=255 loop=0 ls=0 le=0 a=0 d=0 s=255 r=0 path=
+inst 5 tune=0 fine=0 vol=255 loop=0 ls=0 le=0 a=0 d=0 s=255 r=0 path=
+inst 6 tune=0 fine=0 vol=255 loop=0 ls=0 le=0 a=0 d=0 s=255 r=0 path=
+inst 7 tune=0 fine=0 vol=255 loop=0 ls=0 le=0 a=0 d=0 s=255 r=0 path=
+inst 8 tune=0 fine=0 vol=255 loop=0 ls=0 le=0 a=0 d=0 s=255 r=0 path=
+row 0 53:1:-1 58:1:-1 61:1:-1 65:1:-1
+row 16 49:1:-1 53:1:-1 56:1:-1 60:1:-1
