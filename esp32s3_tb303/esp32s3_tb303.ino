@@ -117,7 +117,7 @@ uint8_t clockTimeIndex = 0;
 uint8_t clockTimeCount = 0;
 
 // sequence
-#define NUM_STEPS 16
+#define NUM_STEPS 32
 
 struct Step {
     uint8_t note = 60;  // Middle C
@@ -140,7 +140,7 @@ bool accentActive = false;      // read by the audio task
 
 // ---------- Autosave to flash ----------
 constexpr uint32_t SAVE_DELAY_MS = 3000;
-constexpr uint8_t  SAVE_VERSION  = 2;   // bump when SavedState or Step changes
+constexpr uint8_t  SAVE_VERSION  = 3;   // bump when SavedState or Step changes
 
 struct SavedState {
 	uint8_t version;
@@ -1352,14 +1352,9 @@ void updateDisplay() {
     // --------------------------------
     // First row: steps 1-8
     // --------------------------------
-
-    for (int i = 0; i < 8; i++) {
-        int x = 2 + (i * 16);
-        int y = 19;
-
-        // Step number.
-        display.setCursor(x, 10);
-        display.print(i + 1);
+    for (int i = 0; i < NUM_STEPS; i++) {
+        int x = 2 + ((i % 8) * 16);
+        int y = 11 + ((i / 8) * 11);
 
         // Active step.
         if (pattern[i].active) {
@@ -1375,45 +1370,12 @@ void updateDisplay() {
 
         // Editing selection.
         if (selectedStep == i) {
-            display.drawFastHLine(x, 27, 7, SSD1306_WHITE);
+            display.drawFastHLine(x, y + 9, 7, SSD1306_WHITE);
         }
 
-				if (loopLength < NUM_STEPS && i == loopLength - 1) {
+        // Loop end marker.
+        if (loopLength < NUM_STEPS && i == loopLength - 1) {
             display.drawFastVLine(x + 10, y - 1, 9, SSD1306_WHITE);
-        }
-    }
-
-    // --------------------------------
-    // Second row: steps 9-16
-    // --------------------------------
-
-    for (int i = 8; i < 16; i++) {
-        int x = 2 + ((i - 8) * 16);
-        int y = 38;
-
-        // Step number.
-        display.setCursor(x, 29);
-        display.print(i + 1);
-
-        // Active step.
-        if (pattern[i].active) {
-            display.fillRect(x, y, 7, 7, SSD1306_WHITE);
-        } else {
-            display.drawPixel(x + 3, y + 3, SSD1306_WHITE);
-        }
-
-        // Playback position.
-        if (currentStep == i) {
-            display.drawRect(x - 1, y - 1, 9, 9, SSD1306_WHITE);
-        }
-
-        // Editing selection.
-        if (selectedStep == i) {
-            display.drawFastHLine(x, 46, 7, SSD1306_WHITE);
-        }
-
-				if (loopLength < NUM_STEPS && i == loopLength - 1) {
-					display.drawFastVLine(x + 10, y - 1, 9, SSD1306_WHITE);
         }
     }
 
