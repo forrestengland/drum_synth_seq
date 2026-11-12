@@ -3,7 +3,7 @@
  *
  *   - fits in an 80x24 terminal
  *   - JACK stereo audio out, JACK MIDI in (clock / start / stop / continue / SPP)
- *   - 4 tracker channels, 64-row pattern, 8 instrument slots
+ *   - 4 tracker channels, 16 patterns of 64 rows (manual switching), 8 instrument slots
  *   - cell = note, instrument number, 2-digit hex volume
  *   - instruments: sample import (anything libsndfile reads), tune (semitones),
  *     fine tune (cents), volume, loop (off / forward / ping-pong, start+end),
@@ -23,6 +23,8 @@
  *          the instrument/volume fields the digits are data entry instead)
  *   F9 sync INT <-> MIDI   F10 or Ctrl-C quit
  *   Space play/stop        < > BPM -/+  (internal sync)
+ *   - / =  previous / next pattern; takes effect immediately, even while playing
+ *          (the playhead keeps its row; sounding notes are not cut)
  *
  * Pattern view
  *   arrows / PgUp PgDn / Home End   move       Tab / Shift-Tab   next/prev channel
@@ -62,6 +64,7 @@
 #define NCHAN      4
 #define NINST      8
 #define PAT_LEN    64
+#define NPAT       16
 #define NOTE_OFF   97
 #define BASE_NOTE  49                 /* C-4: sample plays at original pitch */
 #define MAX_FRAMES (8 * 1024 * 1024)
@@ -102,7 +105,9 @@ typedef struct {
     float gain, level, rel_step;
 } Voice;
 
-static Cell  pat[PAT_LEN][NCHAN];
+static Cell  pat[NPAT][PAT_LEN][NCHAN];
+static atomic_int cur_pat = 0;                     /* pattern being edited AND played */
+#define CURPAT pat[atomic_load(&cur_pat)]
 static Inst  ins[NINST];
 static Voice voices[NVOICE];
 static const float pan[NVOICE] = { 0.25f, 0.75f, 0.75f, 0.25f, 0.5f };
@@ -238,9 +243,10 @@ static void step_row(void)
     int r = next_row;
     next_row = (r + 1) % PAT_LEN;
     atomic_store(&play_row, r);
+    Cell (*cp)[NCHAN] = CURPAT;                    /* switching takes effect on the next row */
 
     for (int c = 0; c < NCHAN; c++) {
-        Cell *ce = &pat[r][c];
+        Cell *ce = &cp[r][c];
         if (atomic_load(&trk_mute[c])) continue;
         if (ce->note == NOTE_OFF) {
             voice_release(&voices[c]);
@@ -539,15 +545,18 @@ static int project_save(const char *path, char *err, size_t el)
                 (unsigned)in->loop_start, (unsigned)in->loop_end,
                 in->att_ms, in->dec_ms, in->sus, in->rel_ms, in->path);
     }
-    for (int r = 0; r < PAT_LEN; r++) {
-        int any = 0;
-        for (int c = 0; c < NCHAN; c++)
-            if (pat[r][c].note || pat[r][c].inst || pat[r][c].vol >= 0) any = 1;
-        if (!any) continue;
-        fprintf(f, "row %d", r);
-        for (int c = 0; c < NCHAN; c++)
-            fprintf(f, " %d:%d:%d", pat[r][c].note, pat[r][c].inst, pat[r][c].vol);
-        fputc('\n', f);
+    fprintf(f, "pattern %d\n", atomic_load(&cur_pat));
+    for (int p = 0; p < NPAT; p++) {
+        for (int r = 0; r < PAT_LEN; r++) {
+            int any = 0;
+            for (int c = 0; c < NCHAN; c++)
+                if (pat[p][r][c].note || pat[p][r][c].inst || pat[p][r][c].vol >= 0) any = 1;
+            if (!any) continue;
+            fprintf(f, "prow %d %d", p, r);
+            for (int c = 0; c < NCHAN; c++)
+                fprintf(f, " %d:%d:%d", pat[p][r][c].note, pat[p][r][c].inst, pat[p][r][c].vol);
+            fputc('\n', f);
+        }
     }
     int bad = ferror(f);
     if (fclose(f)) bad = 1;
@@ -562,7 +571,8 @@ static int project_save(const char *path, char *err, size_t el)
 static int project_load(const char *file, char *err, size_t el, int *missing)
 {
     struct Cfg { int have, tune, fine, vol, loop, att, dec, sus, rel; unsigned ls, le; char path[PATHLEN]; } cfg[NINST];
-    Cell tmp[PAT_LEN][NCHAN];
+    Cell tmp[NPAT][PAT_LEN][NCHAN];
+    int newpat = 0;
     char line[1024];
     int newbpm = 0;
     int t_audio[NCHAN] = { 1, 1, 1, 1 }, t_midi[NCHAN] = { 0, 0, 0, 0 }, t_mute[NCHAN] = { 0, 0, 0, 0 };
@@ -576,8 +586,9 @@ static int project_load(const char *file, char *err, size_t el, int *missing)
 
     memset(cfg, 0, sizeof cfg);
     for (int i = 0; i < NINST; i++) { cfg[i].vol = 255; cfg[i].sus = 255; }
-    for (int r = 0; r < PAT_LEN; r++)
-        for (int c = 0; c < NCHAN; c++) tmp[r][c] = (Cell){ 0, 0, -1 };
+    for (int p = 0; p < NPAT; p++)
+        for (int r = 0; r < PAT_LEN; r++)
+            for (int c = 0; c < NCHAN; c++) tmp[p][r][c] = (Cell){ 0, 0, -1 };
 
     while (fgets(line, sizeof line, f)) {
         size_t l = strlen(line);
@@ -619,16 +630,22 @@ static int project_load(const char *file, char *err, size_t el, int *missing)
                 int mu;                              /* mute is optional (older files) */
                 if (sscanf(line, "track %*d audio=%*d midi=%*d mute=%d", &mu) == 1) t_mute[n - 1] = mu ? 1 : 0;
             }
-        } else if (!strncmp(line, "row ", 4)) {
-            int r, off = 0;
-            if (sscanf(line, "row %d%n", &r, &off) == 1 && r >= 0 && r < PAT_LEN) {
+        } else if (!strncmp(line, "pattern ", 8)) {
+            int p;
+            if (sscanf(line, "pattern %d", &p) == 1 && p >= 0 && p < NPAT) newpat = p;
+        } else if (!strncmp(line, "row ", 4) || !strncmp(line, "prow ", 5)) {
+            /* "prow P R ..." = pattern P; legacy "row R ..." = pattern 0 */
+            int p = 0, r = 0, off = 0;
+            int ok = (line[0] == 'p') ? sscanf(line, "prow %d %d%n", &p, &r, &off) == 2
+                                      : sscanf(line, "row %d%n", &r, &off) == 1;
+            if (ok && p >= 0 && p < NPAT && r >= 0 && r < PAT_LEN) {
                 char *q = line + off;
                 for (int c = 0; c < NCHAN; c++) {
                     int n, i, v, used = 0;
                     if (sscanf(q, " %d:%d:%d%n", &n, &i, &v, &used) != 3) break;
                     q += used;
                     if (n < 0 || n > NOTE_OFF || i < 0 || i > NINST || v < -1 || v > 255) continue;
-                    tmp[r][c] = (Cell){ (uint8_t)n, (uint8_t)i, (int16_t)v };
+                    tmp[p][r][c] = (Cell){ (uint8_t)n, (uint8_t)i, (int16_t)v };
                 }
             }
         }
@@ -643,6 +660,7 @@ static int project_load(const char *file, char *err, size_t el, int *missing)
     atomic_store(&cmd, 2);
     pthread_mutex_lock(&ins_lock);
     memcpy(pat, tmp, sizeof pat);
+    atomic_store(&cur_pat, newpat);
     pthread_mutex_unlock(&ins_lock);
     if (newbpm >= 32 && newbpm <= 300) atomic_store(&bpm, newbpm);
     for (int c = 0; c < NCHAN; c++) {
@@ -736,6 +754,13 @@ static void audition(int inst, int note)
     atomic_store(&preview_req, ((inst + 1) << 8) | note);
 }
 
+static void set_pattern(int p)
+{
+    p = ((p % NPAT) + NPAT) % NPAT;
+    atomic_store(&cur_pat, p);                  /* audio thread picks it up on the next row */
+    snprintf(status, sizeof status, "Pattern %02X", p);
+}
+
 static void toggle_mute(int tr)
 {
     int m = !atomic_load(&trk_mute[tr]);
@@ -794,7 +819,9 @@ static void footer(const char *help1, const char *help2)
 static void draw_pattern(void)
 {
     static const int foff[4] = { 0, 4, 7, 8 }, flen[4] = { 3, 2, 1, 1 };
-    title_bar("PATTERN");
+    char ptitle[16];
+    snprintf(ptitle, sizeof ptitle, "PATTERN %02X", atomic_load(&cur_pat));
+    title_bar(ptitle);
     if (edit_mode) { attron(COLOR_PAIR(5) | A_BOLD); mvaddstr(0, 67, "EDIT"); attroff(COLOR_PAIR(5) | A_BOLD); }
     else           { attron(A_REVERSE);              mvaddstr(0, 67, "VIEW"); attroff(A_REVERSE); }
 
@@ -833,7 +860,7 @@ static void draw_pattern(void)
         for (int x = 0; x < COLS; x++) addch(' ');
         mvprintw(y, 0, "%02X", r);
         for (int c = 0; c < NCHAN; c++) {
-            Cell *ce = &pat[r][c];
+            Cell *ce = &CURPAT[r][c];
             char nn[8], ii[8], vv[8], s[32];
             note_str(ce->note, nn);
             if (ce->inst) snprintf(ii, sizeof ii, "%02X", ce->inst); else strcpy(ii, "--");
@@ -854,7 +881,7 @@ static void draw_pattern(void)
         attroff(attr);
     }
     footer(HELP_GLOBAL,
-           "Spc play Ret play@cur [ ]inst ( )step Del clr q=off <>bpm 1-4 mute");
+           "Spc play Ret play@cur [ ]inst ( )step Del clr q=off <>bpm 1-4 mute -/= pat");
 }
 
 static void compute_peaks(void)
@@ -1154,7 +1181,7 @@ static void inst_key(int k)
 
 static void pattern_key(int k)
 {
-    Cell *ce = &pat[cur_row][cur_ch];
+    Cell *ce = &CURPAT[cur_row][cur_ch];
     switch (k) {
     case KEY_UP:    move_row(-1); return;
     case KEY_DOWN:  move_row(1);  return;
@@ -1297,6 +1324,8 @@ static void global_key(int k, int *handled)
     case KEY_F(4): if (octave < 7) octave++; break;
     case KEY_F(5): do_save(); break;
     case KEY_F(6): do_load(); break;
+    case '-': set_pattern(atomic_load(&cur_pat) - 1); break;
+    case '=': case '+': set_pattern(atomic_load(&cur_pat) + 1); break;
     case KEY_F(8): view = V_TRACK; break;
     case KEY_F(7):
         edit_mode = !edit_mode;
@@ -1321,11 +1350,12 @@ static void global_key(int k, int *handled)
 
 static void demo_pattern(void)
 {
-    for (int r = 0; r < PAT_LEN; r++)
-        for (int c = 0; c < NCHAN; c++) pat[r][c] = (Cell){ 0, 0, -1 };
-    for (int r = 0; r < PAT_LEN; r += 4) pat[r][0] = (Cell){ 49, 1, 0xFF };
-    for (int r = 4; r < PAT_LEN; r += 8) pat[r][1] = (Cell){ 49, 2, 0xC0 };
-    for (int r = 2; r < PAT_LEN; r += 4) pat[r][2] = (Cell){ 49, 3, 0x60 };
+    for (int p = 0; p < NPAT; p++)
+        for (int r = 0; r < PAT_LEN; r++)
+            for (int c = 0; c < NCHAN; c++) pat[p][r][c] = (Cell){ 0, 0, -1 };
+    for (int r = 0; r < PAT_LEN; r += 4) pat[0][r][0] = (Cell){ 49, 1, 0xFF };
+    for (int r = 4; r < PAT_LEN; r += 8) pat[0][r][1] = (Cell){ 49, 2, 0xC0 };
+    for (int r = 2; r < PAT_LEN; r += 4) pat[0][r][2] = (Cell){ 49, 3, 0x60 };
 }
 
 int main(int argc, char **argv)

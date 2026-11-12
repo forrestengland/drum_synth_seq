@@ -3,7 +3,7 @@
 
 // pin midi in
 #define MIDI_RX_PIN 16
-#define MIDI_TX_PIN -1
+#define MIDI_TX_PIN 41
 
 void setup() {
 
@@ -24,5 +24,7 @@ void loop() {
 
 		Serial.print(data);
 		Serial.print(" ");
+
+		Serial2.write(data);
 	}
 }
