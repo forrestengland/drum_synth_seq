@@ -16,6 +16,14 @@
 
 #include <Preferences.h>
 
+volatile bool patternQueued = false;
+uint8_t queuedPattern = 0;
+
+#define MIDI_TX_PIN 41
+#define MIDI_OUT_CHANNEL 1          // 1-16
+
+int midiOutNote = -1;               // note currently held on the output, -1 = none
+
 #define NUM_PATTERNS 16
 #define PATTERN_BUTTON_PIN 47
 
@@ -36,7 +44,8 @@ constexpr uint8_t GATE_PULSES = 4;
 
 constexpr float ACCENT_ENV_MULT   = 1.8f;   // filter envelope depth multiplier
 constexpr float ACCENT_DECAY_MULT = 0.5f;   // envelope decay time multiplier
-constexpr float ACCENT_RES_BOOST  = 0.15f;  // added to resonance
+constexpr float ACCENT_RES_BOOST  = 0.03f;  // added to resonance
+constexpr float FILTER_FEEDBACK = 2.0f;
 
 // Sync mode switch
 #define SYNC_SWITCH_PIN 8
@@ -49,12 +58,12 @@ enum SyncMode {
 SyncMode syncMode = SYNC_EXTERNAL;
 
 // encoders
-#define ENCODER_CLK 13
-#define ENCODER_DT  14
+#define ENCODER_CLK 14
+#define ENCODER_DT  13
 #define ENCODER_SW  15
 
-#define ENCODER2_CLK 17
-#define ENCODER2_DT  18
+#define ENCODER2_CLK 18
+#define ENCODER2_DT  17
 #define ENCODER2_SW  21
 
 // Gray-code encoder state
@@ -232,8 +241,19 @@ float filterResonance = 0.0f;
 float filterEnvDepth = 0.0f;
 float envelopeDecay = 500.0f;
 
+volatile uint32_t filterResets = 0;
+
+// -------- Resonant 4-pole ladder (zero-delay feedback) --------
+float ladderState[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+struct LadderCoeffs {
+    float G, G2, G3, G4, beta;
+};
+
+constexpr float LADDER_DRIVE = 1.5f;   // input drive into the saturator
+
 // -------- Resonant low-pass filter --------
-float filterStage[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+//float filterStage[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
 // -------- Filter envelope --------
 bool filterEnvelopeTrigger = false;
@@ -456,6 +476,7 @@ void internalClockCallback(void* arg) {
     if (syncMode != SYNC_INTERNAL || !midiRunning) {
         return;
     }
+    midiOutRealtime(0xF8);
     sequencerPulse();
 }
 
@@ -495,30 +516,55 @@ void switchPattern(uint8_t n) {
     currentPattern = n;
     pattern = patternBank[n];
     loopLength = loopLengths[n];
+
+    /* if (!midiRunning) { */
+    /*     clockCount = 0; */
+    /*     currentStep = 0; */
+    /*     midiRunning = true; */
+    /*     midiOutRealtime(0xFA);          // Start */
+    /*     triggerSequencerStep(); */
+    /*     restartInternalClock(); */
+    /* } else { */
+    /*     midiRunning = false; */
+    /*     if (esp_timer_is_active(internalClockTimer)) { */
+    /*         esp_timer_stop(internalClockTimer); */
+    /*     } */
+    /*     midiOutRealtime(0xFC);          // Stop */
+    /*     stopSequencerNote(); */
+    /* }		 */
+}
+
+void switchPatternNow() {
+    patternSelectMode = false;
+    patternQueued = false;          // an immediate switch overrides any queued one
+
+    if (pendingPattern != currentPattern) {
+        switchPattern(pendingPattern);
+
+        // Keep the playhead where it is. If the new pattern is shorter than
+        // the current step, park on its last step so the next pulse wraps to 1.
+        if (currentStep >= loopLength) {
+            currentStep = loopLength - 1;
+        }
+    }
+
+    displayDirty = true;
 }
 
 void confirmPatternSelect() {
-	
-    patternSelectMode = false;
 
-    // Stop the internal clock first so its task can't race the switch.
-    if (syncMode == SYNC_INTERNAL && esp_timer_is_active(internalClockTimer)) {
-        esp_timer_stop(internalClockTimer);
-    }
+	patternSelectMode = false;
 
-    stopSequencerNote();              // release the old pattern's note
-    switchPattern(pendingPattern);
-
-    if (syncMode == SYNC_INTERNAL) {
-        // Start the new pattern from step 1, right now.
+    if (midiRunning) {
+        // Playing: switch at the next pattern wrap, in time.
+        queuedPattern = pendingPattern;
+        patternQueued = (queuedPattern != currentPattern);
+    } else {
+        // Stopped: switch right away.
+        stopSequencerNote();
+        switchPattern(pendingPattern);
+        currentStep = 0;
         clockCount = 0;
-        currentStep = 0;
-        midiRunning = true;
-        triggerSequencerStep();
-        restartInternalClock();
-    } else if (currentStep >= loopLength) {
-        // External: stay locked to the incoming clock, wrap if needed.
-        currentStep = 0;
     }
 
     displayDirty = true;
@@ -528,15 +574,24 @@ void updateButtons() {
 
     // Pattern button: fires on press, works in both modes.
     if (updateButton(patternButton) == BTN_PRESSED) {
+        bool accentHeld = (accentButton.stableState == LOW);
+
+        if (accentHeld) {
+            // Chord: stop the accent button's release from toggling accent.
+            chordUsed = true;
+        }
+
         if (!patternSelectMode) {
             patternSelectMode = true;
             pendingPattern = currentPattern;
             displayDirty = true;
+        } else if (accentHeld) {
+            switchPatternNow();
         } else {
             confirmPatternSelect();
         }
         return;
-    }
+    }	
 
     // While selecting, ignore the other buttons so nothing is edited by accident.
     if (patternSelectMode) {
@@ -594,20 +649,49 @@ void updateButtons() {
 
 }
 
-float processFilter(
-    float input,
-    float coefficient,
-    float resonance
-) {
-    // Resonance feedback.
-    float feedback = filterStage[3] * resonance * 3.0f;
+static inline float fastTanh(float x) {
+    if (x > 3.0f) return 1.0f;
+    if (x < -3.0f) return -1.0f;
+    float x2 = x * x;
+    return x * (27.0f + x2) / (27.0f + 9.0f * x2);
+}
 
-    float x = input - feedback;
+LadderCoeffs makeLadderCoeffs(float cutoffHz) {
+    float g = tanf(PI * cutoffHz / SAMPLE_RATE);
+    LadderCoeffs c;
+    c.G = g / (1.0f + g);
+    c.G2 = c.G * c.G;
+    c.G3 = c.G2 * c.G;
+    c.G4 = c.G3 * c.G;
+    c.beta = 1.0f / (1.0f + g);
+    return c;
+}
 
-    // Four cascaded low-pass stages.
+float processLadder(float input, const LadderCoeffs& c, float k) {
+    // Contribution of the filter's stored state to the output.
+    float S = c.beta * (c.G3 * ladderState[0] +
+                        c.G2 * ladderState[1] +
+                        c.G  * ladderState[2] +
+                              ladderState[3]);
+
+    // Solve the feedback loop for this sample, then saturate.
+    float u = (input * LADDER_DRIVE - k * S) / (1.0f + k * c.G4);
+    u = fastTanh(u);
+
+    // Four trapezoidal one-pole stages.
+    float x = u;
     for (int i = 0; i < 4; i++) {
-        filterStage[i] += coefficient * (x - filterStage[i]);
-        x = filterStage[i];
+        float v = (x - ladderState[i]) * c.G;
+        float y = v + ladderState[i];
+        ladderState[i] = y + v;
+        x = y;
+    }
+
+    // Safety net, should never trigger now.
+    if (!isfinite(x) || fabsf(x) > 8.0f) {
+        for (int i = 0; i < 4; i++) ladderState[i] = 0.0f;
+        filterResets++;
+        return 0.0f;
     }
 
     return x;
@@ -746,6 +830,49 @@ void setNoteOff(int note) {
     }
 }
 
+void midiOutNoteOn(int note, int velocity, bool legato) {
+    uint8_t msg[6];
+    int len = 0;
+    uint8_t onStatus  = 0x90 | ((MIDI_OUT_CHANNEL - 1) & 0x0F);
+    uint8_t offStatus = 0x80 | ((MIDI_OUT_CHANNEL - 1) & 0x0F);
+
+    if (legato && midiOutNote >= 0) {
+        if (note == midiOutNote) {
+            return;                 // tied note at the same pitch: nothing to send
+        }
+        // Slide: new note on first, then old note off, so a mono synth glides.
+        msg[len++] = onStatus;  msg[len++] = note;         msg[len++] = velocity;
+        msg[len++] = offStatus; msg[len++] = midiOutNote;  msg[len++] = 0;
+    } else {
+        if (midiOutNote >= 0) {
+            msg[len++] = offStatus; msg[len++] = midiOutNote; msg[len++] = 0;
+        }
+        msg[len++] = onStatus; msg[len++] = note; msg[len++] = velocity;
+    }
+
+    midiOutNote = note;
+    Serial2.write(msg, len);        // one write per event, so messages can't interleave
+}
+
+void midiOutNoteOff() {
+    if (midiOutNote < 0) {
+        return;
+    }
+    uint8_t msg[3] = {
+        (uint8_t)(0x80 | ((MIDI_OUT_CHANNEL - 1) & 0x0F)),
+        (uint8_t)midiOutNote,
+        0
+    };
+    midiOutNote = -1;
+    Serial2.write(msg, 3);
+}
+
+inline void midiOutRealtime(uint8_t byte) {
+    if (syncMode == SYNC_INTERNAL) {
+        Serial2.write(byte);
+    }
+}
+
 void triggerSequencerStep() {
 	
     Step& step = pattern[currentStep];
@@ -754,6 +881,7 @@ void triggerSequencerStep() {
         // Rest: close the gate.
         sequencerNote = -1;
         sequencerVelocity = 0;
+				midiOutNoteOff();				
         updateSynthVoice(RETRIG_ALWAYS);
         return;
     }
@@ -766,6 +894,7 @@ void triggerSequencerStep() {
     sequencerNote = step.note;
     sequencerVelocity = step.accent ? 127 : 100;
 		sequencerAccent = step.accent;
+		midiOutNoteOn(step.note, sequencerVelocity, legato);
 
     updateSynthVoice(legato ? RETRIG_NEVER : RETRIG_ALWAYS);
 }
@@ -784,6 +913,7 @@ void gateOffCurrentStep() {
 
     sequencerNote = -1;
     sequencerVelocity = 0;
+    midiOutNoteOff();		
     updateSynthVoice(RETRIG_ALWAYS);
 }
 
@@ -793,7 +923,17 @@ void sequencerPulse() {
 
     if (clockCount >= 6) {
         clockCount = 0;
-				currentStep = (currentStep + 1 >= loopLength) ? 0 : currentStep + 1;
+
+        if (currentStep + 1 >= loopLength) {
+            currentStep = 0;
+            if (patternQueued) {
+                patternQueued = false;
+                switchPattern(queuedPattern);
+            }
+        } else {
+            currentStep++;
+        }
+
         triggerSequencerStep();
         displayDirty = true;
     } else if (clockCount == GATE_PULSES) {
@@ -804,7 +944,7 @@ void sequencerPulse() {
 void stopSequencerNote() {
     sequencerNote = -1;
     sequencerVelocity = 0;
-
+    midiOutNoteOff();
     updateSynthVoice(RETRIG_ALWAYS);
 }
 
@@ -864,7 +1004,16 @@ void audioTask(void* parameter) {
   // Fraction of the remaining pitch distance covered per block.
   const float glideBlockCoeff =
       1.0f - expf(-(float)BLOCK_FRAMES /
-                  (GLIDE_TIME_MS * 0.001f * SAMPLE_RATE));	
+                  (GLIDE_TIME_MS * 0.001f * SAMPLE_RATE));
+
+  // Pot smoothing: one-pole per block, ~15 ms time constant.
+  const float potSmoothCoeff =
+      1.0f - expf(-(float)BLOCK_FRAMES / (0.015f * SAMPLE_RATE));
+
+  float smCutoffLog = -1.0f;   // log2 of cutoff, -1 = uninitialised
+  float smResonance = 0.0f;
+  float smEnvDepth  = 0.0f;
+  float smDecay     = 500.0f;	
 
 	for (;;) {
     float blockTargetAmplitude;
@@ -895,10 +1044,30 @@ void audioTask(void* parameter) {
 
     portEXIT_CRITICAL(&synthMux);
 
+    float targetCutoffLog = log2f(blockCutoff);
+
+    if (smCutoffLog < 0.0f) {
+        // First block: start at the current pot positions.
+        smCutoffLog = targetCutoffLog;
+        smResonance = blockResonance;
+        smEnvDepth  = blockEnvDepth;
+        smDecay     = blockDecay;
+    }
+
+    smCutoffLog += potSmoothCoeff * (targetCutoffLog - smCutoffLog);
+    smResonance += potSmoothCoeff * (blockResonance - smResonance);
+    smEnvDepth  += potSmoothCoeff * (blockEnvDepth  - smEnvDepth);
+    smDecay     += potSmoothCoeff * (blockDecay     - smDecay);
+
+    blockCutoff    = exp2f(smCutoffLog);
+    blockResonance = smResonance;
+    blockEnvDepth  = smEnvDepth;
+    blockDecay     = smDecay;		
+
 		if (blockAccent) {
 			blockEnvDepth *= ACCENT_ENV_MULT;
 			blockDecay = max(blockDecay * ACCENT_DECAY_MULT, 20.0f);
-			blockResonance = min(blockResonance + ACCENT_RES_BOOST, 0.9f);
+			blockResonance = min(blockResonance + ACCENT_RES_BOOST, 1.0f);
     }
 
 		float incStart = phaseIncrement;
@@ -936,12 +1105,10 @@ void audioTask(void* parameter) {
 																SAMPLE_RATE * 0.45f
 																);
 
-		// Calculate filter coefficient.
-		float filterCoefficient =
-			1.0f - expf(
-									-TWO_PI * effectiveCutoff / SAMPLE_RATE
-									);		
+    LadderCoeffs ladder = makeLadderCoeffs(effectiveCutoff);
 
+    // Resonance 0..1 maps to feedback 0..4.2. Self-oscillation starts near 4.
+    float k = constrain(blockResonance, 0.0f, 1.0f) * 4.2f;		
 
     for (int i = 0; i < BLOCK_FRAMES; i++) {
 
@@ -966,18 +1133,15 @@ void audioTask(void* parameter) {
       if (currentAmplitude > 0.00001f) {
 				float oscillatorSample = getOscillatorSample();
 
-				float filteredSample = processFilter(
-																						 oscillatorSample,
-																						 filterCoefficient,
-																						 blockResonance
-																						 );
+        float filteredSample = processLadder(oscillatorSample, ladder, k);
 
 				sample = filteredSample * currentAmplitude;
 				//				sample = getOscillatorSample() * currentAmplitude;
 
       }
 
-      int16_t pcm = (int16_t)(sample * 32767.0f);
+      float out = constrain(sample, -1.0f, 1.0f);
+      int16_t pcm = (int16_t)(out * 32767.0f);			
 
       // Duplicate mono signal to left and right.
       buffer[i * 2] = pcm;
@@ -1058,7 +1222,7 @@ void updateSynthControls() {
 
   static uint32_t lastRead = 0;
 
-  if (millis() - lastRead < 20) {
+  if (millis() - lastRead < 10) {
     return;
   }
 
@@ -1086,7 +1250,7 @@ void updateSynthControls() {
 
   // Convert normalized readings to synth parameters.
   float newCutoff = 80.0f * powf(150.0f, pot0);
-  float newResonance = pot1 * 0.75f;
+  float newResonance = pot1;
   float newEnvDepth = pot2 * 8000.0f;
   float newDecay = 50.0f + pot3 * 1450.0f;
 
@@ -1402,15 +1566,20 @@ void updateDisplay() {
     display.print(statusText);
 
     char patText[8];
-    snprintf(patText, sizeof(patText), "P%02d", currentPattern + 1);
-    display.setCursor(108, 55);
+    if (patternQueued) {
+        snprintf(patText, sizeof(patText), ">P%02d", queuedPattern + 1);
+    } else {
+        snprintf(patText, sizeof(patText), "P%02d", currentPattern + 1);
+    }
+    display.setCursor(patternQueued ? 102 : 108, 55);
     display.print(patText);		
 
     display.display();
 }
 
 void toggleInternalRun() {
-    if (syncMode != SYNC_INTERNAL) {
+
+	if (syncMode != SYNC_INTERNAL) {
         return;
     }
 
@@ -1419,6 +1588,7 @@ void toggleInternalRun() {
         clockCount = 0;
         currentStep = 0;
         midiRunning = true;
+				midiOutRealtime(0xFA);          // Start
         triggerSequencerStep();
         restartInternalClock();
     } else {
@@ -1426,6 +1596,7 @@ void toggleInternalRun() {
         if (esp_timer_is_active(internalClockTimer)) {
             esp_timer_stop(internalClockTimer);
         }
+				midiOutRealtime(0xFC);          // Stop
         stopSequencerNote();
     }
 
@@ -1464,6 +1635,9 @@ void updateSyncSwitch() {
         return;
     }
 
+		if (syncMode == SYNC_INTERNAL && midiRunning) {
+			Serial2.write((uint8_t)0xFC);   // tell followers to stop
+    }
     syncMode = newMode;
 
     // Stop the previous clock source.
@@ -1613,4 +1787,10 @@ void loop() {
 	updateDisplay();
 
 	updateAutosave();
+
+  static uint32_t lastResets = 0;
+  if (filterResets != lastResets) {
+    lastResets = filterResets;
+    Serial.printf("Filter reset #%lu\n", (unsigned long)filterResets);
+  }	
 }
