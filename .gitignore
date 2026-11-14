@@ -61,3 +61,5 @@ esp32_vadrum/build
 
 build
 *.wav
+\#*
+.\#*
