@@ -12,7 +12,9 @@
 
 #include <math.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #define MAX_PARAMS 8
 
@@ -20,7 +22,9 @@ typedef struct {
     const char *name;   /* label under the knob                       */
     const char *fmt;    /* printf format for the readout, e.g. "%.0f ms" */
     float min, max, def;
-    float curve;        /* 1 = linear, 2 = finer resolution near min  */
+    float curve;        /* 1 = linear, >1 finer near min, <1 finer near max */
+    /* Optional custom readout (e.g. "KILL"); NULL = use fmt. UI thread only. */
+    void (*fmt_fn)(float v, char *buf, size_t n);
     _Atomic float value;
 } Param;
 
@@ -45,7 +49,15 @@ static inline void param_init(Param *p, const char *name, const char *fmt,
     p->max = max;
     p->def = def;
     p->curve = curve;
+    p->fmt_fn = NULL;
     atomic_init(&p->value, def);
+}
+
+/* Text shown next to a control. */
+static inline void param_format(const Param *p, float v, char *buf, size_t n)
+{
+    if (p->fmt_fn) p->fmt_fn(v, buf, n);
+    else snprintf(buf, n, p->fmt, v);
 }
 
 static inline float param_get(Param *p)

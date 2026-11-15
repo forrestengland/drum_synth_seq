@@ -90,7 +90,7 @@ static void draw_effect(Effect *fx, int e, int *y, int width, int sel_fx, int se
         char bar[MAX_BAR + 1], val[32];
         for (int i = 0; i < bw; i++) bar[i] = i < fill ? '#' : '-';
         bar[bw] = '\0';
-        snprintf(val, sizeof val, pr->fmt, v);
+        param_format(pr, v, val, sizeof val);
 
         if (selected) attron(A_BOLD);
         mvprintw(*y, 2, "%c %-9s", selected ? '>' : ' ', pr->name);

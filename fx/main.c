@@ -13,7 +13,9 @@
 #include <string.h>
 
 #include "delay.h"
+#include "distortion.h"
 #include "effect.h"
+#include "eq3.h"
 #include "reverb.h"
 #include "ui.h"
 
@@ -84,7 +86,7 @@ int main(int argc, char **argv)
 
     /* Build the rack, in signal-flow order. To add an effect, write its
      * *_create() and append it here. */
-    Effect *(*const factories[])(float) = { delay_create, reverb_create };
+    Effect *(*const factories[])(float) = { distortion_create, delay_create, reverb_create, eq3_create };
     for (size_t i = 0; i < sizeof factories / sizeof factories[0] && nfx < MAX_FX; i++) {
         if (!(rack[nfx] = factories[i](sr))) {
             fprintf(stderr, "out of memory\n");

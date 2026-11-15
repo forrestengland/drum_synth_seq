@@ -146,7 +146,7 @@ static void draw_knob(SDL_Renderer *r, TTF_Font *small, Param *p,
     }
 
     char buf[32];
-    snprintf(buf, sizeof buf, p->fmt, v);
+    param_format(p, v, buf, sizeof buf);
     draw_text(r, small, p->name, cx, cy + KNOB_R + 16, C_DIM, 0);
     draw_text(r, small, buf,     cx, cy + KNOB_R + 36, bypassed ? C_DIM : C_ACCENT, 0);
 }
