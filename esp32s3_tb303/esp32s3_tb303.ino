@@ -17,7 +17,7 @@
 #include <Preferences.h>
 
 // screen definitions
-enum Screen { SCREEN_SYNTH, SCREEN_MENU, SCREEN_FX, SCREEN_DRUM };
+enum Screen { SCREEN_SYNTH, SCREEN_MENU, SCREEN_FX, SCREEN_DRUM, SCREEN_CHORDS };
 
 // current screen state
 Screen currentScreen = SCREEN_SYNTH;
@@ -196,6 +196,14 @@ volatile float drumLevel = 0.5f;            // 0..1
 volatile uint8_t drumTriggerMask = 0;       // bit 0 kick, 1 snare, 2 closed, 3 open
 uint8_t drumCursor = 0;
 
+// chord synth
+uint8_t chordPattern[4][16];
+uint8_t chordNotes[4][16];                              // note per lane, per step
+volatile uint8_t chordCurNotes[4] = { 45, 48, 52, 55 }; // what the audio task plays
+volatile float chordLevel = 0.5f;
+volatile uint8_t chordGateMask = 0;
+uint8_t chordCursor = 0;
+
 // ---------- Autosave to flash ----------
 constexpr uint32_t SAVE_DELAY_MS = 3000;
 constexpr uint8_t  SAVE_VERSION  = 3;   // bump when SavedState or Step changes
@@ -220,6 +228,13 @@ struct DrumSaved {
     uint8_t version;
     float   drive;
     float   level;
+    uint8_t pattern[4][16];
+};
+
+struct ChordSaved {
+    uint8_t version;
+    float   level;
+    uint8_t notes[4][16];
     uint8_t pattern[4][16];
 };
 
@@ -353,6 +368,17 @@ static const DRAM_ATTR int8_t encoderTable[16] = {
      0,  1, -1,  0
 };
 
+void triggerChords(uint8_t step) {
+    uint8_t mask = 0;
+    for (int i = 0; i < 4; i++) {
+        if (chordPattern[i][step]) {
+            mask |= (1 << i);
+            chordCurNotes[i] = chordNotes[i][step];
+        }
+    }
+    chordGateMask = mask;
+}
+
 void IRAM_ATTR encoderISR(void* arg) {
     Encoder* e = (Encoder*)arg;
 
@@ -416,6 +442,49 @@ void loadDrums() {
     lastSavedDrum = lastSeenDrum;
 }
 
+ChordSaved lastSeenChord;
+ChordSaved lastSavedChord;
+
+ChordSaved captureChords() {
+    ChordSaved c;
+    memset(&c, 0, sizeof(c));
+    c.version = 2;
+    c.level = chordLevel;
+    memcpy(c.notes, chordNotes, sizeof(chordNotes));
+    memcpy(c.pattern, chordPattern, sizeof(chordPattern));
+    return c;
+}
+
+void loadChords() {
+
+	// Defaults: A minor 7, one pitch per lane
+    const uint8_t defaults[4] = { 45, 48, 52, 55 };
+    for (int v = 0; v < 4; v++)
+        for (int s = 0; s < 16; s++) chordNotes[v][s] = defaults[v];
+
+    ChordSaved c;
+		size_t len = prefs.getBytesLength("chords");
+
+    if (len == sizeof(c) &&
+        prefs.getBytes("chords", &c, sizeof(c)) == sizeof(c) &&
+        c.version == 2 && c.level >= 0.0f && c.level <= 1.0f) {
+
+        chordLevel = c.level;
+        for (int v = 0; v < 4; v++)
+            for (int s = 0; s < 16; s++) {
+                chordNotes[v][s] = constrain((int)c.notes[v][s], 24, 96);
+                chordPattern[v][s] = c.pattern[v][s] ? 1 : 0;
+            }
+        Serial.println("Chords loaded from flash.");
+
+    }
+		
+    for (int v = 0; v < 4; v++) chordCurNotes[v] = chordNotes[v][0];
+
+    lastSeenChord = captureChords();
+    lastSavedChord = lastSeenChord;
+}
+
 SavedState captureState() {
 
 	SavedState s;
@@ -472,6 +541,7 @@ void loadState() {
     loopLength = loopLengths[currentPattern];
 
 		loadDrums();
+		loadChords();
     lastSeenState = captureState();
     lastSavedState = lastSeenState;
 
@@ -484,11 +554,14 @@ void loadState() {
 void updateAutosave() {
     SavedState now = captureState();
     DrumSaved nowDrum = captureDrum();
+    ChordSaved nowChord = captureChords();
 
     if (memcmp(&now, &lastSeenState, sizeof(now)) != 0 ||
-        memcmp(&nowDrum, &lastSeenDrum, sizeof(nowDrum)) != 0) {
+        memcmp(&nowDrum, &lastSeenDrum, sizeof(nowDrum)) != 0 ||
+        memcmp(&nowChord, &lastSeenChord, sizeof(nowChord)) != 0) {
         lastSeenState = now;
         lastSeenDrum = nowDrum;
+        lastSeenChord = nowChord;
         lastChangeMs = millis();
         saveDirty = true;
     }
@@ -503,6 +576,10 @@ void updateAutosave() {
         if (memcmp(&nowDrum, &lastSavedDrum, sizeof(nowDrum)) != 0) {
             prefs.putBytes("drums", &nowDrum, sizeof(nowDrum));
             lastSavedDrum = nowDrum;
+        }
+        if (memcmp(&nowChord, &lastSavedChord, sizeof(nowChord)) != 0) {
+            prefs.putBytes("chords", &nowChord, sizeof(nowChord));
+            lastSavedChord = nowChord;
         }
         Serial.println("Saved.");
     }
@@ -618,7 +695,8 @@ void handleMenuButtons(ButtonEvent patEvent) {
         if (sel == BTN_PRESSED) {
             if (menuIndex == 0)      currentScreen = SCREEN_SYNTH;
             else if (menuIndex == 1) currentScreen = SCREEN_FX;
-            else                     currentScreen = SCREEN_DRUM;
+            else if (menuIndex == 2) currentScreen = SCREEN_DRUM;
+						else currentScreen = SCREEN_CHORDS;
             displayDirty = true;
         }
     } else {
@@ -628,6 +706,12 @@ void handleMenuButtons(ButtonEvent patEvent) {
             cell = cell ? 0 : 1;
             displayDirty = true;
         }
+
+				if (currentScreen == SCREEN_CHORDS && sel == BTN_PRESSED) {
+					uint8_t& cell = chordPattern[chordCursor / 16][chordCursor % 16];
+					cell = cell ? 0 : 1;
+					displayDirty = true;
+				}
 
         // Accent or start returns to the menu from FX and Drum.
         if (acc == BTN_PRESSED || st == BTN_PRESSED) {
@@ -656,9 +740,25 @@ void handleMenuEncoders(int32_t d1, int32_t d2) {
     }		
 
 		if (currentScreen == SCREEN_MENU && d1 != 0) {
-        menuIndex = (menuIndex + 3 + (d1 % 3)) % 3;
+        menuIndex = (menuIndex + 4 + (d1 % 4)) % 4;
         displayDirty = true;
     }
+
+		if (currentScreen == SCREEN_CHORDS) {
+			if (d1 != 0) {
+				chordCursor = (chordCursor + 64 + (d1 % 64)) % 64;
+				displayDirty = true;
+			}
+			if (d2 != 0) {
+				if (encoder2Button.stableState == LOW) {
+					uint8_t& n = chordNotes[chordCursor / 16][chordCursor % 16];
+					n = constrain((int)n + d2, 24, 96);       // pitch of this step
+				} else {
+					chordLevel = constrain(chordLevel + d2 * 0.05f, 0.0f, 1.0f);
+				}
+				displayDirty = true;
+			}			
+    }		
 	
     if (currentScreen == SCREEN_FX && d2 != 0) {
         driveAmount = constrain(driveAmount + d2 * 0.05f, 0.0f, 1.0f);
@@ -1051,7 +1151,8 @@ inline void midiOutRealtime(uint8_t byte) {
 
 void triggerSequencerStep() {
 
-    triggerDrums(currentStep % 16);	
+    triggerDrums(currentStep % 16);
+		triggerChords(currentStep % 16);
 	
     Step& step = pattern[currentStep];
 
@@ -1122,6 +1223,7 @@ void sequencerPulse() {
 void stopSequencerNote() {
     sequencerNote = -1;
     sequencerVelocity = 0;
+		chordGateMask = 0;
     midiOutNoteOff();
     updateSynthVoice(RETRIG_ALWAYS);
 }
@@ -1214,6 +1316,12 @@ void audioTask(void* parameter) {
   bool ohChoked = false;
   float hatLp = 0, snareLp = 0;
   float smDrumLevel = 0.0f;
+
+  // ---- Chord voices ----
+  float chordPhase[4] = {0, 0, 0, 0};     // 0..1
+  float chordEnv[4]   = {0, 0, 0, 0};
+  float smChordLevel  = 0.0f;
+  const float chordEnvStep = 1.0f / (SAMPLE_RATE * 0.008f);   // 8 ms attack/release	
 	
 	for (;;) {
 
@@ -1229,7 +1337,8 @@ void audioTask(void* parameter) {
 		bool blockAccent;
 		float blockDrive;
 		uint8_t blockDrumMask;
-		float blockDrumLevel;		
+		float blockDrumLevel;
+		uint8_t blockChordMask; uint8_t blockChordNotes[4]; float blockChordLevel;		
 
     portENTER_CRITICAL(&synthMux);
 
@@ -1252,6 +1361,10 @@ void audioTask(void* parameter) {
 
 		blockDrive = driveAmount;
 
+    blockChordMask = chordGateMask;
+    blockChordLevel = chordLevel;
+    for (int v = 0; v < 4; v++) blockChordNotes[v] = chordCurNotes[v];		
+
     portEXIT_CRITICAL(&synthMux);
 
     if (blockDrumMask & 1) { kickEnv = 1.0f; kickPitchEnv = 1.0f; kickPhase = 0.0f; }
@@ -1260,7 +1373,15 @@ void audioTask(void* parameter) {
     if (blockDrumMask & 8) { ohEnv = 1.0f; ohChoked = false; }
 
     smDrumLevel += potSmoothCoeff * (blockDrumLevel - smDrumLevel);
-    const float drumGain = smDrumLevel * 0.6f;		
+    const float drumGain = smDrumLevel * 0.6f;
+
+    smChordLevel += potSmoothCoeff * (blockChordLevel - smChordLevel);
+    const float chordGain = smChordLevel * 0.12f;
+
+    float chordInc[4];
+    for (int v = 0; v < 4; v++) {
+        chordInc[v] = 440.0f * powf(2.0f, (blockChordNotes[v] - 69) / 12.0f) / SAMPLE_RATE;
+    }
 
     float targetCutoffLog = log2f(blockCutoff);
 
@@ -1398,6 +1519,22 @@ void audioTask(void* parameter) {
 				//				sample = getOscillatorSample() * currentAmplitude;
 
       }
+
+      // ---- Chords ----
+      float chords = 0.0f;
+      for (int v = 0; v < 4; v++) {
+          float target = ((blockChordMask >> v) & 1) ? 1.0f : 0.0f;
+
+          if (chordEnv[v] < target)      chordEnv[v] = min(chordEnv[v] + chordEnvStep, target);
+          else if (chordEnv[v] > target) chordEnv[v] = max(chordEnv[v] - chordEnvStep, target);
+
+          if (chordEnv[v] > 0.0f) {
+              chordPhase[v] += chordInc[v];
+              if (chordPhase[v] >= 1.0f) chordPhase[v] -= 1.0f;
+              chords += (chordPhase[v] < 0.5f ? 1.0f : -1.0f) * chordEnv[v];
+          }
+      }
+      sample += chords * chordGain;			
 
 			float out = fastTanh(sample);
 			//      float out = constrain(sample, -1.0f, 1.0f); // hard clip
@@ -1711,14 +1848,31 @@ void drawPatternSelect() {
     display.print(text);
 }
 
+void drawLaneGrid(uint8_t grid[4][16], uint8_t cursor) {
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 16; c++) {
+            int x = 8 + c * 7;
+            int y = 38 + r * 6;
+            if (grid[r][c]) display.fillRect(x, y, 5, 4, SSD1306_WHITE);
+            else display.drawPixel(x + 2, y + 2, SSD1306_WHITE);
+            if (r * 16 + c == cursor) {
+                display.drawRect(x - 1, y - 1, 7, 6, SSD1306_WHITE);
+            }
+        }
+    }
+    if (midiRunning) {
+        display.drawFastHLine(8 + (currentStep % 16) * 7, 35, 5, SSD1306_WHITE);
+    }
+}
+
 void drawMenuScreen() {
 
 	display.setCursor(0, 12);
 
 	if (currentScreen == SCREEN_MENU) {
-		const char* items[3] = { "Synth", "FX", "Drum" };
-		for (int i = 0; i < 3; i++) {
-			display.setCursor(8, 18 + i * 12);
+		const char* items[4] = { "Synth", "FX", "Drum", "Chords" };
+		for (int i = 0; i < 4; i++) {
+			display.setCursor(8, 16 + i * 11);
 			display.print(i == menuIndex ? "> " : "  ");
 			display.print(items[i]);
 		}
@@ -1731,7 +1885,25 @@ void drawMenuScreen() {
 		display.fillRect(8, 42, (int)(driveAmount * 100.0f), 8, SSD1306_WHITE);
 		display.setCursor(112, 42);
 		display.print((int)(driveAmount * 100.0f + 0.5f) / 10);
-	} else {
+	} else if (currentScreen == SCREEN_CHORDS) {
+		display.setCursor(0, 14);
+		display.print("CHORDS");
+
+		char noteText[8], label[16];
+		uint8_t lane = chordCursor / 16;
+		uint8_t stp  = chordCursor % 16;
+		getNoteName(chordNotes[lane][stp], noteText, sizeof(noteText));
+		snprintf(label, sizeof(label), "L%d %s %02d", lane + 1, noteText, stp + 1);		
+		display.setCursor(50, 14);
+		display.print(label);
+
+		display.setCursor(8, 24);
+		display.print("> Level");
+		display.drawRect(58, 24, 56, 8, SSD1306_WHITE);
+		display.fillRect(58, 24, (int)(chordLevel * 56.0f), 8, SSD1306_WHITE);
+
+		drawLaneGrid(chordPattern, chordCursor);
+	} else {		
 		display.setCursor(0, 14);
 		display.print("DRUM");
 

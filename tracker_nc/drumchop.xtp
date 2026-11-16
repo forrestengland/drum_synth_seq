@@ -1,0 +1,31 @@
+XTRACK 1
+bpm 196
+track 1 audio=0 midi=1 mute=0
+track 2 audio=0 midi=1 mute=0
+track 3 audio=0 midi=1 mute=0
+track 4 audio=0 midi=1 mute=0
+inst 1 tune=0 fine=0 vol=255 loop=0 ls=0 le=0 a=0 d=0 s=255 r=0 path=
+inst 2 tune=0 fine=0 vol=255 loop=0 ls=0 le=0 a=0 d=0 s=255 r=0 path=
+inst 3 tune=0 fine=0 vol=255 loop=0 ls=0 le=0 a=0 d=0 s=255 r=0 path=
+inst 4 tune=0 fine=0 vol=255 loop=0 ls=0 le=0 a=0 d=0 s=255 r=0 path=
+inst 5 tune=0 fine=0 vol=255 loop=0 ls=0 le=0 a=0 d=0 s=255 r=0 path=
+inst 6 tune=0 fine=0 vol=255 loop=0 ls=0 le=0 a=0 d=0 s=255 r=0 path=
+inst 7 tune=0 fine=0 vol=255 loop=0 ls=0 le=0 a=0 d=0 s=255 r=0 path=
+inst 8 tune=0 fine=0 vol=255 loop=0 ls=0 le=0 a=0 d=0 s=255 r=0 path=
+pattern 0
+prow 0 0 51:1:-1 50:1:-1 0:0:-1 0:0:-1
+prow 0 8 0:0:-1 50:1:-1 0:0:-1 0:0:-1
+prow 0 16 0:0:-1 50:1:-1 0:0:-1 0:0:-1
+prow 0 24 0:0:-1 50:1:-1 0:0:-1 0:0:-1
+prow 0 32 51:1:-1 50:1:-1 0:0:-1 0:0:-1
+prow 0 40 0:0:-1 50:1:-1 0:0:-1 0:0:-1
+prow 0 48 0:0:-1 50:1:-1 0:0:-1 0:0:-1
+prow 0 56 0:0:-1 50:1:-1 0:0:-1 0:0:-1
+prow 1 0 49:1:-1 50:1:-1 0:0:-1 0:0:-1
+prow 1 8 0:0:-1 50:1:-1 0:0:-1 0:0:-1
+prow 1 16 0:0:-1 50:1:-1 0:0:-1 0:0:-1
+prow 1 24 0:0:-1 50:1:-1 0:0:-1 0:0:-1
+prow 1 32 49:1:-1 50:1:-1 0:0:-1 0:0:-1
+prow 1 40 0:0:-1 50:1:-1 0:0:-1 0:0:-1
+prow 1 48 0:0:-1 50:1:-1 0:0:-1 0:0:-1
+prow 1 56 0:0:-1 50:1:-1 0:0:-1 0:0:-1
