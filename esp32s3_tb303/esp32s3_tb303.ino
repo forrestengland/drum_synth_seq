@@ -22,7 +22,7 @@
 enum Screen { SCREEN_SYNTH, SCREEN_MENU, SCREEN_FX, SCREEN_DRUM, SCREEN_CHORDS };
 
 // current screen state
-Screen currentScreen = SCREEN_SYNTH;
+Screen currentScreen = SCREEN_MENU;
 // currently highlighted menu index
 uint8_t menuIndex = 0;                  // 0 synth, 1 fx, 2 drum
 
