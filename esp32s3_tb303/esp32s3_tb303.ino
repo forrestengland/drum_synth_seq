@@ -27,6 +27,12 @@ uint8_t menuIndex = 0;                  // 0 synth, 1 fx, 2 drum
 // drive amount for bass synth
 volatile float driveAmount = 0.0f;      // 0..1
 
+// global delay effect state
+volatile float delayMs       = 300.0f;   // 40..740
+volatile float delayFeedback = 0.4f;     // 0..1 (scaled to 0..0.85 in the audio task)
+volatile float delayMix      = 0.0f;     // 0..1
+uint8_t fxIndex = 0;                     // 0 drive, 1 time, 2 feedback, 3 mix
+
 // keep track of pattern queuing state for pattern switching at end of pattern
 volatile bool patternQueued = false;
 // what pattern to play next
@@ -99,6 +105,10 @@ SyncMode syncMode = SYNC_EXTERNAL;
 // Gray-code encoder state
 int encoderPosition = 0;
 int encoder2Position = 0;
+
+constexpr int DELAY_SIZE = 32768;                 // must be a power of two
+constexpr int DELAY_MASK = DELAY_SIZE - 1;
+static int16_t delayBuf[DELAY_SIZE];              // zero-initialised
 
 // other 2 push button pins
 #define ACCENT_BUTTON_PIN 1
@@ -222,6 +232,13 @@ struct SavedStateV1 {
     uint8_t loopLength;
     float   internalBpm;
     Step    pattern[NUM_STEPS];
+};
+
+struct FxSaved {
+    uint8_t version;
+    float   timeMs;
+    float   feedback;
+    float   mix;
 };
 
 struct DrumSaved {
@@ -422,6 +439,36 @@ DrumSaved captureDrum() {
     return d;
 }
 
+FxSaved lastSeenFx;
+FxSaved lastSavedFx;
+
+FxSaved captureFx() {
+    FxSaved f;
+    memset(&f, 0, sizeof(f));
+    f.version = 1;
+    f.timeMs = delayMs;
+    f.feedback = delayFeedback;
+    f.mix = delayMix;
+    return f;
+}
+
+void loadFx() {
+    FxSaved f;
+    if (prefs.getBytesLength("fx") == sizeof(f) &&
+        prefs.getBytes("fx", &f, sizeof(f)) == sizeof(f) &&
+        f.version == 1 &&
+        f.timeMs >= 40.0f && f.timeMs <= 740.0f &&
+        f.feedback >= 0.0f && f.feedback <= 1.0f &&
+        f.mix >= 0.0f && f.mix <= 1.0f) {
+
+        delayMs = f.timeMs;
+        delayFeedback = f.feedback;
+        delayMix = f.mix;
+    }
+    lastSeenFx = captureFx();
+    lastSavedFx = lastSeenFx;
+}
+
 void loadDrums() {
     DrumSaved d;
     if (prefs.getBytesLength("drums") == sizeof(d) &&
@@ -542,6 +589,7 @@ void loadState() {
 
 		loadDrums();
 		loadChords();
+		loadFx();
     lastSeenState = captureState();
     lastSavedState = lastSeenState;
 
@@ -555,13 +603,16 @@ void updateAutosave() {
     SavedState now = captureState();
     DrumSaved nowDrum = captureDrum();
     ChordSaved nowChord = captureChords();
+    FxSaved nowFx = captureFx();                       // with the other captures		
 
     if (memcmp(&now, &lastSeenState, sizeof(now)) != 0 ||
         memcmp(&nowDrum, &lastSeenDrum, sizeof(nowDrum)) != 0 ||
+        memcmp(&nowFx, &lastSeenFx, sizeof(nowFx)) != 0 ||   
         memcmp(&nowChord, &lastSeenChord, sizeof(nowChord)) != 0) {
         lastSeenState = now;
         lastSeenDrum = nowDrum;
         lastSeenChord = nowChord;
+				lastSeenFx = nowFx;                           
         lastChangeMs = millis();
         saveDirty = true;
     }
@@ -581,6 +632,10 @@ void updateAutosave() {
             prefs.putBytes("chords", &nowChord, sizeof(nowChord));
             lastSavedChord = nowChord;
         }
+        if (memcmp(&nowFx, &lastSeenFx, sizeof(nowFx)) != 0) {
+					prefs.putBytes("fx", &nowFx, sizeof(nowFx));
+					lastSavedFx = nowFx;                            // inside the change block
+				}
         Serial.println("Saved.");
     }
 }
@@ -759,11 +814,21 @@ void handleMenuEncoders(int32_t d1, int32_t d2) {
 				displayDirty = true;
 			}			
     }		
-	
-    if (currentScreen == SCREEN_FX && d2 != 0) {
-        driveAmount = constrain(driveAmount + d2 * 0.05f, 0.0f, 1.0f);
-        displayDirty = true;
-    }
+    if (currentScreen == SCREEN_FX) {
+        if (d1 != 0) {
+            fxIndex = (fxIndex + 4 + (d1 % 4)) % 4;
+            displayDirty = true;
+        }
+        if (d2 != 0) {
+            switch (fxIndex) {
+                case 0: driveAmount    = constrain(driveAmount    + d2 * 0.05f, 0.0f, 1.0f); break;
+                case 1: delayMs        = constrain(delayMs        + d2 * 10.0f, 40.0f, 740.0f); break;
+                case 2: delayFeedback  = constrain(delayFeedback  + d2 * 0.05f, 0.0f, 1.0f); break;
+                case 3: delayMix       = constrain(delayMix       + d2 * 0.05f, 0.0f, 1.0f); break;
+            }
+            displayDirty = true;
+        }
+    }	
 }
 
 ButtonEvent updateButton(Button& b) {
@@ -1321,7 +1386,16 @@ void audioTask(void* parameter) {
   float chordPhase[4] = {0, 0, 0, 0};     // 0..1
   float chordEnv[4]   = {0, 0, 0, 0};
   float smChordLevel  = 0.0f;
-  const float chordEnvStep = 1.0f / (SAMPLE_RATE * 0.008f);   // 8 ms attack/release	
+  const float chordEnvStep = 1.0f / (SAMPLE_RATE * 0.008f);   // 8 ms attack/release
+
+  // ---- Delay ----
+  int   delayWrite = 0;
+  float smDelaySamples = 0.0f;
+  float smDelayFb = 0.0f, smDelayMix = 0.0f;
+  float delayLp = 0.0f;
+  const float delayTimeCoeff =
+      1.0f - expf(-(float)BLOCK_FRAMES / (0.08f * SAMPLE_RATE));   // ~80 ms glide
+	float blockDelayMs, blockDelayFb, blockDelayMix;	
 	
 	for (;;) {
 
@@ -1363,7 +1437,11 @@ void audioTask(void* parameter) {
 
     blockChordMask = chordGateMask;
     blockChordLevel = chordLevel;
-    for (int v = 0; v < 4; v++) blockChordNotes[v] = chordCurNotes[v];		
+    for (int v = 0; v < 4; v++) blockChordNotes[v] = chordCurNotes[v];
+
+    blockDelayMs  = delayMs;
+    blockDelayFb  = delayFeedback;
+    blockDelayMix = delayMix;		
 
     portEXIT_CRITICAL(&synthMux);
 
@@ -1376,12 +1454,18 @@ void audioTask(void* parameter) {
     const float drumGain = smDrumLevel * 0.6f;
 
     smChordLevel += potSmoothCoeff * (blockChordLevel - smChordLevel);
-    const float chordGain = smChordLevel * 0.12f;
+    const float chordGain = smChordLevel * 0.12f;		
 
     float chordInc[4];
     for (int v = 0; v < 4; v++) {
         chordInc[v] = 440.0f * powf(2.0f, (blockChordNotes[v] - 69) / 12.0f) / SAMPLE_RATE;
     }
+
+    float targetDelaySamples = blockDelayMs * 0.001f * SAMPLE_RATE;
+    if (smDelaySamples < 1.0f) smDelaySamples = targetDelaySamples;   // first block
+    smDelaySamples += delayTimeCoeff * (targetDelaySamples - smDelaySamples);
+    smDelayFb  += potSmoothCoeff * (blockDelayFb  * 0.85f - smDelayFb);
+    smDelayMix += potSmoothCoeff * (blockDelayMix - smDelayMix);		
 
     float targetCutoffLog = log2f(blockCutoff);
 
@@ -1534,7 +1618,22 @@ void audioTask(void* parameter) {
               chords += (chordPhase[v] < 0.5f ? 1.0f : -1.0f) * chordEnv[v];
           }
       }
-      sample += chords * chordGain;			
+      sample += chords * chordGain;
+
+      // ---- Delay (all voices) ----
+      float rpos = (float)delayWrite - smDelaySamples;
+      if (rpos < 0.0f) rpos += DELAY_SIZE;
+      int i0 = (int)rpos;
+      float fr = rpos - i0;
+      int i1 = (i0 + 1) & DELAY_MASK;
+      float wet = (delayBuf[i0] + (delayBuf[i1] - delayBuf[i0]) * fr) * (1.0f / 32768.0f);
+
+      delayLp += 0.4f * (wet - delayLp);                       // darken the repeats
+      float toBuf = fastTanh(sample + delayLp * smDelayFb);
+      delayBuf[delayWrite] = (int16_t)(toBuf * 32767.0f);
+      delayWrite = (delayWrite + 1) & DELAY_MASK;
+
+      sample += wet * smDelayMix;			
 
 			float out = fastTanh(sample);
 			//      float out = constrain(sample, -1.0f, 1.0f); // hard clip
@@ -1877,14 +1976,28 @@ void drawMenuScreen() {
 			display.print(items[i]);
 		}
 	} else if (currentScreen == SCREEN_FX) {
-		display.setCursor(0, 14);
-		display.print("FX");
-		display.setCursor(8, 30);
-		display.print("> Drive");
-		display.drawRect(8, 42, 100, 8, SSD1306_WHITE);
-		display.fillRect(8, 42, (int)(driveAmount * 100.0f), 8, SSD1306_WHITE);
-		display.setCursor(112, 42);
-		display.print((int)(driveAmount * 100.0f + 0.5f) / 10);
+        display.setCursor(0, 14);
+        display.print("FX");
+
+        const char* names[4] = { "Drive", "Time", "Fdbk", "Mix" };
+        float values[4] = {
+            driveAmount,
+            (delayMs - 40.0f) / 700.0f,
+            delayFeedback,
+            delayMix
+        };
+
+        for (int i = 0; i < 4; i++) {
+            int y = 24 + i * 10;
+            display.setCursor(0, y);
+            display.print(i == fxIndex ? ">" : " ");
+            display.print(names[i]);
+            display.drawRect(42, y, 60, 7, SSD1306_WHITE);
+            display.fillRect(42, y, (int)(values[i] * 60.0f), 7, SSD1306_WHITE);
+        }
+
+        display.setCursor(106, 24 + 10);
+        display.print((int)delayMs / 10);   // time in tens of ms		
 	} else if (currentScreen == SCREEN_CHORDS) {
 		display.setCursor(0, 14);
 		display.print("CHORDS");
