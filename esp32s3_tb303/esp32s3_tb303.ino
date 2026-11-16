@@ -152,6 +152,19 @@ uint8_t selectedStep = 0;
 bool sequencerAccent = false;   // set per step
 bool accentActive = false;      // read by the audio task
 
+// ---------- Drums ----------
+// Rows: kick, snare, closed hat, open hat. Columns: steps 1-16.
+uint8_t drumPattern[4][16] = {
+    {1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0},   // kick
+    {0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0},   // snare
+    {1,0,1,0, 1,0,0,0, 1,0,1,0, 1,0,0,0},   // closed hat
+    {0,0,0,0, 0,0,1,0, 0,0,0,0, 0,0,1,0},   // open hat
+};
+
+volatile float drumLevel = 0.5f;            // 0..1
+volatile uint8_t drumTriggerMask = 0;       // bit 0 kick, 1 snare, 2 closed, 3 open
+uint8_t drumCursor = 0;
+
 // ---------- Autosave to flash ----------
 constexpr uint32_t SAVE_DELAY_MS = 3000;
 constexpr uint8_t  SAVE_VERSION  = 3;   // bump when SavedState or Step changes
@@ -171,6 +184,16 @@ struct SavedStateV1 {
     float   internalBpm;
     Step    pattern[NUM_STEPS];
 };
+
+struct DrumSaved {
+    uint8_t version;
+    float   drive;
+    float   level;
+    uint8_t pattern[4][16];
+};
+
+DrumSaved lastSeenDrum;
+DrumSaved lastSavedDrum;
 
 Preferences prefs;
 SavedState lastSeenState;    // what we saw on the previous loop
@@ -320,6 +343,48 @@ void IRAM_ATTR encoderISR(void* arg) {
     }
 }
 
+void triggerDrums(uint8_t step) {
+    uint8_t mask = 0;
+    for (int i = 0; i < 4; i++) {
+        if (drumPattern[i][step]) mask |= (1 << i);
+    }
+    if (mask) {
+        portENTER_CRITICAL(&synthMux);
+        drumTriggerMask |= mask;
+        portEXIT_CRITICAL(&synthMux);
+    }
+}
+
+DrumSaved captureDrum() {
+    DrumSaved d;
+    memset(&d, 0, sizeof(d));
+    d.version = 1;
+    d.drive = driveAmount;
+    d.level = drumLevel;
+    memcpy(d.pattern, drumPattern, sizeof(drumPattern));
+    return d;
+}
+
+void loadDrums() {
+    DrumSaved d;
+    if (prefs.getBytesLength("drums") == sizeof(d) &&
+        prefs.getBytes("drums", &d, sizeof(d)) == sizeof(d) &&
+        d.version == 1 &&
+        d.drive >= 0.0f && d.drive <= 1.0f &&
+        d.level >= 0.0f && d.level <= 1.0f) {
+
+        driveAmount = d.drive;
+        drumLevel = d.level;
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 16; c++)
+                drumPattern[r][c] = d.pattern[r][c] ? 1 : 0;
+        Serial.println("Drums loaded from flash.");
+    }
+
+    lastSeenDrum = captureDrum();
+    lastSavedDrum = lastSeenDrum;
+}
+
 SavedState captureState() {
 
 	SavedState s;
@@ -375,6 +440,7 @@ void loadState() {
     pattern = patternBank[currentPattern];
     loopLength = loopLengths[currentPattern];
 
+		loadDrums();
     lastSeenState = captureState();
     lastSavedState = lastSeenState;
 
@@ -385,11 +451,13 @@ void loadState() {
 }
 
 void updateAutosave() {
+    SavedState now = captureState();
+    DrumSaved nowDrum = captureDrum();
 
-	SavedState now = captureState();
-
-    if (memcmp(&now, &lastSeenState, sizeof(now)) != 0) {
+    if (memcmp(&now, &lastSeenState, sizeof(now)) != 0 ||
+        memcmp(&nowDrum, &lastSeenDrum, sizeof(nowDrum)) != 0) {
         lastSeenState = now;
+        lastSeenDrum = nowDrum;
         lastChangeMs = millis();
         saveDirty = true;
     }
@@ -397,12 +465,15 @@ void updateAutosave() {
     if (saveDirty && (millis() - lastChangeMs) >= SAVE_DELAY_MS) {
         saveDirty = false;
 
-        // Skip the write if the state ended up back where it was saved.
         if (memcmp(&now, &lastSavedState, sizeof(now)) != 0) {
             prefs.putBytes("state", &now, sizeof(now));
             lastSavedState = now;
-            Serial.println("Pattern saved.");
         }
+        if (memcmp(&nowDrum, &lastSavedDrum, sizeof(nowDrum)) != 0) {
+            prefs.putBytes("drums", &nowDrum, sizeof(nowDrum));
+            lastSavedDrum = nowDrum;
+        }
+        Serial.println("Saved.");
     }
 }
 
@@ -505,11 +576,11 @@ void restartInternalClock() {
 
 void handleMenuButtons(ButtonEvent patEvent) {
 
-	ButtonEvent sel = updateButton(encoder1Button);
-	ButtonEvent e2  = updateButton(encoder2Button);
-	ButtonEvent acc = updateButton(accentButton);     // return buttons
-	ButtonEvent st  = updateButton(startButton);      // return buttons
-	
+    ButtonEvent sel = updateButton(encoder1Button);
+    ButtonEvent e2  = updateButton(encoder2Button);
+    ButtonEvent acc = updateButton(accentButton);     // return buttons
+    ButtonEvent st  = updateButton(startButton);      // return buttons
+
     (void)patEvent; (void)e2;
 
     if (currentScreen == SCREEN_MENU) {
@@ -519,9 +590,19 @@ void handleMenuButtons(ButtonEvent patEvent) {
             else                     currentScreen = SCREEN_DRUM;
             displayDirty = true;
         }
-    } else if (acc == BTN_PRESSED || st == BTN_PRESSED) {
-        currentScreen = SCREEN_MENU;
-        displayDirty = true;
+    } else {
+        // Drum screen: encoder 1 button toggles the step under the cursor.
+        if (currentScreen == SCREEN_DRUM && sel == BTN_PRESSED) {
+            uint8_t& cell = drumPattern[drumCursor / 16][drumCursor % 16];
+            cell = cell ? 0 : 1;
+            displayDirty = true;
+        }
+
+        // Accent or start returns to the menu from FX and Drum.
+        if (acc == BTN_PRESSED || st == BTN_PRESSED) {
+            currentScreen = SCREEN_MENU;
+            displayDirty = true;
+        }
     }
 
     // Keep the synth buttons from toggling when you come back.
@@ -533,7 +614,17 @@ void handleMenuButtons(ButtonEvent patEvent) {
 
 void handleMenuEncoders(int32_t d1, int32_t d2) {
 
-	if (currentScreen == SCREEN_MENU && d1 != 0) {
+    if (currentScreen == SCREEN_DRUM && d2 != 0) {
+        drumLevel = constrain(drumLevel + d2 * 0.05f, 0.0f, 1.0f);
+        displayDirty = true;
+    }
+
+    if (currentScreen == SCREEN_DRUM && d1 != 0) {
+        drumCursor = (drumCursor + 64 + (d1 % 64)) % 64;
+        displayDirty = true;
+    }		
+
+		if (currentScreen == SCREEN_MENU && d1 != 0) {
         menuIndex = (menuIndex + 3 + (d1 % 3)) % 3;
         displayDirty = true;
     }
@@ -569,22 +660,6 @@ void switchPattern(uint8_t n) {
     currentPattern = n;
     pattern = patternBank[n];
     loopLength = loopLengths[n];
-
-    /* if (!midiRunning) { */
-    /*     clockCount = 0; */
-    /*     currentStep = 0; */
-    /*     midiRunning = true; */
-    /*     midiOutRealtime(0xFA);          // Start */
-    /*     triggerSequencerStep(); */
-    /*     restartInternalClock(); */
-    /* } else { */
-    /*     midiRunning = false; */
-    /*     if (esp_timer_is_active(internalClockTimer)) { */
-    /*         esp_timer_stop(internalClockTimer); */
-    /*     } */
-    /*     midiOutRealtime(0xFC);          // Stop */
-    /*     stopSequencerNote(); */
-    /* }		 */
 }
 
 void switchPatternNow() {
@@ -944,6 +1019,8 @@ inline void midiOutRealtime(uint8_t byte) {
 }
 
 void triggerSequencerStep() {
+
+    triggerDrums(currentStep % 16);	
 	
     Step& step = pattern[currentStep];
 
@@ -1086,7 +1163,29 @@ void audioTask(void* parameter) {
   float smDecay     = 500.0f;
   float smDrive = 0.0f;	
 
+  // ---- Drum voices ----
+  auto decayMul = [](float ms) {
+      return expf(-1.0f / (ms * 0.001f * SAMPLE_RATE));
+  };
+  const float kickAmpMul   = decayMul(120.0f);
+  const float kickPitchMul = decayMul(25.0f);
+  const float snareNoiseMul = decayMul(70.0f);
+  const float snareToneMul = decayMul(40.0f);
+  const float chMul        = decayMul(15.0f);
+  const float ohMul        = decayMul(120.0f);
+  const float chokeMul     = decayMul(2.0f);     // fast fade when the closed hat chokes the open hat
+  const float snareToneInc = TWO_PI * 190.0f / SAMPLE_RATE;
+
+  uint32_t noiseState = 22222;
+  float kickPhase = 0, kickEnv = 0, kickPitchEnv = 0;
+  float snareEnv = 0, snareToneEnv = 0, snareTonePhase = 0;
+  float chEnv = 0, ohEnv = 0;
+  bool ohChoked = false;
+  float hatLp = 0, snareLp = 0;
+  float smDrumLevel = 0.0f;
+	
 	for (;;) {
+
     float blockTargetAmplitude;
     float blockCutoff;
     float blockResonance;
@@ -1098,6 +1197,8 @@ void audioTask(void* parameter) {
 		bool blockGlide;
 		bool blockAccent;
 		float blockDrive;
+		uint8_t blockDrumMask;
+		float blockDrumLevel;		
 
     portENTER_CRITICAL(&synthMux);
 
@@ -1110,6 +1211,10 @@ void audioTask(void* parameter) {
     blockGlide = glideActive;
 		blockAccent = accentActive;
 
+    blockDrumMask = drumTriggerMask;
+    drumTriggerMask = 0;
+    blockDrumLevel = drumLevel;		
+
 		// consume the trigger
 		triggerEnvelope = filterEnvelopeTrigger;
 		filterEnvelopeTrigger = false;
@@ -1117,6 +1222,14 @@ void audioTask(void* parameter) {
 		blockDrive = driveAmount;
 
     portEXIT_CRITICAL(&synthMux);
+
+    if (blockDrumMask & 1) { kickEnv = 1.0f; kickPitchEnv = 1.0f; kickPhase = 0.0f; }
+    if (blockDrumMask & 2) { snareEnv = 1.0f; snareToneEnv = 1.0f; }
+    if (blockDrumMask & 4) { chEnv = 1.0f; ohChoked = true; }      // closed hat chokes the open hat
+    if (blockDrumMask & 8) { ohEnv = 1.0f; ohChoked = false; }
+
+    smDrumLevel += potSmoothCoeff * (blockDrumLevel - smDrumLevel);
+    const float drumGain = smDrumLevel * 0.6f;		
 
     float targetCutoffLog = log2f(blockCutoff);
 
@@ -1208,6 +1321,39 @@ void audioTask(void* parameter) {
 
       float sample = 0.0f;
 
+      // ---- Drums ----
+      noiseState ^= noiseState << 13;
+      noiseState ^= noiseState >> 17;
+      noiseState ^= noiseState << 5;
+      float n = (int32_t)noiseState * 4.656613e-10f;       // -1..1
+
+      hatLp   += 0.5f  * (n - hatLp);
+      snareLp += 0.15f * (n - snareLp);
+      float hat      = n - hatLp;                          // bright noise
+      float snNoise  = n - snareLp;                        // wider noise
+
+      float kickFreq = 45.0f + 110.0f * kickPitchEnv;
+      kickPhase += TWO_PI * kickFreq / SAMPLE_RATE;
+      if (kickPhase > TWO_PI) kickPhase -= TWO_PI;
+      float kick = sinf(kickPhase) * kickEnv;
+
+      snareTonePhase += snareToneInc;
+      if (snareTonePhase > TWO_PI) snareTonePhase -= TWO_PI;
+      float snare = snNoise * snareEnv * 0.8f +
+                    sinf(snareTonePhase) * snareToneEnv * 0.5f;
+
+      float drums = kick * 0.9f + snare * 0.5f +
+				hat * chEnv * 0.35f + hat * ohEnv * 0.3f;
+
+      sample += drums * drumGain;
+
+      kickEnv      *= kickAmpMul;
+      kickPitchEnv *= kickPitchMul;
+      snareEnv     *= snareNoiseMul;
+      snareToneEnv *= snareToneMul;
+      chEnv        *= chMul;
+      ohEnv        *= ohChoked ? chokeMul : ohMul;			
+
       if (currentAmplitude > 0.00001f) {
 				float oscillatorSample = getOscillatorSample();
 
@@ -1217,12 +1363,14 @@ void audioTask(void* parameter) {
             filteredSample = fastTanh(filteredSample * driveGain) * driveNorm;
         }				
 
-				sample = filteredSample * currentAmplitude;
+				sample += filteredSample * currentAmplitude;
 				//				sample = getOscillatorSample() * currentAmplitude;
 
       }
 
-      float out = constrain(sample, -1.0f, 1.0f);
+			float out = fastTanh(sample);
+			//      float out = constrain(sample, -1.0f, 1.0f); // hard clip
+			
       int16_t pcm = (int16_t)(out * 32767.0f);			
 
       // Duplicate mono signal to left and right.
@@ -1235,7 +1383,13 @@ void audioTask(void* parameter) {
 			if (filterEnvelope < 0.0001f) {
 				filterEnvelope = 0.0f;
 			}
-    }
+		}
+
+    if (kickEnv < 1e-4f) kickEnv = 0.0f;
+    if (snareEnv < 1e-4f) snareEnv = 0.0f;
+    if (snareToneEnv < 1e-4f) snareToneEnv = 0.0f;
+    if (chEnv < 1e-4f) chEnv = 0.0f;
+    if (ohEnv < 1e-4f) ohEnv = 0.0f;		
 
     size_t bytesWritten = 0;
 
@@ -1527,6 +1681,7 @@ void drawPatternSelect() {
 }
 
 void drawMenuScreen() {
+
 	display.setCursor(0, 12);
 
 	if (currentScreen == SCREEN_MENU) {
@@ -1548,8 +1703,34 @@ void drawMenuScreen() {
 	} else {
 		display.setCursor(0, 14);
 		display.print("DRUM");
-		display.setCursor(8, 30);
-		display.print("coming soon");
+
+		static const char* drumNames[4] = { "KICK", "SNARE", "CHAT", "OHAT" };
+		char label[16];
+		snprintf(label, sizeof(label), "%s %02d",
+						 drumNames[drumCursor / 16], (drumCursor % 16) + 1);
+		display.setCursor(50, 14);
+		display.print(label);
+
+		display.setCursor(8, 24);
+		display.print("> Level");
+		display.drawRect(58, 24, 56, 8, SSD1306_WHITE);
+		display.fillRect(58, 24, (int)(drumLevel * 56.0f), 8, SSD1306_WHITE);
+
+		// 4 x 16 pattern grid with a playhead tick
+		for (int r = 0; r < 4; r++) {
+			for (int c = 0; c < 16; c++) {
+				int x = 8 + c * 7;
+				int y = 38 + r * 6;
+				if (drumPattern[r][c]) display.fillRect(x, y, 5, 4, SSD1306_WHITE);
+				else display.drawPixel(x + 2, y + 2, SSD1306_WHITE);
+				if (r * 16 + c == drumCursor) {
+					display.drawRect(x - 1, y - 1, 7, 6, SSD1306_WHITE);
+				}
+			}
+		}
+		if (midiRunning) {
+			display.drawFastHLine(8 + (currentStep % 16) * 7, 35, 5, SSD1306_WHITE);
+		}
 	}
 }
 
