@@ -16,6 +16,12 @@
 
 #include <Preferences.h>
 
+enum Screen { SCREEN_SYNTH, SCREEN_MENU, SCREEN_FX, SCREEN_DRUM };
+Screen currentScreen = SCREEN_SYNTH;
+uint8_t menuIndex = 0;                  // 0 synth, 1 fx, 2 drum
+
+volatile float driveAmount = 0.0f;      // 0..1
+
 volatile bool patternQueued = false;
 uint8_t queuedPattern = 0;
 
@@ -410,44 +416,50 @@ int32_t takeEncoderDetents(Encoder& e) {
 }
 
 void updateEncoder() {
-    updateButtons();
 
-    int32_t d1 = takeEncoderDetents(enc1);
-    int32_t d2 = takeEncoderDetents(enc2);
+	updateButtons();
 
-    if (patternSelectMode) {
-        if (d1 != 0) {
-            pendingPattern =
-                (pendingPattern + NUM_PATTERNS + (d1 % NUM_PATTERNS)) % NUM_PATTERNS;
-            displayDirty = true;
-        }
-        return;   // encoder 2 is ignored while selecting
-    }
+	int32_t d1 = takeEncoderDetents(enc1);
+	int32_t d2 = takeEncoderDetents(enc2);
 
-    // Encoder 1: select step
-    if (d1 != 0) {
-        selectedStep = (selectedStep + NUM_STEPS + (d1 % NUM_STEPS)) % NUM_STEPS;
-        displayDirty = true;
-    }
+	if (currentScreen != SCREEN_SYNTH) {
+		handleMenuEncoders(d1, d2);
+		return;
+	}
 
-    // Encoder 2: note, or tempo while its button is held
-    if (d2 != 0) {
-        bool buttonHeld = (encoder2Button.stableState == LOW);
+	if (patternSelectMode) {
+		if (d1 != 0) {
+			pendingPattern =
+				(pendingPattern + NUM_PATTERNS + (d1 % NUM_PATTERNS)) % NUM_PATTERNS;
+			displayDirty = true;
+		}
+		return;   // encoder 2 is ignored while selecting
+	}
 
-        if (buttonHeld) {
-            encoder2Turned = true;
+	// Encoder 1: select step
+	if (d1 != 0) {
+		selectedStep = (selectedStep + NUM_STEPS + (d1 % NUM_STEPS)) % NUM_STEPS;
+		displayDirty = true;
+	}
 
-            if (syncMode == SYNC_INTERNAL) {
-                internalBpm = constrain(internalBpm + d2, MIN_BPM, MAX_BPM);
-                if (midiRunning) restartInternalClock();
-                displayDirty = true;
-            }
-        } else {
-            int n = pattern[selectedStep].note + d2;
-            pattern[selectedStep].note = constrain(n, 24, 96);
-            displayDirty = true;
-        }
-    }
+	// Encoder 2: note, or tempo while its button is held
+	if (d2 != 0) {
+		bool buttonHeld = (encoder2Button.stableState == LOW);
+
+		if (buttonHeld) {
+			encoder2Turned = true;
+
+			if (syncMode == SYNC_INTERNAL) {
+				internalBpm = constrain(internalBpm + d2, MIN_BPM, MAX_BPM);
+				if (midiRunning) restartInternalClock();
+				displayDirty = true;
+			}
+		} else {
+			int n = pattern[selectedStep].note + d2;
+			pattern[selectedStep].note = constrain(n, 24, 96);
+			displayDirty = true;
+		}
+	}
 }
 
 void setupEncoder() {
@@ -489,6 +501,47 @@ void restartInternalClock() {
         (uint64_t)(60000000.0f / (internalBpm * 24.0f));
 
     esp_timer_start_periodic(internalClockTimer, interval);
+}
+
+void handleMenuButtons(ButtonEvent patEvent) {
+
+	ButtonEvent sel = updateButton(encoder1Button);
+	ButtonEvent e2  = updateButton(encoder2Button);
+	ButtonEvent acc = updateButton(accentButton);     // return buttons
+	ButtonEvent st  = updateButton(startButton);      // return buttons
+	
+    (void)patEvent; (void)e2;
+
+    if (currentScreen == SCREEN_MENU) {
+        if (sel == BTN_PRESSED) {
+            if (menuIndex == 0)      currentScreen = SCREEN_SYNTH;
+            else if (menuIndex == 1) currentScreen = SCREEN_FX;
+            else                     currentScreen = SCREEN_DRUM;
+            displayDirty = true;
+        }
+    } else if (acc == BTN_PRESSED || st == BTN_PRESSED) {
+        currentScreen = SCREEN_MENU;
+        displayDirty = true;
+    }
+
+    // Keep the synth buttons from toggling when you come back.
+    chordUsed = true;
+    if (accentButton.stableState == HIGH && startButton.stableState == HIGH) {
+        chordUsed = false;
+    }
+}
+
+void handleMenuEncoders(int32_t d1, int32_t d2) {
+
+	if (currentScreen == SCREEN_MENU && d1 != 0) {
+        menuIndex = (menuIndex + 3 + (d1 % 3)) % 3;
+        displayDirty = true;
+    }
+	
+    if (currentScreen == SCREEN_FX && d2 != 0) {
+        driveAmount = constrain(driveAmount + d2 * 0.05f, 0.0f, 1.0f);
+        displayDirty = true;
+    }
 }
 
 ButtonEvent updateButton(Button& b) {
@@ -573,7 +626,24 @@ void confirmPatternSelect() {
 void updateButtons() {
 
     // Pattern button: fires on press, works in both modes.
-    if (updateButton(patternButton) == BTN_PRESSED) {
+    ButtonEvent patEvent = updateButton(patternButton);
+
+    if (currentScreen != SCREEN_SYNTH) {
+        handleMenuButtons(patEvent);
+        return;
+    }
+
+    // Start + Pattern: open the menu.
+    if (patEvent == BTN_PRESSED && startButton.stableState == LOW) {
+        chordUsed = true;               // start's release won't toggle run
+        patternSelectMode = false;
+        currentScreen = SCREEN_MENU;
+        menuIndex = 0;
+        displayDirty = true;
+        return;
+    }
+
+    if (patEvent == BTN_PRESSED) {	
         bool accentHeld = (accentButton.stableState == LOW);
 
         if (accentHeld) {
@@ -1013,7 +1083,8 @@ void audioTask(void* parameter) {
   float smCutoffLog = -1.0f;   // log2 of cutoff, -1 = uninitialised
   float smResonance = 0.0f;
   float smEnvDepth  = 0.0f;
-  float smDecay     = 500.0f;	
+  float smDecay     = 500.0f;
+  float smDrive = 0.0f;	
 
 	for (;;) {
     float blockTargetAmplitude;
@@ -1026,6 +1097,7 @@ void audioTask(void* parameter) {
 		float blockTargetInc;
 		bool blockGlide;
 		bool blockAccent;
+		float blockDrive;
 
     portENTER_CRITICAL(&synthMux);
 
@@ -1041,6 +1113,8 @@ void audioTask(void* parameter) {
 		// consume the trigger
 		triggerEnvelope = filterEnvelopeTrigger;
 		filterEnvelopeTrigger = false;
+
+		blockDrive = driveAmount;
 
     portEXIT_CRITICAL(&synthMux);
 
@@ -1062,7 +1136,11 @@ void audioTask(void* parameter) {
     blockCutoff    = exp2f(smCutoffLog);
     blockResonance = smResonance;
     blockEnvDepth  = smEnvDepth;
-    blockDecay     = smDecay;		
+    blockDecay     = smDecay;
+
+    smDrive += potSmoothCoeff * (blockDrive - smDrive);
+    float driveGain = 1.0f + smDrive * 9.0f;
+    float driveNorm = 1.0f / fastTanh(driveGain);		
 
 		if (blockAccent) {
 			blockEnvDepth *= ACCENT_ENV_MULT;
@@ -1134,6 +1212,10 @@ void audioTask(void* parameter) {
 				float oscillatorSample = getOscillatorSample();
 
         float filteredSample = processLadder(oscillatorSample, ladder, k);
+
+        if (smDrive > 0.001f) {
+            filteredSample = fastTanh(filteredSample * driveGain) * driveNorm;
+        }				
 
 				sample = filteredSample * currentAmplitude;
 				//				sample = getOscillatorSample() * currentAmplitude;
@@ -1444,6 +1526,33 @@ void drawPatternSelect() {
     display.print(text);
 }
 
+void drawMenuScreen() {
+	display.setCursor(0, 12);
+
+	if (currentScreen == SCREEN_MENU) {
+		const char* items[3] = { "Synth", "FX", "Drum" };
+		for (int i = 0; i < 3; i++) {
+			display.setCursor(8, 18 + i * 12);
+			display.print(i == menuIndex ? "> " : "  ");
+			display.print(items[i]);
+		}
+	} else if (currentScreen == SCREEN_FX) {
+		display.setCursor(0, 14);
+		display.print("FX");
+		display.setCursor(8, 30);
+		display.print("> Drive");
+		display.drawRect(8, 42, 100, 8, SSD1306_WHITE);
+		display.fillRect(8, 42, (int)(driveAmount * 100.0f), 8, SSD1306_WHITE);
+		display.setCursor(112, 42);
+		display.print((int)(driveAmount * 100.0f + 0.5f) / 10);
+	} else {
+		display.setCursor(0, 14);
+		display.print("DRUM");
+		display.setCursor(8, 30);
+		display.print("coming soon");
+	}
+}
+
 void updateDisplay() {
 
 	// Only refresh when something has changed.
@@ -1504,6 +1613,12 @@ void updateDisplay() {
         display.fillCircle(60, 4, 2, SSD1306_WHITE);
     } else {
         display.drawCircle(60, 4, 2, SSD1306_WHITE);
+    }
+
+    if (currentScreen != SCREEN_SYNTH) {
+        drawMenuScreen();
+        display.display();
+        return;
     }
 
 		if (patternSelectMode) {
