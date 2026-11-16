@@ -16,6 +16,8 @@
 
 #include <Preferences.h>
 
+#define RUN_SWITCH_PIN 40
+
 // screen definitions
 enum Screen { SCREEN_SYNTH, SCREEN_MENU, SCREEN_FX, SCREEN_DRUM, SCREEN_CHORDS };
 
@@ -269,7 +271,6 @@ bool chordUsed = false;
 
 // 5 pin midi in
 #define MIDI_RX_PIN 16
-#define MIDI_TX_PIN -1
 
 // pots
 #define I2C_SDA 11
@@ -632,7 +633,7 @@ void updateAutosave() {
             prefs.putBytes("chords", &nowChord, sizeof(nowChord));
             lastSavedChord = nowChord;
         }
-        if (memcmp(&nowFx, &lastSeenFx, sizeof(nowFx)) != 0) {
+        if (memcmp(&nowFx, &lastSavedFx, sizeof(nowFx)) != 0) {
 					prefs.putBytes("fx", &nowFx, sizeof(nowFx));
 					lastSavedFx = nowFx;                            // inside the change block
 				}
@@ -755,8 +756,9 @@ void handleMenuButtons(ButtonEvent patEvent) {
             displayDirty = true;
         }
     } else {
-        // Drum screen: encoder 1 button toggles the step under the cursor.
-        if (currentScreen == SCREEN_DRUM && sel == BTN_PRESSED) {
+						
+			// Drum screen: encoder 1 button toggles the step under the cursor.
+			if (currentScreen == SCREEN_DRUM && sel == BTN_PRESSED) {
             uint8_t& cell = drumPattern[drumCursor / 16][drumCursor % 16];
             cell = cell ? 0 : 1;
             displayDirty = true;
@@ -939,7 +941,7 @@ void updateButtons() {
         updateButton(encoder1Button);
         updateButton(encoder2Button);
         updateButton(accentButton);
-        updateButton(startButton);
+				//        updateButton(startButton);
         return;
     }	
 	
@@ -981,7 +983,10 @@ void updateButtons() {
     }
 
     if (startEvent == BTN_RELEASED && !chordUsed) {
-        toggleInternalRun();
+        patternSelectMode = false;
+        currentScreen = SCREEN_MENU;
+        menuIndex = 0;
+        displayDirty = true;
     }
 
     if (!accentDown && !startDown) {
@@ -2267,12 +2272,11 @@ void updateSyncSwitch() {
 
     if (syncMode == SYNC_INTERNAL) {
 
-        // Trigger the first step immediately.
-			//        triggerSequencerStep();
+			if (digitalRead(RUN_SWITCH_PIN) == LOW) {
+				toggleInternalRun();   // midiRunning is false here, so this starts
+			}
 
-			//        restartInternalClock();
-
-        Serial.println("SYNC: INTERNAL");
+			Serial.println("SYNC: INTERNAL");
 
     } else {
 
@@ -2283,6 +2287,8 @@ void updateSyncSwitch() {
 }
 
 void setup() {
+
+	pinMode(RUN_SWITCH_PIN, INPUT_PULLUP);
 
 	pinMode(SYNC_SWITCH_PIN, INPUT_PULLUP);
 
@@ -2386,6 +2392,43 @@ void setup() {
  
 }
 
+void updateRunSwitch() {
+    static bool initialised = false;
+    static int lastReading = HIGH;
+    static int stableReading = HIGH;
+    static uint32_t lastChange = 0;
+
+    int reading = digitalRead(RUN_SWITCH_PIN);
+
+    if (!initialised) {
+        // Adopt the switch position at boot without acting on it.
+        initialised = true;
+        lastReading = stableReading = reading;
+        return;
+    }
+
+    if (reading != lastReading) {
+        lastChange = millis();
+        lastReading = reading;
+    }
+
+    if ((millis() - lastChange) < 30 || reading == stableReading) {
+        return;
+    }
+
+    stableReading = reading;
+
+    // Only the internal clock can be started and stopped from here.
+    if (syncMode != SYNC_INTERNAL) {
+        return;
+    }
+
+    bool wantRun = (reading == LOW);
+    if (wantRun != midiRunning) {
+        toggleInternalRun();
+    }
+}
+
 void loop() {
 
 	processMidi();
@@ -2394,7 +2437,8 @@ void loop() {
 	updateSynthControls();
 
 	updateEncoder();
-	updateSyncSwitch();		
+	updateSyncSwitch();
+	updateRunSwitch();
 
 	updateDisplay();
 
