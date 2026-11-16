@@ -16,54 +16,78 @@
 
 #include <Preferences.h>
 
+// screen definitions
 enum Screen { SCREEN_SYNTH, SCREEN_MENU, SCREEN_FX, SCREEN_DRUM };
+
+// current screen state
 Screen currentScreen = SCREEN_SYNTH;
+// currently highlighted menu index
 uint8_t menuIndex = 0;                  // 0 synth, 1 fx, 2 drum
 
+// drive amount for bass synth
 volatile float driveAmount = 0.0f;      // 0..1
 
+// keep track of pattern queuing state for pattern switching at end of pattern
 volatile bool patternQueued = false;
+// what pattern to play next
 uint8_t queuedPattern = 0;
 
+// midi output pin definition
 #define MIDI_TX_PIN 41
+
+// midi output channel
 #define MIDI_OUT_CHANNEL 1          // 1-16
+// note currently held on the output, -1 = none
+int midiOutNote = -1;
 
-int midiOutNote = -1;               // note currently held on the output, -1 = none
-
+// number of bass synth patterns
 #define NUM_PATTERNS 16
+
+// button 3 pin which controls pattern selection for the bass synth
 #define PATTERN_BUTTON_PIN 47
 
+// target phase increment for our slide functionality
 float targetPhaseIncrement = 0.0f;
+// whether we're currently generating audible frequency glide
 bool glideActive = false;
 
+// glide time
 constexpr float GLIDE_TIME_MS = 25.0f;   // time constant; ~60-75 ms to settle
 
+// retrigger modes
 enum RetriggerMode {
     RETRIG_ON_PITCH,   // old behavior: only when the pitch changes
     RETRIG_ALWAYS,     // new gated note
     RETRIG_NEVER       // slide: keep envelope and gate running
 };
 
+// gate time for retriggering note on each step
 // Gate closes after this many of the 6 pulses in a step.
 // 3 = 50%, 4 = 67%, 5 = 83%
 constexpr uint8_t GATE_PULSES = 4;
 
+// how much accent affects the envelope
 constexpr float ACCENT_ENV_MULT   = 1.8f;   // filter envelope depth multiplier
+// how much accent affects decay
 constexpr float ACCENT_DECAY_MULT = 0.5f;   // envelope decay time multiplier
+// how much accent affects resonance
 constexpr float ACCENT_RES_BOOST  = 0.03f;  // added to resonance
+// how much feedback the filter uses
 constexpr float FILTER_FEEDBACK = 2.0f;
 
-// Sync mode switch
+// Sync mode switch pin - toggle switch for external or internal sync mode
 #define SYNC_SWITCH_PIN 8
 
+// available sync modes
 enum SyncMode {
     SYNC_EXTERNAL,
     SYNC_INTERNAL
 };
 
+// current sync mode
 SyncMode syncMode = SYNC_EXTERNAL;
 
-// encoders
+// encoder pin definitions
 #define ENCODER_CLK 14
 #define ENCODER_DT  13
 #define ENCODER_SW  15
@@ -73,15 +97,17 @@ SyncMode syncMode = SYNC_EXTERNAL;
 #define ENCODER2_SW  21
 
 // Gray-code encoder state
-
 int encoderPosition = 0;
 int encoder2Position = 0;
 
+// other 2 push button pins
 #define ACCENT_BUTTON_PIN 1
 #define START_BUTTON_PIN  2
 
+// button event
 enum ButtonEvent { BTN_NONE, BTN_PRESSED, BTN_RELEASED };
 
+// Button definition
 struct Button {
     uint8_t pin;
     bool lastReading;
@@ -91,26 +117,30 @@ struct Button {
     Button(uint8_t p) : pin(p), lastReading(HIGH), stableState(HIGH), lastChange(0) {}
 };
 
-Button encoder1Button(ENCODER_SW);       // defined after the encoder pin #defines
+// Button instances for debouncing
+Button encoder1Button(ENCODER_SW);
 Button encoder2Button(ENCODER2_SW);
 Button accentButton(ACCENT_BUTTON_PIN);
 Button startButton(START_BUTTON_PIN);
 Button patternButton(PATTERN_BUTTON_PIN);
 
+// keep track if encoder 2 was turned while encoder 2 button was pressed
+// because it sets slide for the current step if not turned
+// or sets the internal clock tempo if it was turned while the button was pressed
 bool encoder2Turned = false;
 
 // Internal tempo
+// current
 float internalBpm = 120.0f;
+// range
 constexpr float MIN_BPM = 40.0f;
 constexpr float MAX_BPM = 240.0f;
 
+// timer
 esp_timer_handle_t internalClockTimer = nullptr;
 
-// encoder button debounce
+// encoder debounce time
 #define ENCODER_DEBOUNCE_MS 50
-
-// clock
-// MIDI clock / sequencer state
 
 // OLED refresh state
 uint32_t lastDisplayUpdate = 0;
@@ -120,7 +150,6 @@ volatile uint8_t clockCount = 0;
 volatile bool midiRunning = false;
 volatile uint8_t currentStep = 0;
 volatile bool displayDirty = true;
-
 volatile uint32_t lastClockMicros = 0;
 volatile float externalBpm = 0.0f;
 
@@ -130,16 +159,18 @@ uint32_t clockTimes[CLOCK_WINDOW];
 uint8_t clockTimeIndex = 0;
 uint8_t clockTimeCount = 0;
 
-// sequence
+// sequence length for bass synth
 #define NUM_STEPS 32
 
+// bass synth sequencer Step
 struct Step {
-    uint8_t note = 60;  // Middle C
+    uint8_t note = 60;  // Middle C by default
     bool active = false;
     bool accent = false;
     bool slide = false;
 };
 
+// patterns data
 Step patternBank[NUM_PATTERNS][NUM_STEPS];
 Step* pattern = patternBank[0];          // the pattern currently playing/editing
 uint8_t loopLengths[NUM_PATTERNS];       // loopLength is stored per pattern
@@ -147,7 +178,7 @@ uint8_t currentPattern = 0;
 uint8_t pendingPattern = 0;
 bool patternSelectMode = false;
 
-uint8_t selectedStep = 0;
+uint8_t selectedStep = 0; // step the cursor is on - actions affect this step index
 
 bool sequencerAccent = false;   // set per step
 bool accentActive = false;      // read by the audio task
