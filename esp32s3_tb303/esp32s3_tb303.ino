@@ -251,6 +251,15 @@ struct DrumSaved {
     float   drive;
     float   level;
     uint8_t pattern[4][16];
+    uint8_t accent[4][16];
+};
+
+// Old format without accents, for migration.
+struct DrumSavedV1 {
+    uint8_t version;
+    float   drive;
+    float   level;
+    uint8_t pattern[4][16];
 };
 
 struct ChordSaved {
@@ -442,13 +451,62 @@ void triggerDrums(uint8_t step) {
 }
 
 DrumSaved captureDrum() {
-    DrumSaved d;
-    memset(&d, 0, sizeof(d));
-    d.version = 1;
-    d.drive = driveAmount;
-    d.level = drumLevel;
-    memcpy(d.pattern, drumPattern, sizeof(drumPattern));
-    return d;
+	DrumSaved d;
+	memset(&d, 0, sizeof(d));
+	d.version = 2;
+	d.drive = driveAmount;
+	d.level = drumLevel;
+	memcpy(d.pattern, drumPattern, sizeof(drumPattern));
+	memcpy(d.accent, drumAccent, sizeof(drumAccent));
+	return d;
+}
+
+void loadDrums() {
+	DrumSaved d;
+	DrumSavedV1 old;
+	size_t len = prefs.getBytesLength("drums");
+	bool migrated = false;
+
+	if (len == sizeof(d) &&
+			prefs.getBytes("drums", &d, sizeof(d)) == sizeof(d) &&
+			d.version == 2 &&
+			d.drive >= 0.0f && d.drive <= 1.0f &&
+			d.level >= 0.0f && d.level <= 1.0f) {
+
+		driveAmount = d.drive;
+		drumLevel = d.level;
+		for (int r = 0; r < 4; r++)
+			for (int c = 0; c < 16; c++) {
+				drumPattern[r][c] = d.pattern[r][c] ? 1 : 0;
+				drumAccent[r][c]  = d.accent[r][c] ? 1 : 0;
+			}
+		Serial.println("Drums loaded from flash.");
+
+	} else if (len == sizeof(old) &&
+						 prefs.getBytes("drums", &old, sizeof(old)) == sizeof(old) &&
+						 old.version == 1 &&
+						 old.drive >= 0.0f && old.drive <= 1.0f &&
+						 old.level >= 0.0f && old.level <= 1.0f) {
+
+		// Keep the old pattern, start with no accents.
+		driveAmount = old.drive;
+		drumLevel = old.level;
+		for (int r = 0; r < 4; r++)
+			for (int c = 0; c < 16; c++) {
+				drumPattern[r][c] = old.pattern[r][c] ? 1 : 0;
+				drumAccent[r][c]  = 0;
+			}
+		migrated = true;
+		Serial.println("Migrated v1 drums.");
+	}
+
+	lastSeenDrum = captureDrum();
+	lastSavedDrum = lastSeenDrum;
+
+	// Write the new format right away after a migration.
+	if (migrated) {
+		prefs.putBytes("drums", &lastSavedDrum, sizeof(lastSavedDrum));
+	}
 }
 
 FxSaved lastSeenFx;
@@ -479,26 +537,6 @@ void loadFx() {
     }
     lastSeenFx = captureFx();
     lastSavedFx = lastSeenFx;
-}
-
-void loadDrums() {
-    DrumSaved d;
-    if (prefs.getBytesLength("drums") == sizeof(d) &&
-        prefs.getBytes("drums", &d, sizeof(d)) == sizeof(d) &&
-        d.version == 1 &&
-        d.drive >= 0.0f && d.drive <= 1.0f &&
-        d.level >= 0.0f && d.level <= 1.0f) {
-
-        driveAmount = d.drive;
-        drumLevel = d.level;
-        for (int r = 0; r < 4; r++)
-            for (int c = 0; c < 16; c++)
-                drumPattern[r][c] = d.pattern[r][c] ? 1 : 0;
-        Serial.println("Drums loaded from flash.");
-    }
-
-    lastSeenDrum = captureDrum();
-    lastSavedDrum = lastSeenDrum;
 }
 
 ChordSaved lastSeenChord;
