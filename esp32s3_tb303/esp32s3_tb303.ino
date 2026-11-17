@@ -21,10 +21,10 @@
 // screen definitions
 enum Screen { SCREEN_SYNTH, SCREEN_MENU, SCREEN_FX, SCREEN_DRUM, SCREEN_CHORDS };
 
-// current screen state
+// current screen
 Screen currentScreen = SCREEN_MENU;
 // currently highlighted menu index
-uint8_t menuIndex = 0;                  // 0 synth, 1 fx, 2 drum
+uint8_t menuIndex = 0;                  // 0 synth, 1 fx, 2 drum, 3 chords
 
 // drive amount for bass synth
 volatile float driveAmount = 0.0f;      // 0..1
@@ -204,6 +204,9 @@ uint8_t drumPattern[4][16] = {
     {0,0,0,0, 0,0,1,0, 0,0,0,0, 0,0,1,0},   // open hat
 };
 
+#define DRUM_ACCENT_AMT 0.3f
+uint8_t drumAccent[4][16];
+
 volatile float drumLevel = 0.5f;            // 0..1
 volatile uint8_t drumTriggerMask = 0;       // bit 0 kick, 1 snare, 2 closed, 3 open
 uint8_t drumCursor = 0;
@@ -266,19 +269,20 @@ SavedState lastSavedState;   // what is in flash
 bool saveDirty = false;
 uint32_t lastChangeMs = 0;
 
-volatile uint8_t loopLength = NUM_STEPS;   // steps 0..loopLength-1 play
+volatile uint8_t loopLength = NUM_STEPS;   // steps 0..loopLength-1 for bass synth sequencer playback
 bool chordUsed = false;
 
-// 5 pin midi in
+// 5 pin midi in pin
 #define MIDI_RX_PIN 16
 
-// pots
+// i2c pin definitions for oled and adc
 #define I2C_SDA 11
 #define I2C_SCL 12
 
+// adc definition for pot reads
 Adafruit_ADS1115 ads;
 
-// -------- I2S wiring --------
+// -------- I2S audio wiring --------
 constexpr int I2S_BCLK = 5;
 constexpr int I2S_LRCK = 6;
 constexpr int I2S_DOUT = 7;
@@ -294,6 +298,7 @@ enum Waveform {
     WAVE_SQUARE
 };
 
+// current bass synth waveform
 Waveform currentWaveform = WAVE_SAW;
 
 // -------- Wavetable settings --------
@@ -302,17 +307,14 @@ Waveform currentWaveform = WAVE_SAW;
 float sawTable[WAVETABLE_SIZE];
 float squareTable[WAVETABLE_SIZE];
 
-// Oscillator phase, measured in wavetable samples.
-//float phase = 0.0f;
-//float phaseIncrement = 0.0f;
-
-// -------- MIDI --------
+// -------- usb MIDI host --------
 USBConnection usbHost;
 static uint64_t lastEventIndex = 0;
 
 // Protect shared audio parameters between tasks
 portMUX_TYPE synthMux = portMUX_INITIALIZER_UNLOCKED;
 
+// bass synth state
 int activeNote = -1;
 float targetAmplitude = 0.0f;
 float currentAmplitude = 0.0f;
@@ -334,6 +336,7 @@ float filterResonance = 0.0f;
 float filterEnvDepth = 0.0f;
 float envelopeDecay = 500.0f;
 
+// check if the filter resets on serial console
 volatile uint32_t filterResets = 0;
 
 // -------- Resonant 4-pole ladder (zero-delay feedback) --------
@@ -344,9 +347,6 @@ struct LadderCoeffs {
 };
 
 constexpr float LADDER_DRIVE = 1.5f;   // input drive into the saturator
-
-// -------- Resonant low-pass filter --------
-//float filterStage[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
 // -------- Filter envelope --------
 bool filterEnvelopeTrigger = false;
@@ -366,7 +366,7 @@ Adafruit_SSD1306 display(
 );
 
 // ---------- Interrupt-driven encoders ----------
-#define ENCODER_TRANSITIONS_PER_DETENT 4   // try 2 if your encoder gives 2 counts per click
+#define ENCODER_TRANSITIONS_PER_DETENT 4
 
 struct Encoder {
     uint8_t clkPin;
@@ -738,43 +738,44 @@ void restartInternalClock() {
     esp_timer_start_periodic(internalClockTimer, interval);
 }
 
-void handleMenuButtons(ButtonEvent patEvent) {
+void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEvent startEvent, ButtonEvent sel, ButtonEvent e2) {
 
-    ButtonEvent sel = updateButton(encoder1Button);
-    ButtonEvent e2  = updateButton(encoder2Button);
-    ButtonEvent acc = updateButton(accentButton);     // return buttons
-    ButtonEvent st  = updateButton(startButton);      // return buttons
-
-    (void)patEvent; (void)e2;
+		//    (void)patEvent; (void)e2;
 
     if (currentScreen == SCREEN_MENU) {
-        if (sel == BTN_PRESSED) {
+
+			if (sel == BTN_PRESSED) {
             if (menuIndex == 0)      currentScreen = SCREEN_SYNTH;
             else if (menuIndex == 1) currentScreen = SCREEN_FX;
             else if (menuIndex == 2) currentScreen = SCREEN_DRUM;
 						else currentScreen = SCREEN_CHORDS;
             displayDirty = true;
         }
+			
     } else {
+
+			Serial.print("current screen not menu called, st = ");
+			Serial.println(startEvent);
+
+			if (startEvent == BTN_PRESSED) {
+				Serial.println("start button pressed block called");
+				currentScreen = SCREEN_MENU;
+				displayDirty = true;
+				return;
+			}
 						
 			// Drum screen: encoder 1 button toggles the step under the cursor.
 			if (currentScreen == SCREEN_DRUM && sel == BTN_PRESSED) {
-            uint8_t& cell = drumPattern[drumCursor / 16][drumCursor % 16];
-            cell = cell ? 0 : 1;
-            displayDirty = true;
-        }
+				uint8_t& cell = drumPattern[drumCursor / 16][drumCursor % 16];
+				cell = cell ? 0 : 1;
+				displayDirty = true;
+			}
 
-				if (currentScreen == SCREEN_CHORDS && sel == BTN_PRESSED) {
-					uint8_t& cell = chordPattern[chordCursor / 16][chordCursor % 16];
-					cell = cell ? 0 : 1;
-					displayDirty = true;
-				}
-
-        // Accent or start returns to the menu from FX and Drum.
-        if (acc == BTN_PRESSED || st == BTN_PRESSED) {
-            currentScreen = SCREEN_MENU;
-            displayDirty = true;
-        }
+			if (currentScreen == SCREEN_CHORDS && sel == BTN_PRESSED) {
+				uint8_t& cell = chordPattern[chordCursor / 16][chordCursor % 16];
+				cell = cell ? 0 : 1;
+				displayDirty = true;
+			}
     }
 
     // Keep the synth buttons from toggling when you come back.
@@ -834,20 +835,21 @@ void handleMenuEncoders(int32_t d1, int32_t d2) {
 }
 
 ButtonEvent updateButton(Button& b) {
-    bool reading = digitalRead(b.pin);
 
-    if (reading != b.lastReading) {
-        b.lastChange = millis();
-        b.lastReading = reading;
-    }
+	bool reading = digitalRead(b.pin);
 
-    if ((millis() - b.lastChange) >= ENCODER_DEBOUNCE_MS &&
-        reading != b.stableState) {
-        b.stableState = reading;
-        return reading == LOW ? BTN_PRESSED : BTN_RELEASED;
-    }
+	if (reading != b.lastReading) {
+		b.lastChange = millis();
+		b.lastReading = reading;
+	}
 
-    return BTN_NONE;
+	if ((millis() - b.lastChange) >= ENCODER_DEBOUNCE_MS &&
+			reading != b.stableState) {
+		b.stableState = reading;
+		return reading == LOW ? BTN_PRESSED : BTN_RELEASED;
+	}
+
+	return BTN_NONE;
 }
 
 void toggleInternalRun();   // defined below
@@ -898,101 +900,89 @@ void confirmPatternSelect() {
 
 void updateButtons() {
 
-    // Pattern button: fires on press, works in both modes.
-    ButtonEvent patEvent = updateButton(patternButton);
+	// grab all button states
+	ButtonEvent patEvent = updateButton(patternButton);
+	ButtonEvent accentEvent = updateButton(accentButton);
+	ButtonEvent startEvent  = updateButton(startButton);
+	ButtonEvent sel = updateButton(encoder1Button);
+	ButtonEvent e2  = updateButton(encoder2Button);
 
-    if (currentScreen != SCREEN_SYNTH) {
-        handleMenuButtons(patEvent);
-        return;
-    }
+	// handleMenuButtons handles button presses when we're not on the bass synth screen
+	if (currentScreen != SCREEN_SYNTH) {
+		handleMenuButtons(patEvent, accentEvent, startEvent, sel, e2);
+		return;
+	}
 
-    // Start + Pattern: open the menu.
-    if (patEvent == BTN_PRESSED && startButton.stableState == LOW) {
-        chordUsed = true;               // start's release won't toggle run
-        patternSelectMode = false;
-        currentScreen = SCREEN_MENU;
-        menuIndex = 0;
-        displayDirty = true;
-        return;
-    }
+	if (patEvent == BTN_PRESSED) {	// if pattern button was just pressed
 
-    if (patEvent == BTN_PRESSED) {	
-        bool accentHeld = (accentButton.stableState == LOW);
+		bool accentHeld = (accentButton.stableState == LOW); // find out if accent button is being held
 
-        if (accentHeld) {
-            // Chord: stop the accent button's release from toggling accent.
-            chordUsed = true;
-        }
+		if (accentHeld) {
+			// Chord: stop the accent button's release from toggling accent.
+			chordUsed = true;
+		}
 
-        if (!patternSelectMode) {
-            patternSelectMode = true;
-            pendingPattern = currentPattern;
-            displayDirty = true;
-        } else if (accentHeld) {
-            switchPatternNow();
-        } else {
-            confirmPatternSelect();
-        }
-        return;
-    }	
+		if (!patternSelectMode) { // go into bass synth pattern select mode if we're not already there
+			patternSelectMode = true;
+			pendingPattern = currentPattern;
+			displayDirty = true;
+		} else if (accentHeld) {
+			switchPatternNow();
+		} else {
+			confirmPatternSelect();
+		}
+		return;
+	}	
 
-    // While selecting, ignore the other buttons so nothing is edited by accident.
-    if (patternSelectMode) {
-        updateButton(encoder1Button);
-        updateButton(encoder2Button);
-        updateButton(accentButton);
-				//        updateButton(startButton);
-        return;
-    }	
+	// While selecting, ignore the other buttons so nothing is edited by accident.
+	if (patternSelectMode) {
+		return; 
+	}	
 	
-    // Encoder 1 button: toggle step active
-    if (updateButton(encoder1Button) == BTN_PRESSED) {
-        pattern[selectedStep].active = !pattern[selectedStep].active;
-        displayDirty = true;
-    }
+	// Encoder 1 button: toggle step active
+	if (sel == BTN_PRESSED) {
+		pattern[selectedStep].active = !pattern[selectedStep].active;
+		displayDirty = true;
+	}
 
-    // Encoder 2 button: slide on release, unless it was used for tempo
-    ButtonEvent e2 = updateButton(encoder2Button);
-    if (e2 == BTN_PRESSED) {
-        encoder2Turned = false;
-    } else if (e2 == BTN_RELEASED && !encoder2Turned) {
-        pattern[selectedStep].slide = !pattern[selectedStep].slide;
-        displayDirty = true;
-    }
+	// Encoder 2 button: slide on release, unless it was used for tempo
+	if (e2 == BTN_PRESSED) {
+		encoder2Turned = false;
+	} else if (e2 == BTN_RELEASED && !encoder2Turned) {
+		pattern[selectedStep].slide = !pattern[selectedStep].slide;
+		displayDirty = true;
+	}
 
-    // Accent + Start chord: set loop end to the current step.
-    ButtonEvent accentEvent = updateButton(accentButton);
-    ButtonEvent startEvent  = updateButton(startButton);
+	// bass synth seq last step setting ----
+	bool accentDown = (accentButton.stableState == LOW);
+	bool startDown  = (startButton.stableState == LOW);
 
-    bool accentDown = (accentButton.stableState == LOW);
-    bool startDown  = (startButton.stableState == LOW);
+	if (accentDown && startDown && !chordUsed) {
 
-    if (accentDown && startDown && !chordUsed) {
-        chordUsed = true;
+		chordUsed = true;
 
-        // While running use the playing step, otherwise the selected step.
-        uint8_t endStep = selectedStep;
-        loopLength = endStep + 1;
-        displayDirty = true;
-    }
+		uint8_t endStep = selectedStep;
+		loopLength = endStep + 1;
+		displayDirty = true;
+	}
 
-    // Single-button actions fire on release, unless the chord happened.
-    if (accentEvent == BTN_RELEASED && !chordUsed) {
-        pattern[selectedStep].accent = !pattern[selectedStep].accent;
-        displayDirty = true;
-    }
+	// Single-button actions fire on release, unless the chord happened.
+	if (accentEvent == BTN_RELEASED && !chordUsed) {
+		pattern[selectedStep].accent = !pattern[selectedStep].accent;
+		displayDirty = true;
+	}
 
-    if (startEvent == BTN_RELEASED && !chordUsed) {
-        patternSelectMode = false;
-        currentScreen = SCREEN_MENU;
-        menuIndex = 0;
-        displayDirty = true;
-    }
+	// start button 1 now goes to menu
+	if (startEvent == BTN_RELEASED && !chordUsed) {
+		patternSelectMode = false;
+		currentScreen = SCREEN_MENU;
+		menuIndex = 0;
+		displayDirty = true;
+	}
 
-    if (!accentDown && !startDown) {
-        chordUsed = false;
-    }		
-
+	if (!accentDown && !startDown) {
+		chordUsed = false;
+	}		
 }
 
 static inline float fastTanh(float x) {
