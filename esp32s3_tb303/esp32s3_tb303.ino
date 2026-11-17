@@ -216,11 +216,23 @@ volatile uint8_t drumTriggerMask = 0, drumAccentMask = 0;       // bit 0 kick, 1
 uint8_t drumCursor = 0;
 
 // chord synth
-uint8_t chordPattern[4][16];
-uint8_t chordNotes[4][16];                              // note per lane, per step
-volatile uint8_t chordCurNotes[4] = { 45, 48, 52, 55 }; // what the audio task plays
+uint8_t chordPatternBank[NUM_PATTERNS][4][16] = {};
+uint8_t chordNotesBank[NUM_PATTERNS][4][16] = {};
+
+uint8_t (*chordPattern)[16] = chordPatternBank[0];
+uint8_t (*chordNotes)[16] = chordNotesBank[0];
+
+uint8_t currentChordPattern = 0;
+uint8_t pendingChordPattern = 0;
+uint8_t queuedChordPattern = 0;
+
+bool chordPatternSelectMode = false;
+volatile bool chordPatternQueued = false;
+
+volatile uint8_t chordCurNotes[4] = { 45, 48, 52, 55 };
 volatile float chordLevel = 0.5f;
 volatile uint8_t chordGateMask = 0;
+
 uint8_t chordCursor = 0;
 
 // ---------- Autosave to flash ----------
@@ -276,7 +288,16 @@ struct DrumSavedV1 {            // single pattern, no accents
 
 struct ChordSaved {
     uint8_t version;
-    float   level;
+    uint8_t currentPattern;
+    float level;
+    uint8_t notes[NUM_PATTERNS][4][16];
+    uint8_t pattern[NUM_PATTERNS][4][16];
+};
+
+// Previous single-pattern format.
+struct ChordSavedV2 {
+    uint8_t version;
+    float level;
     uint8_t notes[4][16];
     uint8_t pattern[4][16];
 };
@@ -575,44 +596,82 @@ void loadFx() {
 ChordSaved lastSeenChord;
 ChordSaved lastSavedChord;
 
-ChordSaved captureChords() {
-    ChordSaved c;
+void captureChords(ChordSaved& c) {
+
     memset(&c, 0, sizeof(c));
-    c.version = 2;
+
+    c.version = 3;
+    c.currentPattern = currentChordPattern;
     c.level = chordLevel;
-    memcpy(c.notes, chordNotes, sizeof(chordNotes));
-    memcpy(c.pattern, chordPattern, sizeof(chordPattern));
-    return c;
+
+    memcpy(c.notes, chordNotesBank, sizeof(chordNotesBank));
+    memcpy(c.pattern, chordPatternBank, sizeof(chordPatternBank));
 }
 
 void loadChords() {
 
-	// Defaults: A minor 7, one pitch per lane
-    const uint8_t defaults[4] = { 45, 48, 52, 55 };
-    for (int v = 0; v < 4; v++)
-        for (int s = 0; s < 16; s++) chordNotes[v][s] = defaults[v];
+    static ChordSaved c;
+    static ChordSavedV2 old;
 
-    ChordSaved c;
-		size_t len = prefs.getBytesLength("chords");
+    // Default notes: A minor 7, one pitch per lane.
+    const uint8_t defaults[4] = { 45, 48, 52, 55 };
+
+    for (int p = 0; p < NUM_PATTERNS; p++) {
+        for (int v = 0; v < 4; v++) {
+            for (int s = 0; s < 16; s++) {
+                chordNotesBank[p][v][s] = defaults[v];
+                chordPatternBank[p][v][s] = 0;
+            }
+        }
+    }
+
+    currentChordPattern = 0;
+
+    size_t len = prefs.getBytesLength("chords");
+    bool migrated = false;
 
     if (len == sizeof(c) &&
         prefs.getBytes("chords", &c, sizeof(c)) == sizeof(c) &&
-        c.version == 2 && c.level >= 0.0f && c.level <= 1.0f) {
+        c.version == 3 &&
+        c.currentPattern < NUM_PATTERNS &&
+        c.level >= 0.0f && c.level <= 1.0f) {
 
         chordLevel = c.level;
-        for (int v = 0; v < 4; v++)
-            for (int s = 0; s < 16; s++) {
-                chordNotes[v][s] = constrain((int)c.notes[v][s], 24, 96);
-                chordPattern[v][s] = c.pattern[v][s] ? 1 : 0;
-            }
-        Serial.println("Chords loaded from flash.");
+        currentChordPattern = c.currentPattern;
 
+        memcpy(chordNotesBank, c.notes, sizeof(chordNotesBank));
+        memcpy(chordPatternBank, c.pattern, sizeof(chordPatternBank));
+
+        Serial.println("Chord patterns loaded from flash.");
+
+    } else if (
+        len == sizeof(old) &&
+        prefs.getBytes("chords", &old, sizeof(old)) == sizeof(old) &&
+        old.version == 2 &&
+        old.level >= 0.0f && old.level <= 1.0f) {
+
+        chordLevel = old.level;
+
+        // Migrate the old single pattern into pattern 1.
+        memcpy(chordNotesBank[0], old.notes, sizeof(old.notes));
+        memcpy(chordPatternBank[0], old.pattern, sizeof(old.pattern));
+
+        migrated = true;
+
+        Serial.println("Migrated old chords into pattern 1.");
     }
-		
-    for (int v = 0; v < 4; v++) chordCurNotes[v] = chordNotes[v][0];
 
-    lastSeenChord = captureChords();
+    switchChordPattern(currentChordPattern);
+
+    lastSeenChord = {};
+    lastSavedChord = {};
+
+    captureChords(lastSeenChord);
     lastSavedChord = lastSeenChord;
+
+    if (migrated) {
+        prefs.putBytes("chords", &lastSavedChord, sizeof(lastSavedChord));
+    }
 }
 
 SavedState captureState() {
@@ -699,7 +758,8 @@ void updateAutosave() {
 	SavedState now = captureState();
     static DrumSaved nowDrum;
 		captureDrum(nowDrum);
-    ChordSaved nowChord = captureChords();
+    static ChordSaved nowChord;
+		captureChords(nowChord);
     FxSaved nowFx = captureFx();                       // with the other captures		
 
     if (memcmp(&now, &lastSeenState, sizeof(now)) != 0 ||
@@ -893,11 +953,41 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEven
 			if (accentEvent == BTN_RELEASED) accentChord = false;
 		}		
 
-		// handle chord seq step toggle
-		if (currentScreen == SCREEN_CHORDS && sel == BTN_PRESSED) {
-			uint8_t& cell = chordPattern[chordCursor / 16][chordCursor % 16];
-			cell = cell ? 0 : 1;
-			displayDirty = true;
+		// Chord sequencer controls
+		if (currentScreen == SCREEN_CHORDS) {
+
+			if (patEvent == BTN_PRESSED) {
+
+        bool accentHeld = (accentButton.stableState == LOW);
+
+        if (!chordPatternSelectMode) {
+
+					chordPatternSelectMode = true;
+					pendingChordPattern = currentChordPattern;
+
+        } else if (accentHeld) {
+
+					// Accent + Pattern = immediate switch
+					switchChordPatternNow();
+
+        } else {
+
+					// Pattern again = confirm / queue
+					confirmChordPatternSelect();
+        }
+
+        displayDirty = true;
+			}
+
+			// Only allow editing when not selecting a pattern.
+			else if (!chordPatternSelectMode && sel == BTN_PRESSED) {
+
+        uint8_t& cell =
+					chordPattern[chordCursor / 16][chordCursor % 16];
+
+        cell = cell ? 0 : 1;
+        displayDirty = true;
+			}
 		}
 	}
 
@@ -936,22 +1026,45 @@ void handleMenuEncoders(int32_t d1, int32_t d2) {
 			displayDirty = true;
 		}		
 	}
-		
+
 	if (currentScreen == SCREEN_CHORDS) {
-		if (d1 != 0) {
+
+    if (chordPatternSelectMode) {
+
+			if (d1 != 0) {
+				pendingChordPattern =
+					(pendingChordPattern + NUM_PATTERNS +
+					 (d1 % NUM_PATTERNS)) % NUM_PATTERNS;
+
+				displayDirty = true;
+			}
+
+			return;  // Ignore encoder 2 while selecting.
+    }
+
+    if (d1 != 0) {
 			chordCursor = (chordCursor + 64 + (d1 % 64)) % 64;
 			displayDirty = true;
-		}
-		if (d2 != 0) {
+    }
+
+    if (d2 != 0) {
+
 			if (encoder2Button.stableState == LOW) {
-				uint8_t& n = chordNotes[chordCursor / 16][chordCursor % 16];
-				n = constrain((int)n + d2, 24, 96);       // pitch of this step
+
+				uint8_t& n =
+					chordNotes[chordCursor / 16][chordCursor % 16];
+
+				n = constrain((int)n + d2, 24, 96);
+
 			} else {
-				chordLevel = constrain(chordLevel + d2 * 0.05f, 0.0f, 1.0f);
+
+				chordLevel =
+					constrain(chordLevel + d2 * 0.05f, 0.0f, 1.0f);
 			}
+
 			displayDirty = true;
-		}			
-	}		
+    }
+	}
 
 	if (currentScreen == SCREEN_FX) {
 		if (d1 != 0) {
@@ -970,7 +1083,7 @@ void handleMenuEncoders(int32_t d1, int32_t d2) {
 	}	
 }
 
-ButtonEvent updateButton(Button& b) {
+ ButtonEvent updateButton(Button& b) {
 
 	bool reading = digitalRead(b.pin);
 
@@ -1033,6 +1146,45 @@ void confirmPatternSelect() {
 	}
 
 	displayDirty = true;
+}
+
+void switchChordPattern(uint8_t n) {
+
+    currentChordPattern = n;
+    chordPattern = chordPatternBank[n];
+    chordNotes = chordNotesBank[n];
+
+    for (int v = 0; v < 4; v++) {
+        chordCurNotes[v] = chordNotes[v][0];
+    }
+}
+
+void switchChordPatternNow() {
+
+    chordPatternSelectMode = false;
+    chordPatternQueued = false;
+
+    if (pendingChordPattern != currentChordPattern) {
+        switchChordPattern(pendingChordPattern);
+    }
+
+    displayDirty = true;
+}
+
+void confirmChordPatternSelect() {
+
+    chordPatternSelectMode = false;
+
+    if (midiRunning) {
+        queuedChordPattern = pendingChordPattern;
+        chordPatternQueued =
+            (queuedChordPattern != currentChordPattern);
+    } else {
+        switchChordPattern(pendingChordPattern);
+        chordPatternQueued = false;
+    }
+
+    displayDirty = true;
 }
 
 void switchDrumPattern(uint8_t n) {
@@ -1449,6 +1601,11 @@ void sequencerPulse() {
 			drumPatternQueued = false;
 			switchDrumPattern(queuedDrumPattern);
 		}
+
+		if (currentStep % 16 == 0 && chordPatternQueued) {
+			chordPatternQueued = false;
+			switchChordPattern(queuedChordPattern);
+		}		
 
 		triggerSequencerStep();					
 		triggerSequencerStep();
@@ -1888,7 +2045,7 @@ void updateWaveformSwitch() {
   }
 }
 
-float readCutoffPot() {
+ float readCutoffPot() {
   int16_t raw = ads.readADC_SingleEnded(0);
 
   // GAIN_ONE uses a +/-4.096V measurement range.
@@ -1944,7 +2101,7 @@ void updateSynthControls() {
   portEXIT_CRITICAL(&synthMux);
 }
 
-void printSynthControls() {
+ void printSynthControls() {
   static uint32_t lastPrint = 0;
 
   if (millis() - lastPrint < 500) {
@@ -1973,7 +2130,7 @@ void printSynthControls() {
 //uint8_t clockCount = 0;
 //uint32_t stepCount = 0;
 
-void getNoteName(uint8_t note, char* output, size_t outputSize) {
+ void getNoteName(uint8_t note, char* output, size_t outputSize) {
     static const char* noteNames[] = {
         "C", "C#", "D", "D#", "E", "F",
         "F#", "G", "G#", "A", "A#", "B"
@@ -1990,7 +2147,7 @@ void getNoteName(uint8_t note, char* output, size_t outputSize) {
     );
 }
 
-void midiClockTask(void* parameter) {
+ void midiClockTask(void* parameter) {
     for (;;) {
         while (Serial2.available()) {
             uint8_t data = Serial2.read();
@@ -2013,12 +2170,12 @@ void midiClockTask(void* parameter) {
     }
 }
 
-void resetClockTempo() {
+ void resetClockTempo() {
     clockTimeIndex = 0;
     clockTimeCount = 0;
 }
 
-void handleMidiClock(uint8_t data, uint32_t now) {
+ void handleMidiClock(uint8_t data, uint32_t now) {
 
     if (syncMode != SYNC_EXTERNAL) {
         return;
@@ -2086,18 +2243,71 @@ void handleMidiClock(uint8_t data, uint32_t now) {
     }
 }
 
-bool patternHasNotes(uint8_t p) {
+ bool patternHasNotes(uint8_t p) {
     for (int i = 0; i < NUM_STEPS; i++) {
         if (patternBank[p][i].active) return true;
     }
     return false;
 }
 
-bool drumPatternHasNotes(uint8_t p) {
-    for (int d = 0; d < 4; d++)
-        for (int i = 0; i < 16; i++)
-            if (drumPatternBank[p][d][i]) return true;
-    return false;
+ bool drumPatternHasNotes(uint8_t p) {
+	for (int d = 0; d < 4; d++)
+		for (int i = 0; i < 16; i++)
+			if (drumPatternBank[p][d][i]) return true;
+	return false;
+}
+
+bool chordPatternHasNotes(uint8_t p) {
+
+	 for (int lane = 0; lane < 4; lane++) {
+		 for (int step = 0; step < 16; step++) {
+			 if (chordPatternBank[p][lane][step]) {
+				 return true;
+			 }
+		 }
+	 }
+
+	 return false;
+}
+
+void drawChordPatternSelect() {
+
+    for (int i = 0; i < NUM_PATTERNS; i++) {
+
+        int x = 2 + ((i % 8) * 16);
+        int numY = (i < 8) ? 10 : 29;
+        int y = (i < 8) ? 19 : 38;
+
+        display.setCursor(x, numY);
+        display.print(i + 1);
+
+        if (chordPatternHasNotes(i)) {
+            display.fillRect(x, y, 7, 7, SSD1306_WHITE);
+        } else {
+            display.drawPixel(x + 3, y + 3, SSD1306_WHITE);
+        }
+
+        if (i == currentChordPattern) {
+            display.drawRect(x - 1, y - 1, 9, 9, SSD1306_WHITE);
+        }
+
+        if (i == pendingChordPattern) {
+            display.drawFastHLine(x, y + 8, 7, SSD1306_WHITE);
+        }
+    }
+
+    char text[24];
+
+    snprintf(
+        text,
+        sizeof(text),
+        "SELECT P%02d  NOW P%02d",
+        pendingChordPattern + 1,
+        currentChordPattern + 1
+    );
+
+    display.setCursor(0, 55);
+    display.print(text);
 }
 
 void drawPatternSelect() {
@@ -2218,6 +2428,12 @@ void drawMenuScreen() {
         display.setCursor(106, 24 + 10);
         display.print((int)delayMs / 10);   // time in tens of ms		
 	} else if (currentScreen == SCREEN_CHORDS) {
+
+		if (chordPatternSelectMode) {
+			drawChordPatternSelect();
+			display.display();
+			return;
+		}
 		display.setCursor(0, 14);
 		display.print("CHORDS");
 
