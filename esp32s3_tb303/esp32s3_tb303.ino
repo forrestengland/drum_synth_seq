@@ -204,11 +204,11 @@ uint8_t drumPattern[4][16] = {
     {0,0,0,0, 0,0,1,0, 0,0,0,0, 0,0,1,0},   // open hat
 };
 
-#define DRUM_ACCENT_AMT 0.3f
+#define DRUM_ACCENT_MUL 1.8f
 uint8_t drumAccent[4][16];
 
 volatile float drumLevel = 0.5f;            // 0..1
-volatile uint8_t drumTriggerMask = 0;       // bit 0 kick, 1 snare, 2 closed, 3 open
+volatile uint8_t drumTriggerMask = 0, drumAccentMask = 0;       // bit 0 kick, 1 snare, 2 closed, 3 open
 uint8_t drumCursor = 0;
 
 // chord synth
@@ -419,15 +419,26 @@ void IRAM_ATTR encoderISR(void* arg) {
 }
 
 void triggerDrums(uint8_t step) {
-    uint8_t mask = 0;
-    for (int i = 0; i < 4; i++) {
-        if (drumPattern[i][step]) mask |= (1 << i);
-    }
-    if (mask) {
-        portENTER_CRITICAL(&synthMux);
-        drumTriggerMask |= mask;
-        portEXIT_CRITICAL(&synthMux);
-    }
+
+	uint8_t mask = 0, acc = 0;
+
+  for (int i = 0; i < 4; i++) {
+
+		if (drumPattern[i][step]) {
+			mask |= (1 << i);
+		}
+		
+		if (drumAccent[i][step]) {
+			acc |= (1 << i);
+		}
+	}
+	
+	if (mask) {
+		portENTER_CRITICAL(&synthMux);
+		drumTriggerMask |= mask;
+		drumAccentMask |= acc;
+		portEXIT_CRITICAL(&synthMux);
+	}
 }
 
 DrumSaved captureDrum() {
@@ -740,49 +751,57 @@ void restartInternalClock() {
 
 void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEvent startEvent, ButtonEvent sel, ButtonEvent e2) {
 
-		//    (void)patEvent; (void)e2;
+	// menu screen
+	if (currentScreen == SCREEN_MENU) {
 
-    if (currentScreen == SCREEN_MENU) {
-
-			if (sel == BTN_PRESSED) {
-            if (menuIndex == 0)      currentScreen = SCREEN_SYNTH;
-            else if (menuIndex == 1) currentScreen = SCREEN_FX;
-            else if (menuIndex == 2) currentScreen = SCREEN_DRUM;
-						else currentScreen = SCREEN_CHORDS;
-            displayDirty = true;
-        }
+		// encoder one pressed, switch screen to selection
+		if (sel == BTN_PRESSED) {
+			if (menuIndex == 0)      currentScreen = SCREEN_SYNTH;
+			else if (menuIndex == 1) currentScreen = SCREEN_FX;
+			else if (menuIndex == 2) currentScreen = SCREEN_DRUM;
+			else currentScreen = SCREEN_CHORDS;
+			displayDirty = true;
+		}
 			
-    } else {
+	} else { // other than menu screen or synth screen
 
-			Serial.print("current screen not menu called, st = ");
-			Serial.println(startEvent);
-
-			if (startEvent == BTN_PRESSED) {
-				Serial.println("start button pressed block called");
-				currentScreen = SCREEN_MENU;
-				displayDirty = true;
-				return;
-			}
+		// first button pressed - return to menu
+		if (startEvent == BTN_PRESSED) {
+			currentScreen = SCREEN_MENU;
+			displayDirty = true;
+			return;
+		}
 						
-			// Drum screen: encoder 1 button toggles the step under the cursor.
-			if (currentScreen == SCREEN_DRUM && sel == BTN_PRESSED) {
+		// Drum screen
+		if (currentScreen == SCREEN_DRUM) {
+
+			// encoder 1 button toggles the step under the cursor
+			if (sel == BTN_PRESSED) {
 				uint8_t& cell = drumPattern[drumCursor / 16][drumCursor % 16];
 				cell = cell ? 0 : 1;
 				displayDirty = true;
 			}
 
-			if (currentScreen == SCREEN_CHORDS && sel == BTN_PRESSED) {
-				uint8_t& cell = chordPattern[chordCursor / 16][chordCursor % 16];
+			if (accentEvent == BTN_PRESSED) {
+				uint8_t& cell = drumAccent[drumCursor / 16][drumCursor % 16];
 				cell = cell ? 0 : 1;
 				displayDirty = true;
 			}
-    }
+		}
 
-    // Keep the synth buttons from toggling when you come back.
-    chordUsed = true;
-    if (accentButton.stableState == HIGH && startButton.stableState == HIGH) {
-        chordUsed = false;
-    }
+		// handle chord seq step toggle
+		if (currentScreen == SCREEN_CHORDS && sel == BTN_PRESSED) {
+			uint8_t& cell = chordPattern[chordCursor / 16][chordCursor % 16];
+			cell = cell ? 0 : 1;
+			displayDirty = true;
+		}
+	}
+
+	// Keep the synth buttons from toggling when you come back.
+	chordUsed = true; // keeps track of button combination presses
+	if (accentButton.stableState == HIGH && startButton.stableState == HIGH) {
+		chordUsed = false;
+	}
 }
 
 void handleMenuEncoders(int32_t d1, int32_t d2) {
@@ -1103,7 +1122,8 @@ void setupAudio() {
 }
 
 void updateSynthVoice(RetriggerMode mode) {
-    // Manual keyboard notes take priority.
+
+	// Manual keyboard notes take priority.
     int note = manualNote >= 0 ? manualNote : sequencerNote;
     int velocity = manualNote >= 0
         ? manualVelocity
@@ -1390,7 +1410,9 @@ void audioTask(void* parameter) {
   float delayLp = 0.0f;
   const float delayTimeCoeff =
       1.0f - expf(-(float)BLOCK_FRAMES / (0.08f * SAMPLE_RATE));   // ~80 ms glide
-	float blockDelayMs, blockDelayFb, blockDelayMix;	
+	float blockDelayMs, blockDelayFb, blockDelayMix;
+
+  float voiceAcc[4] = {1.0f, 1.0f, 1.0f, 1.0f};   // gain latched per hit	
 	
 	for (;;) {
 
@@ -1406,6 +1428,7 @@ void audioTask(void* parameter) {
 		bool blockAccent;
 		float blockDrive;
 		uint8_t blockDrumMask;
+		uint8_t blockDrumAccentMask;		
 		float blockDrumLevel;
 		uint8_t blockChordMask; uint8_t blockChordNotes[4]; float blockChordLevel;		
 
@@ -1421,8 +1444,10 @@ void audioTask(void* parameter) {
 		blockAccent = accentActive;
 
     blockDrumMask = drumTriggerMask;
+    blockDrumAccentMask = drumAccentMask;		
     drumTriggerMask = 0;
-    blockDrumLevel = drumLevel;		
+		drumAccentMask = 0;
+    blockDrumLevel = drumLevel;
 
 		// consume the trigger
 		triggerEnvelope = filterEnvelopeTrigger;
@@ -1440,10 +1465,14 @@ void audioTask(void* parameter) {
 
     portEXIT_CRITICAL(&synthMux);
 
-    if (blockDrumMask & 1) { kickEnv = 1.0f; kickPitchEnv = 1.0f; kickPhase = 0.0f; }
-    if (blockDrumMask & 2) { snareEnv = 1.0f; snareToneEnv = 1.0f; }
-    if (blockDrumMask & 4) { chEnv = 1.0f; ohChoked = true; }      // closed hat chokes the open hat
-    if (blockDrumMask & 8) { ohEnv = 1.0f; ohChoked = false; }
+    if (blockDrumMask & 1) { kickEnv = 1.0f; kickPitchEnv = 1.0f; kickPhase = 0.0f;
+                             voiceAcc[0] = (blockDrumAccentMask & 1) ? DRUM_ACCENT_MUL : 1.0f; }
+    if (blockDrumMask & 2) { snareEnv = 1.0f; snareToneEnv = 1.0f;
+                             voiceAcc[1] = (blockDrumAccentMask & 2) ? DRUM_ACCENT_MUL : 1.0f; }
+    if (blockDrumMask & 4) { chEnv = 1.0f; ohChoked = true;
+                             voiceAcc[2] = (blockDrumAccentMask & 4) ? DRUM_ACCENT_MUL : 1.0f; }
+    if (blockDrumMask & 8) { ohEnv = 1.0f; ohChoked = false;
+                             voiceAcc[3] = (blockDrumAccentMask & 8) ? DRUM_ACCENT_MUL : 1.0f; }		
 
     smDrumLevel += potSmoothCoeff * (blockDrumLevel - smDrumLevel);
     const float drumGain = smDrumLevel * 0.6f;
@@ -1513,19 +1542,12 @@ void audioTask(void* parameter) {
 
 		// Calculate exponential envelope decay.
 		// blockDecay is expressed in milliseconds.
-		float decayMultiplier = expf(
-																 -1.0f / (blockDecay * 0.001f * SAMPLE_RATE)
-																 );
+		float decayMultiplier = expf(-1.0f / (blockDecay * 0.001f * SAMPLE_RATE));
 
 		// Apply envelope depth to the base cutoff.
-		float effectiveCutoff =
-			blockCutoff + (blockEnvDepth * filterEnvelope);
+		float effectiveCutoff = blockCutoff + (blockEnvDepth * filterEnvelope);
 
-		effectiveCutoff = constrain(
-																effectiveCutoff,
-																20.0f,
-																SAMPLE_RATE * 0.45f
-																);
+		effectiveCutoff = constrain(effectiveCutoff, 20.0f, SAMPLE_RATE * 0.45f);
 
     LadderCoeffs ladder = makeLadderCoeffs(effectiveCutoff);
 
@@ -1573,8 +1595,10 @@ void audioTask(void* parameter) {
       float snare = snNoise * snareEnv * 0.8f +
                     sinf(snareTonePhase) * snareToneEnv * 0.5f;
 
-      float drums = kick * 0.9f + snare * 0.5f +
-				hat * chEnv * 0.35f + hat * ohEnv * 0.3f;
+      float drums = kick * 0.9f * voiceAcc[0] +
+                    snare * 0.5f * voiceAcc[1] +
+                    hat * chEnv * 0.35f * voiceAcc[2] +
+                    hat * ohEnv * 0.3f * voiceAcc[3];			
 
       sample += drums * drumGain;
 
@@ -1912,8 +1936,10 @@ bool patternHasNotes(uint8_t p) {
 }
 
 void drawPatternSelect() {
-    for (int i = 0; i < NUM_PATTERNS; i++) {
-        int x = 2 + ((i % 8) * 16);
+
+	for (int i = 0; i < NUM_PATTERNS; i++) {
+
+		int x = 2 + ((i % 8) * 16);
         int numY = (i < 8) ? 10 : 29;
         int y    = (i < 8) ? 19 : 38;
 
@@ -2011,7 +2037,9 @@ void drawMenuScreen() {
 		display.fillRect(58, 24, (int)(chordLevel * 56.0f), 8, SSD1306_WHITE);
 
 		drawLaneGrid(chordPattern, chordCursor);
-	} else {		
+		
+	} else {		// draw drum screen
+
 		display.setCursor(0, 14);
 		display.print("DRUM");
 
@@ -2021,6 +2049,11 @@ void drawMenuScreen() {
 						 drumNames[drumCursor / 16], (drumCursor % 16) + 1);
 		display.setCursor(50, 14);
 		display.print(label);
+
+		if (drumAccent[drumCursor / 16][drumCursor % 16]) {
+			display.setCursor(100, 14);
+			display.print("ACC");
+		}
 
 		display.setCursor(8, 24);
 		display.print("> Level");
