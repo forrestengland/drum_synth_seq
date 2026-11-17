@@ -40,6 +40,9 @@ volatile bool patternQueued = false;
 // what pattern to play next
 uint8_t queuedPattern = 0;
 
+volatile bool drumPatternQueued = false;
+uint8_t queuedDrumPattern = 0;
+
 // midi output pin definition
 #define MIDI_TX_PIN 41
 
@@ -197,15 +200,16 @@ bool accentActive = false;      // read by the audio task
 
 // ---------- Drums ----------
 // Rows: kick, snare, closed hat, open hat. Columns: steps 1-16.
-uint8_t drumPattern[4][16] = {
-    {1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0},   // kick
-    {0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0},   // snare
-    {1,0,1,0, 1,0,0,0, 1,0,1,0, 1,0,0,0},   // closed hat
-    {0,0,0,0, 0,0,1,0, 0,0,0,0, 0,0,1,0},   // open hat
-};
+uint8_t currentDrumPattern = 0;
+uint8_t pendingDrumPattern = 0;
+bool drumPatternSelectMode = false; // mode for selecting a drum pattern
+
+uint8_t drumPatternBank[NUM_PATTERNS][4][16];
+uint8_t drumAccentBank[NUM_PATTERNS][4][16];
+uint8_t (*drumPattern)[16] = drumPatternBank[0];
+uint8_t (*drumAccent)[16]  = drumAccentBank[0];
 
 #define DRUM_ACCENT_MUL 1.8f
-uint8_t drumAccent[4][16];
 
 volatile float drumLevel = 0.5f;            // 0..1
 volatile uint8_t drumTriggerMask = 0, drumAccentMask = 0;       // bit 0 kick, 1 snare, 2 closed, 3 open
@@ -248,14 +252,22 @@ struct FxSaved {
 
 struct DrumSaved {
     uint8_t version;
+    uint8_t currentPattern;
+    float   drive;
+    float   level;
+    uint8_t pattern[NUM_PATTERNS][4][16];
+    uint8_t accent[NUM_PATTERNS][4][16];
+};
+
+struct DrumSavedV2 {            // single pattern with accents
+    uint8_t version;
     float   drive;
     float   level;
     uint8_t pattern[4][16];
     uint8_t accent[4][16];
 };
 
-// Old format without accents, for migration.
-struct DrumSavedV1 {
+struct DrumSavedV1 {            // single pattern, no accents
     uint8_t version;
     float   drive;
     float   level;
@@ -428,85 +440,106 @@ void IRAM_ATTR encoderISR(void* arg) {
 }
 
 void triggerDrums(uint8_t step) {
-
-	uint8_t mask = 0, acc = 0;
-
-  for (int i = 0; i < 4; i++) {
-
-		if (drumPattern[i][step]) {
-			mask |= (1 << i);
-		}
-		
-		if (drumAccent[i][step]) {
-			acc |= (1 << i);
-		}
-	}
-	
-	if (mask) {
-		portENTER_CRITICAL(&synthMux);
-		drumTriggerMask |= mask;
-		drumAccentMask |= acc;
-		portEXIT_CRITICAL(&synthMux);
-	}
+    uint8_t mask = 0, acc = 0;
+    for (int i = 0; i < 4; i++) {
+        if (drumPattern[i][step]) {
+            mask |= (1 << i);
+            if (drumAccent[i][step]) acc |= (1 << i);
+        }
+    }
+    if (mask) {
+        portENTER_CRITICAL(&synthMux);
+        drumTriggerMask |= mask;
+        drumAccentMask = (drumAccentMask & ~mask) | acc;
+        portEXIT_CRITICAL(&synthMux);
+    }
 }
 
-DrumSaved captureDrum() {
-	DrumSaved d;
-	memset(&d, 0, sizeof(d));
-	d.version = 2;
-	d.drive = driveAmount;
-	d.level = drumLevel;
-	memcpy(d.pattern, drumPattern, sizeof(drumPattern));
-	memcpy(d.accent, drumAccent, sizeof(drumAccent));
-	return d;
+void captureDrum(DrumSaved &d) {
+    memset(&d, 0, sizeof(d));
+    d.version = 3;
+    d.currentPattern = currentDrumPattern;
+    d.drive = driveAmount;
+    d.level = drumLevel;
+
+    memcpy(d.pattern, drumPatternBank, sizeof(drumPatternBank));
+    memcpy(d.accent, drumAccentBank, sizeof(drumAccentBank));
 }
 
 void loadDrums() {
-	DrumSaved d;
-	DrumSavedV1 old;
-	size_t len = prefs.getBytesLength("drums");
-	bool migrated = false;
+    // Default groove in pattern 1
+    static const uint8_t groove[4][16] = {
+        {1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0},
+        {0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0},
+        {1,0,1,0, 1,0,0,0, 1,0,1,0, 1,0,0,0},
+        {0,0,0,0, 0,0,1,0, 0,0,0,0, 0,0,1,0},
+    };
+    memcpy(drumPatternBank[0], groove, sizeof(groove));
 
-	if (len == sizeof(d) &&
-			prefs.getBytes("drums", &d, sizeof(d)) == sizeof(d) &&
-			d.version == 2 &&
-			d.drive >= 0.0f && d.drive <= 1.0f &&
-			d.level >= 0.0f && d.level <= 1.0f) {
+		static DrumSaved d;
+		static DrumSavedV2 v2;
+		static DrumSavedV1 v1;		
 
-		driveAmount = d.drive;
-		drumLevel = d.level;
-		for (int r = 0; r < 4; r++)
-			for (int c = 0; c < 16; c++) {
-				drumPattern[r][c] = d.pattern[r][c] ? 1 : 0;
-				drumAccent[r][c]  = d.accent[r][c] ? 1 : 0;
-			}
-		Serial.println("Drums loaded from flash.");
+ size_t len = prefs.getBytesLength("drums");
+    bool migrated = false;
 
-	} else if (len == sizeof(old) &&
-						 prefs.getBytes("drums", &old, sizeof(old)) == sizeof(old) &&
-						 old.version == 1 &&
-						 old.drive >= 0.0f && old.drive <= 1.0f &&
-						 old.level >= 0.0f && old.level <= 1.0f) {
+    if (len == sizeof(d) &&
+        prefs.getBytes("drums", &d, sizeof(d)) == sizeof(d) &&
+        d.version == 3 && d.currentPattern < NUM_PATTERNS &&
+        d.drive >= 0.0f && d.drive <= 1.0f &&
+        d.level >= 0.0f && d.level <= 1.0f) {
 
-		// Keep the old pattern, start with no accents.
-		driveAmount = old.drive;
-		drumLevel = old.level;
-		for (int r = 0; r < 4; r++)
-			for (int c = 0; c < 16; c++) {
-				drumPattern[r][c] = old.pattern[r][c] ? 1 : 0;
-				drumAccent[r][c]  = 0;
-			}
-		migrated = true;
-		Serial.println("Migrated v1 drums.");
-	}
+        driveAmount = d.drive;
+        drumLevel = d.level;
+        currentDrumPattern = d.currentPattern;
+        for (int p = 0; p < NUM_PATTERNS; p++)
+            for (int r = 0; r < 4; r++)
+                for (int c = 0; c < 16; c++) {
+                    drumPatternBank[p][r][c] = d.pattern[p][r][c] ? 1 : 0;
+                    drumAccentBank[p][r][c]  = d.accent[p][r][c] ? 1 : 0;
+                }
+        Serial.println("Drums loaded from flash.");
 
-	lastSeenDrum = captureDrum();
-	lastSavedDrum = lastSeenDrum;
+    } else if (len == sizeof(v2) &&
+               prefs.getBytes("drums", &v2, sizeof(v2)) == sizeof(v2) &&
+               v2.version == 2 &&
+               v2.drive >= 0.0f && v2.drive <= 1.0f &&
+               v2.level >= 0.0f && v2.level <= 1.0f) {
 
-	// Write the new format right away after a migration.
-	if (migrated) {
-		prefs.putBytes("drums", &lastSavedDrum, sizeof(lastSavedDrum));
-	}
+        driveAmount = v2.drive;
+        drumLevel = v2.level;
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 16; c++) {
+                drumPatternBank[0][r][c] = v2.pattern[r][c] ? 1 : 0;
+                drumAccentBank[0][r][c]  = v2.accent[r][c] ? 1 : 0;
+            }
+        migrated = true;
+        Serial.println("Migrated v2 drums into slot 1.");
+
+    } else if (len == sizeof(v1) &&
+               prefs.getBytes("drums", &v1, sizeof(v1)) == sizeof(v1) &&
+               v1.version == 1 &&
+               v1.drive >= 0.0f && v1.drive <= 1.0f &&
+               v1.level >= 0.0f && v1.level <= 1.0f) {
+
+        driveAmount = v1.drive;
+        drumLevel = v1.level;
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 16; c++)
+                drumPatternBank[0][r][c] = v1.pattern[r][c] ? 1 : 0;
+        migrated = true;
+        Serial.println("Migrated v1 drums into slot 1.");
+    }
+
+    drumPattern = drumPatternBank[currentDrumPattern];
+    drumAccent  = drumAccentBank[currentDrumPattern];
+
+		captureDrum(lastSeenDrum);
+		lastSavedDrum = lastSeenDrum;		
+
+    if (migrated) {
+        prefs.putBytes("drums", &lastSavedDrum, sizeof(lastSavedDrum));
+    }
 }
 
 FxSaved lastSeenFx;
@@ -637,11 +670,23 @@ void loadState() {
     pattern = patternBank[currentPattern];
     loopLength = loopLengths[currentPattern];
 
+		Serial.println("DEBUG: before loadDrums");
 		loadDrums();
+
+		Serial.println("DEBUG: before loadChords");
 		loadChords();
+
+		Serial.println("DEBUG: before loadFx");
 		loadFx();
-    lastSeenState = captureState();
-    lastSavedState = lastSeenState;
+
+		Serial.println("DEBUG: before captureState");
+		lastSeenState = captureState();
+
+		Serial.println("DEBUG: before lastSavedState");
+		lastSavedState = lastSeenState;
+
+		Serial.println("DEBUG: loadState complete");		
+
 
     // Write the new format immediately after a migration.
     if (len == sizeof(old)) {
@@ -650,8 +695,10 @@ void loadState() {
 }
 
 void updateAutosave() {
-    SavedState now = captureState();
-    DrumSaved nowDrum = captureDrum();
+
+	SavedState now = captureState();
+    static DrumSaved nowDrum;
+		captureDrum(nowDrum);
     ChordSaved nowChord = captureChords();
     FxSaved nowFx = captureFx();                       // with the other captures		
 
@@ -812,20 +859,39 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEven
 						
 		// Drum screen
 		if (currentScreen == SCREEN_DRUM) {
+			static bool accentChord = false;
 
-			// encoder 1 button toggles the step under the cursor
-			if (sel == BTN_PRESSED) {
-				uint8_t& cell = drumPattern[drumCursor / 16][drumCursor % 16];
-				cell = cell ? 0 : 1;
+			if (patEvent == BTN_PRESSED) {
+				bool accentHeld = (accentButton.stableState == LOW);
+				if (accentHeld) accentChord = true;
+
+				if (!drumPatternSelectMode) {
+					drumPatternSelectMode = true;
+					pendingDrumPattern = currentDrumPattern;
+				} else if (accentHeld) {
+					switchDrumPatternNow();
+				} else {
+					confirmDrumPatternSelect();
+				}
 				displayDirty = true;
 			}
+			else if (!drumPatternSelectMode) {
+				if (sel == BTN_PRESSED) {
+					uint8_t& cell = drumPattern[drumCursor / 16][drumCursor % 16];
+					cell = cell ? 0 : 1;
+					displayDirty = true;
+				}
 
-			if (accentEvent == BTN_PRESSED) {
-				uint8_t& cell = drumAccent[drumCursor / 16][drumCursor % 16];
-				cell = cell ? 0 : 1;
-				displayDirty = true;
+				// Accent toggles on release, unless it was part of the chord.
+				if (accentEvent == BTN_RELEASED && !accentChord) {
+					uint8_t& a = drumAccent[drumCursor / 16][drumCursor % 16];
+					a = a ? 0 : 1;
+					displayDirty = true;
+				}
 			}
-		}
+
+			if (accentEvent == BTN_RELEASED) accentChord = false;
+		}		
 
 		// handle chord seq step toggle
 		if (currentScreen == SCREEN_CHORDS && sel == BTN_PRESSED) {
@@ -844,51 +910,64 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEven
 
 void handleMenuEncoders(int32_t d1, int32_t d2) {
 
-    if (currentScreen == SCREEN_DRUM && d2 != 0) {
-        drumLevel = constrain(drumLevel + d2 * 0.05f, 0.0f, 1.0f);
-        displayDirty = true;
-    }
+	if (currentScreen == SCREEN_MENU && d1 != 0) {
+		menuIndex = (menuIndex + 4 + (d1 % 4)) % 4;
+		displayDirty = true;
+	}
 
-    if (currentScreen == SCREEN_DRUM && d1 != 0) {
-        drumCursor = (drumCursor + 64 + (d1 % 64)) % 64;
-        displayDirty = true;
-    }		
+	if (currentScreen == SCREEN_DRUM) {
 
-		if (currentScreen == SCREEN_MENU && d1 != 0) {
-        menuIndex = (menuIndex + 4 + (d1 % 4)) % 4;
-        displayDirty = true;
-    }
-
-		if (currentScreen == SCREEN_CHORDS) {
+		if (drumPatternSelectMode) {
 			if (d1 != 0) {
-				chordCursor = (chordCursor + 64 + (d1 % 64)) % 64;
+				pendingDrumPattern =
+					(pendingDrumPattern + NUM_PATTERNS + (d1 % NUM_PATTERNS)) % NUM_PATTERNS;
 				displayDirty = true;
 			}
-			if (d2 != 0) {
-				if (encoder2Button.stableState == LOW) {
-					uint8_t& n = chordNotes[chordCursor / 16][chordCursor % 16];
-					n = constrain((int)n + d2, 24, 96);       // pitch of this step
-				} else {
-					chordLevel = constrain(chordLevel + d2 * 0.05f, 0.0f, 1.0f);
-				}
-				displayDirty = true;
-			}			
-    }		
-    if (currentScreen == SCREEN_FX) {
-        if (d1 != 0) {
-            fxIndex = (fxIndex + 4 + (d1 % 4)) % 4;
-            displayDirty = true;
-        }
-        if (d2 != 0) {
-            switch (fxIndex) {
-                case 0: driveAmount    = constrain(driveAmount    + d2 * 0.05f, 0.0f, 1.0f); break;
-                case 1: delayMs        = constrain(delayMs        + d2 * 10.0f, 40.0f, 740.0f); break;
-                case 2: delayFeedback  = constrain(delayFeedback  + d2 * 0.05f, 0.0f, 1.0f); break;
-                case 3: delayMix       = constrain(delayMix       + d2 * 0.05f, 0.0f, 1.0f); break;
-            }
-            displayDirty = true;
-        }
-    }	
+			return;
+		}
+
+		if (d2 != 0) {
+			drumLevel = constrain(drumLevel + d2 * 0.05f, 0.0f, 1.0f);
+			displayDirty = true;
+		}
+
+		if (d1 != 0) {
+			drumCursor = (drumCursor + 64 + (d1 % 64)) % 64;
+			displayDirty = true;
+		}		
+	}
+		
+	if (currentScreen == SCREEN_CHORDS) {
+		if (d1 != 0) {
+			chordCursor = (chordCursor + 64 + (d1 % 64)) % 64;
+			displayDirty = true;
+		}
+		if (d2 != 0) {
+			if (encoder2Button.stableState == LOW) {
+				uint8_t& n = chordNotes[chordCursor / 16][chordCursor % 16];
+				n = constrain((int)n + d2, 24, 96);       // pitch of this step
+			} else {
+				chordLevel = constrain(chordLevel + d2 * 0.05f, 0.0f, 1.0f);
+			}
+			displayDirty = true;
+		}			
+	}		
+
+	if (currentScreen == SCREEN_FX) {
+		if (d1 != 0) {
+			fxIndex = (fxIndex + 4 + (d1 % 4)) % 4;
+			displayDirty = true;
+		}
+		if (d2 != 0) {
+			switch (fxIndex) {
+			case 0: driveAmount    = constrain(driveAmount    + d2 * 0.05f, 0.0f, 1.0f); break;
+			case 1: delayMs        = constrain(delayMs        + d2 * 10.0f, 40.0f, 740.0f); break;
+			case 2: delayFeedback  = constrain(delayFeedback  + d2 * 0.05f, 0.0f, 1.0f); break;
+			case 3: delayMix       = constrain(delayMix       + d2 * 0.05f, 0.0f, 1.0f); break;
+			}
+			displayDirty = true;
+		}
+	}	
 }
 
 ButtonEvent updateButton(Button& b) {
@@ -920,38 +999,71 @@ void switchPattern(uint8_t n) {
 }
 
 void switchPatternNow() {
-    patternSelectMode = false;
-    patternQueued = false;          // an immediate switch overrides any queued one
 
-    if (pendingPattern != currentPattern) {
-        switchPattern(pendingPattern);
+	patternSelectMode = false;
+	patternQueued = false;          // an immediate switch overrides any queued one
 
-        // Keep the playhead where it is. If the new pattern is shorter than
-        // the current step, park on its last step so the next pulse wraps to 1.
-        if (currentStep >= loopLength) {
-            currentStep = loopLength - 1;
-        }
-    }
+	if (pendingPattern != currentPattern) {
+		switchPattern(pendingPattern);
 
-    displayDirty = true;
+		// Keep the playhead where it is. If the new pattern is shorter than
+		// the current step, park on its last step so the next pulse wraps to 1.
+		if (currentStep >= loopLength) {
+			currentStep = loopLength - 1;
+		}
+	}
+
+	displayDirty = true;
 }
 
 void confirmPatternSelect() {
 
 	patternSelectMode = false;
 
-    if (midiRunning) {
-        // Playing: switch at the next pattern wrap, in time.
-        queuedPattern = pendingPattern;
-        patternQueued = (queuedPattern != currentPattern);
-    } else {
-        // Stopped: switch right away.
-        stopSequencerNote();
-        switchPattern(pendingPattern);
-        currentStep = 0;
-        clockCount = 0;
-    }
+	if (midiRunning) {
+		// Playing: switch at the next pattern wrap, in time.
+		queuedPattern = pendingPattern;
+		patternQueued = (queuedPattern != currentPattern);
+	} else {
+		// Stopped: switch right away.
+		stopSequencerNote();
+		switchPattern(pendingPattern);
+		currentStep = 0;
+		clockCount = 0;
+	}
 
+	displayDirty = true;
+}
+
+void switchDrumPattern(uint8_t n) {
+	
+    currentDrumPattern = n;
+    drumPattern = drumPatternBank[n];
+    drumAccent = drumAccentBank[n];		
+}
+
+void switchDrumPatternNow() {
+
+	drumPatternSelectMode = false;
+	drumPatternQueued = false;          // an immediate switch overrides any queued one
+
+	if (pendingDrumPattern != currentDrumPattern) {
+		switchDrumPattern(pendingDrumPattern);
+	}
+
+	displayDirty = true;
+}
+
+void confirmDrumPatternSelect() {
+    drumPatternSelectMode = false;
+
+    if (midiRunning) {
+        queuedDrumPattern = pendingDrumPattern;
+        drumPatternQueued = (queuedDrumPattern != currentDrumPattern);
+    } else {
+        switchDrumPattern(pendingDrumPattern);
+        drumPatternQueued = false;
+    }
     displayDirty = true;
 }
 
@@ -1316,26 +1428,34 @@ void gateOffCurrentStep() {
 
 // One MIDI-clock-equivalent pulse (24 per quarter note).
 void sequencerPulse() {
-    clockCount++;
 
-    if (clockCount >= 6) {
-        clockCount = 0;
+	clockCount++;
 
-        if (currentStep + 1 >= loopLength) {
-            currentStep = 0;
-            if (patternQueued) {
-                patternQueued = false;
-                switchPattern(queuedPattern);
-            }
-        } else {
-            currentStep++;
-        }
+	if (clockCount >= 6) {
+		clockCount = 0;
 
-        triggerSequencerStep();
-        displayDirty = true;
-    } else if (clockCount == GATE_PULSES) {
-        gateOffCurrentStep();
-    }
+		if (currentStep + 1 >= loopLength) {
+			currentStep = 0;
+			if (patternQueued) {
+				patternQueued = false;
+				switchPattern(queuedPattern);
+			}
+						
+		} else {
+			currentStep++;
+		}
+
+		if (currentStep % 16 == 0 && drumPatternQueued) {
+			drumPatternQueued = false;
+			switchDrumPattern(queuedDrumPattern);
+		}
+
+		triggerSequencerStep();					
+		triggerSequencerStep();
+		displayDirty = true;
+	} else if (clockCount == GATE_PULSES) {
+		gateOffCurrentStep();
+	}
 }
 
 void stopSequencerNote() {
@@ -1973,6 +2093,13 @@ bool patternHasNotes(uint8_t p) {
     return false;
 }
 
+bool drumPatternHasNotes(uint8_t p) {
+    for (int d = 0; d < 4; d++)
+        for (int i = 0; i < 16; i++)
+            if (drumPatternBank[p][d][i]) return true;
+    return false;
+}
+
 void drawPatternSelect() {
 
 	for (int i = 0; i < NUM_PATTERNS; i++) {
@@ -2004,6 +2131,39 @@ void drawPatternSelect() {
              pendingPattern + 1, currentPattern + 1);
     display.setCursor(0, 55);
     display.print(text);
+}
+
+void drawDrumPatternSelect() {
+
+	for (int i = 0; i < NUM_PATTERNS; i++) {
+
+		int x = 2 + ((i % 8) * 16);
+		int numY = (i < 8) ? 10 : 29;
+		int y    = (i < 8) ? 19 : 38;
+
+		display.setCursor(x, numY);
+		display.print(i + 1);
+
+		if (drumPatternHasNotes(i)) {
+			display.fillRect(x, y, 7, 7, SSD1306_WHITE);
+		} else {
+			display.drawPixel(x + 3, y + 3, SSD1306_WHITE);
+		}
+
+		if (i == currentDrumPattern) {
+			display.drawRect(x - 1, y - 1, 9, 9, SSD1306_WHITE);
+		}
+
+		if (i == pendingDrumPattern) {
+			display.drawFastHLine(x, y + 8, 7, SSD1306_WHITE);
+		}
+	}
+
+	char text[24];
+	snprintf(text, sizeof(text), "SELECT P%02d  NOW P%02d",
+					 pendingDrumPattern + 1, currentDrumPattern + 1);
+	display.setCursor(0, 55);
+	display.print(text);
 }
 
 void drawLaneGrid(uint8_t grid[4][16], uint8_t cursor) {
@@ -2078,8 +2238,17 @@ void drawMenuScreen() {
 		
 	} else {		// draw drum screen
 
+		if (drumPatternSelectMode) {
+        drawDrumPatternSelect();
+        display.display();
+        return;
+    }
+
 		display.setCursor(0, 14);
-		display.print("DRUM");
+		char dp[10];
+		if (drumPatternQueued) snprintf(dp, sizeof(dp), "DRM>P%02d", queuedDrumPattern + 1);
+		else                   snprintf(dp, sizeof(dp), "DRM P%02d", currentDrumPattern + 1);
+		display.print(dp);
 
 		static const char* drumNames[4] = { "KICK", "SNARE", "CHAT", "OHAT" };
 		char label[16];
@@ -2140,7 +2309,7 @@ void updateDisplay() {
     // --------------------------------
 
     display.setCursor(0, 0);
-    display.print("TB-303");
+    display.print("EE303+");
 
 		display.setCursor(66, 0);
 
@@ -2178,7 +2347,7 @@ void updateDisplay() {
         display.drawCircle(60, 4, 2, SSD1306_WHITE);
     }
 
-    if (currentScreen != SCREEN_SYNTH) {
+    if (currentScreen != SCREEN_SYNTH) {			
         drawMenuScreen();
         display.display();
         return;
