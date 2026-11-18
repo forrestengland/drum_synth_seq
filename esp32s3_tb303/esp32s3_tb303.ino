@@ -18,13 +18,16 @@
 
 #define RUN_SWITCH_PIN 40
 
-// screen definitions
-enum Screen { SCREEN_SYNTH, SCREEN_MENU, SCREEN_FX, SCREEN_DRUM, SCREEN_CHORDS };
+enum Screen {
+    SCREEN_SYNTH, SCREEN_MENU, SCREEN_FX,
+    SCREEN_DRUM, SCREEN_CHORDS, SCREEN_SCENES
+};
 
 // current screen
 Screen currentScreen = SCREEN_MENU;
 // currently highlighted menu index
-uint8_t menuIndex = 0;                  // 0 synth, 1 fx, 2 drum, 3 chords
+// 0 synth, 1 FX, 2 drum, 3 chords, 4 scenes
+uint8_t menuIndex = 0;                  
 
 // drive amount for bass synth
 volatile float driveAmount = 0.0f;      // 0..1
@@ -301,6 +304,37 @@ struct ChordSavedV2 {
     uint8_t notes[4][16];
     uint8_t pattern[4][16];
 };
+
+// ---------- Scenes ----------
+constexpr uint8_t NUM_SCENES = 8;
+
+// Scene assignments: 0 = unassigned, 1..16 = pattern number.
+struct Scene {
+    uint8_t bass = 0;
+    uint8_t drums = 0;
+    uint8_t chords = 0;
+};
+
+Scene scenes[NUM_SCENES] = {};
+
+uint8_t selectedScene = 0;
+uint8_t selectedScenePart = 0;  // 0 bass, 1 drums, 2 chords
+
+volatile bool sceneQueued = false;
+volatile uint8_t queuedScene = 0;
+
+void requestSceneLaunch(bool immediate);
+
+// scene saving ----
+struct SceneSaved {
+    uint8_t version;
+    uint8_t selectedScene;
+    Scene scenes[NUM_SCENES];
+};
+
+SceneSaved lastSeenScene;
+SceneSaved lastSavedScene;
+// end scene saving ---
 
 DrumSaved lastSeenDrum;
 DrumSaved lastSavedDrum;
@@ -674,6 +708,43 @@ void loadChords() {
     }
 }
 
+void captureScenes(SceneSaved& s) {
+    memset(&s, 0, sizeof(s));
+
+    s.version = 1;
+    s.selectedScene = selectedScene;
+    memcpy(s.scenes, scenes, sizeof(scenes));
+}
+
+void loadScenes() {
+    static SceneSaved saved;
+
+    memset(scenes, 0, sizeof(scenes));
+    selectedScene = 0;
+    sceneQueued = false;
+
+    if (prefs.getBytesLength("scenes") == sizeof(saved) &&
+        prefs.getBytes("scenes", &saved, sizeof(saved)) == sizeof(saved) &&
+        saved.version == 1 &&
+        saved.selectedScene < NUM_SCENES) {
+
+        memcpy(scenes, saved.scenes, sizeof(scenes));
+        selectedScene = saved.selectedScene;
+
+        // Reject invalid assignments rather than indexing outside a bank.
+        for (int i = 0; i < NUM_SCENES; i++) {
+            if (scenes[i].bass > NUM_PATTERNS) scenes[i].bass = 0;
+            if (scenes[i].drums > NUM_PATTERNS) scenes[i].drums = 0;
+            if (scenes[i].chords > NUM_PATTERNS) scenes[i].chords = 0;
+        }
+
+        Serial.println("Scenes loaded from flash.");
+    }
+
+    captureScenes(lastSeenScene);
+    lastSavedScene = lastSeenScene;
+}
+
 SavedState captureState() {
 
 	SavedState s;
@@ -738,6 +809,9 @@ void loadState() {
 		Serial.println("DEBUG: before loadFx");
 		loadFx();
 
+		Serial.println("DEBUG: before loadScenes");		
+		loadScenes();
+
 		Serial.println("DEBUG: before captureState");
 		lastSeenState = captureState();
 
@@ -753,48 +827,42 @@ void loadState() {
     }
 }
 
-void updateAutosave() {
+void saveAllToFlash() {
 
-	SavedState now = captureState();
+    // Static storage avoids putting several large pattern structures
+    // on the loop task's stack.
+    static SavedState now;
     static DrumSaved nowDrum;
-		captureDrum(nowDrum);
     static ChordSaved nowChord;
-		captureChords(nowChord);
-    FxSaved nowFx = captureFx();                       // with the other captures		
+		static SceneSaved nowScenes;
 
-    if (memcmp(&now, &lastSeenState, sizeof(now)) != 0 ||
-        memcmp(&nowDrum, &lastSeenDrum, sizeof(nowDrum)) != 0 ||
-        memcmp(&nowFx, &lastSeenFx, sizeof(nowFx)) != 0 ||   
-        memcmp(&nowChord, &lastSeenChord, sizeof(nowChord)) != 0) {
-        lastSeenState = now;
-        lastSeenDrum = nowDrum;
-        lastSeenChord = nowChord;
-				lastSeenFx = nowFx;                           
-        lastChangeMs = millis();
-        saveDirty = true;
-    }
+    now = captureState();
+    captureDrum(nowDrum);
+    captureChords(nowChord);
+    static FxSaved nowFx = captureFx();
+		captureScenes(nowScenes);		
 
-    if (saveDirty && (millis() - lastChangeMs) >= SAVE_DELAY_MS) {
-        saveDirty = false;
+    prefs.putBytes("state", &now, sizeof(now));
+    prefs.putBytes("drums", &nowDrum, sizeof(nowDrum));
+    prefs.putBytes("chords", &nowChord, sizeof(nowChord));
+    prefs.putBytes("fx", &nowFx, sizeof(nowFx));
+		size_t saved = prefs.putBytes(
+																	"scenes",
+																	&nowScenes,
+																	sizeof(nowScenes)
+																	);
+		
+		if (saved != sizeof(nowScenes)) {
+			Serial.println("ERROR: Scene save failed!");
+		}		
 
-        if (memcmp(&now, &lastSavedState, sizeof(now)) != 0) {
-            prefs.putBytes("state", &now, sizeof(now));
-            lastSavedState = now;
-        }
-        if (memcmp(&nowDrum, &lastSavedDrum, sizeof(nowDrum)) != 0) {
-            prefs.putBytes("drums", &nowDrum, sizeof(nowDrum));
-            lastSavedDrum = nowDrum;
-        }
-        if (memcmp(&nowChord, &lastSavedChord, sizeof(nowChord)) != 0) {
-            prefs.putBytes("chords", &nowChord, sizeof(nowChord));
-            lastSavedChord = nowChord;
-        }
-        if (memcmp(&nowFx, &lastSavedFx, sizeof(nowFx)) != 0) {
-					prefs.putBytes("fx", &nowFx, sizeof(nowFx));
-					lastSavedFx = nowFx;                            // inside the change block
-				}
-        Serial.println("Saved.");
-    }
+    // Keep the saved-state copies up to date.
+    lastSavedState = now;
+    lastSavedDrum = nowDrum;
+    lastSavedChord = nowChord;
+    lastSavedFx = nowFx;
+
+    Serial.println("Manual save complete.");
 }
 
 // Returns detents since last call and clears the counter.
@@ -899,12 +967,13 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEven
 	// menu screen
 	if (currentScreen == SCREEN_MENU) {
 
-		// encoder one pressed, switch screen to selection
-		if (sel == BTN_PRESSED) {
+		// encoder one pressed or button 1 pressed, switch screen to selection
+		if (sel == BTN_PRESSED || startEvent == BTN_PRESSED) {
 			if (menuIndex == 0)      currentScreen = SCREEN_SYNTH;
 			else if (menuIndex == 1) currentScreen = SCREEN_FX;
 			else if (menuIndex == 2) currentScreen = SCREEN_DRUM;
-			else currentScreen = SCREEN_CHORDS;
+			else if (menuIndex == 3) currentScreen = SCREEN_CHORDS;
+			else currentScreen = SCREEN_SCENES;
 			displayDirty = true;
 		}
 			
@@ -916,6 +985,25 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEven
 			displayDirty = true;
 			return;
 		}
+
+		// Scene controls
+		if (currentScreen == SCREEN_SCENES) {
+
+			// Encoder 2 push cycles Bass -> Drums -> Chords.
+			if (e2 == BTN_PRESSED) {
+        selectedScenePart = (selectedScenePart + 1) % 3;
+        displayDirty = true;
+			}
+
+			if (patEvent == BTN_PRESSED) {
+        bool accentHeld = (accentButton.stableState == LOW);
+
+        // PATTERN = queue while running; ACCENT + PATTERN = immediate.
+        requestSceneLaunch(accentHeld);
+			}
+
+			return;
+		}		
 						
 		// Drum screen
 		if (currentScreen == SCREEN_DRUM) {
@@ -1001,9 +1089,35 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEven
 void handleMenuEncoders(int32_t d1, int32_t d2) {
 
 	if (currentScreen == SCREEN_MENU && d1 != 0) {
-		menuIndex = (menuIndex + 4 + (d1 % 4)) % 4;
+		menuIndex = (menuIndex + 5 + (d1 % 5)) % 5;
 		displayDirty = true;
 	}
+
+	if (currentScreen == SCREEN_SCENES) {
+
+    if (d1 != 0) {
+			selectedScene =
+				(selectedScene + NUM_SCENES + (d1 % NUM_SCENES))
+				% NUM_SCENES;
+
+			displayDirty = true;
+    }
+
+    if (d2 != 0) {
+			Scene& s = scenes[selectedScene];
+			uint8_t* assignment = nullptr;
+
+			if (selectedScenePart == 0) assignment = &s.bass;
+			else if (selectedScenePart == 1) assignment = &s.drums;
+			else assignment = &s.chords;
+
+			// Rotate through --, P01, P02 ... P16.
+			int value = (*assignment + 17 + (d2 % 17)) % 17;
+			*assignment = value;
+
+			displayDirty = true;
+    }
+	}	
 
 	if (currentScreen == SCREEN_DRUM) {
 
@@ -1219,6 +1333,82 @@ void confirmDrumPatternSelect() {
     displayDirty = true;
 }
 
+bool sceneHasAssignments(uint8_t n) {
+    if (n >= NUM_SCENES) return false;
+
+    const Scene& s = scenes[n];
+    return s.bass || s.drums || s.chords;
+}
+
+void applyScenePatterns(uint8_t n) {
+    if (n >= NUM_SCENES || !sceneHasAssignments(n)) return;
+
+    const Scene& s = scenes[n];
+
+    // A scene replaces any separately queued pattern changes.
+    patternQueued = false;
+    drumPatternQueued = false;
+    chordPatternQueued = false;
+    sceneQueued = false;
+
+    // Stop any note/gate carried over from the previous arrangement.
+    stopSequencerNote();
+
+    // Apply only assigned parts. Unassigned parts keep their patterns.
+    if (s.bass != 0) {
+        switchPattern(s.bass - 1);
+    }
+
+    if (s.drums != 0) {
+        switchDrumPattern(s.drums - 1);
+    }
+
+    if (s.chords != 0) {
+        switchChordPattern(s.chords - 1);
+    }
+
+    currentStep = 0;
+    clockCount = 0;
+
+    displayDirty = true;
+}
+
+void launchSceneImmediately(uint8_t n) {
+    if (!sceneHasAssignments(n)) return;
+
+    applyScenePatterns(n);
+
+    // If transport is running, immediately trigger step 1 of the new scene.
+    if (midiRunning) {
+        triggerSequencerStep();
+    }
+
+    displayDirty = true;
+}
+
+void requestSceneLaunch(bool immediate) {
+    if (!sceneHasAssignments(selectedScene)) {
+        displayDirty = true;
+        return;
+    }
+
+    if (!midiRunning || immediate) {
+        sceneQueued = false;
+        launchSceneImmediately(selectedScene);
+    } else {
+        // Capture the selected scene now; the user can continue browsing.
+        queuedScene = selectedScene;
+        sceneQueued = true;
+
+        // The scene will take control of all three pattern selections.
+        patternQueued = false;
+        drumPatternQueued = false;
+        chordPatternQueued = false;
+    }
+
+    displayDirty = true;
+}
+
 void updateButtons() {
 
 	// grab all button states
@@ -1227,6 +1417,41 @@ void updateButtons() {
 	ButtonEvent startEvent  = updateButton(startButton);
 	ButtonEvent sel = updateButton(encoder1Button);
 	ButtonEvent e2  = updateButton(encoder2Button);
+
+	// Manual save: hold Pattern + Accent + Start.
+	static bool saveComboLatched = false;
+
+	bool saveComboDown =
+		patternButton.stableState == LOW &&
+		accentButton.stableState == LOW &&
+		startButton.stableState == LOW;
+
+	if (saveComboDown) {
+		if (!saveComboLatched) {
+			saveComboLatched = true;
+
+			// Prevent the combo from also activating normal controls.
+			chordUsed = true;
+			patternSelectMode = false;
+			drumPatternSelectMode = false;
+			chordPatternSelectMode = false;
+
+			saveAllToFlash();
+			displayDirty = true;
+		}
+		return;
+	}
+
+	// Don't process the individual button releases from the combo.
+	if (saveComboLatched) {
+		if (patternButton.stableState == HIGH &&
+				accentButton.stableState == HIGH &&
+				startButton.stableState == HIGH) {
+			saveComboLatched = false;
+			chordUsed = false;
+		}
+		return;
+	}	
 
 	// handleMenuButtons handles button presses when we're not on the bass synth screen
 	if (currentScreen != SCREEN_SYNTH) {
@@ -1581,38 +1806,50 @@ void gateOffCurrentStep() {
 // One MIDI-clock-equivalent pulse (24 per quarter note).
 void sequencerPulse() {
 
-	clockCount++;
+    clockCount++;
 
-	if (clockCount >= 6) {
-		clockCount = 0;
+    if (clockCount >= 6) {
+        clockCount = 0;
 
-		if (currentStep + 1 >= loopLength) {
-			currentStep = 0;
-			if (patternQueued) {
-				patternQueued = false;
-				switchPattern(queuedPattern);
-			}
-						
-		} else {
-			currentStep++;
-		}
+        bool sceneApplied = false;
 
-		if (currentStep % 16 == 0 && drumPatternQueued) {
-			drumPatternQueued = false;
-			switchDrumPattern(queuedDrumPattern);
-		}
+        if (currentStep + 1 >= loopLength) {
+            currentStep = 0;
 
-		if (currentStep % 16 == 0 && chordPatternQueued) {
-			chordPatternQueued = false;
-			switchChordPattern(queuedChordPattern);
-		}		
+            // A queued scene takes priority over individual pattern queues.
+            if (sceneQueued) {
+                uint8_t n = queuedScene;
+                sceneQueued = false;
+                applyScenePatterns(n);
+                sceneApplied = true;
 
-		triggerSequencerStep();					
-		triggerSequencerStep();
-		displayDirty = true;
-	} else if (clockCount == GATE_PULSES) {
-		gateOffCurrentStep();
-	}
+            } else if (patternQueued) {
+                patternQueued = false;
+                switchPattern(queuedPattern);
+            }
+
+        } else {
+            currentStep++;
+        }
+
+        // Retain the existing independent pattern queues when no scene
+        // was applied at this boundary.
+        if (!sceneApplied && currentStep % 16 == 0 && drumPatternQueued) {
+            drumPatternQueued = false;
+            switchDrumPattern(queuedDrumPattern);
+        }
+
+        if (!sceneApplied && currentStep % 16 == 0 && chordPatternQueued) {
+            chordPatternQueued = false;
+            switchChordPattern(queuedChordPattern);
+        }
+
+        triggerSequencerStep();
+        displayDirty = true;
+
+    } else if (clockCount == GATE_PULSES) {
+        gateOffCurrentStep();
+    }
 }
 
 void stopSequencerNote() {
@@ -2398,9 +2635,12 @@ void drawMenuScreen() {
 	display.setCursor(0, 12);
 
 	if (currentScreen == SCREEN_MENU) {
-		const char* items[4] = { "Synth", "FX", "Drum", "Chords" };
-		for (int i = 0; i < 4; i++) {
-			display.setCursor(8, 16 + i * 11);
+		const char* items[5] = {
+			"Synth", "FX", "Drum", "Chords", "Scenes"
+		};
+
+		for (int i = 0; i < 5; i++) {		
+			display.setCursor(8, 10 + i * 11);
 			display.print(i == menuIndex ? "> " : "  ");
 			display.print(items[i]);
 		}
@@ -2451,6 +2691,53 @@ void drawMenuScreen() {
 		display.fillRect(58, 24, (int)(chordLevel * 56.0f), 8, SSD1306_WHITE);
 
 		drawLaneGrid(chordPattern, chordCursor);
+
+	} else if (currentScreen == SCREEN_SCENES) {
+
+    Scene& s = scenes[selectedScene];
+
+    display.setCursor(0, 14);
+    display.print("SCENE ");
+    display.print(selectedScene + 1);
+
+    if (sceneQueued) {
+        display.setCursor(72, 14);
+        display.print("QUEUED ");
+        display.print(queuedScene + 1);
+    }
+
+    display.setCursor(0, 26);
+    display.print(selectedScenePart == 0 ? ">" : " ");
+    display.print("BASS   ");
+    if (s.bass == 0) display.print("--");
+    else {
+        display.print("P");
+        if (s.bass < 10) display.print("0");
+        display.print(s.bass);
+    }
+
+    display.setCursor(0, 36);
+    display.print(selectedScenePart == 1 ? ">" : " ");
+    display.print("DRUMS  ");
+    if (s.drums == 0) display.print("--");
+    else {
+        display.print("P");
+        if (s.drums < 10) display.print("0");
+        display.print(s.drums);
+    }
+
+    display.setCursor(0, 46);
+    display.print(selectedScenePart == 2 ? ">" : " ");
+    display.print("CHORDS ");
+    if (s.chords == 0) display.print("--");
+    else {
+        display.print("P");
+        if (s.chords < 10) display.print("0");
+        display.print(s.chords);
+    }
+
+    display.setCursor(0, 57);
+    display.print("PAT:PLAY  ACC+PAT:NOW");		
 		
 	} else {		// draw drum screen
 
@@ -2887,8 +3174,6 @@ void loop() {
 	updateRunSwitch();
 
 	updateDisplay();
-
-	updateAutosave();
 
   static uint32_t lastResets = 0;
   if (filterResets != lastResets) {
