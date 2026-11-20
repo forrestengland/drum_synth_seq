@@ -342,6 +342,7 @@ struct Scene {
     uint8_t bass = 0;
     uint8_t drums = 0;
     uint8_t chords = 0;
+    uint8_t repeats = 1;  // 1..16
 };
 
 Scene scenes[NUM_SCENES] = {};
@@ -352,11 +353,30 @@ uint8_t selectedScenePart = 0;  // 0 bass, 1 drums, 2 chords
 volatile bool sceneQueued = false;
 volatile uint8_t queuedScene = 0;
 
+bool songMode = false;
+bool songStartQueued = false;
+
+uint8_t songScene = 0;
+uint8_t songRepeatsDone = 0;
+
+void toggleSongMode();
+
 // begin functions
 
 void requestSceneLaunch(bool immediate);
 
 // scene saving ----
+struct SceneSavedV1 {
+    uint8_t version;
+    uint8_t selectedScene;
+
+    struct {
+        uint8_t bass;
+        uint8_t drums;
+        uint8_t chords;
+    } scenes[NUM_SCENES];
+};
+
 struct SceneSaved {
     uint8_t version;
     uint8_t selectedScene;
@@ -777,34 +797,56 @@ void loadChords() {
 void captureScenes(SceneSaved& s) {
     memset(&s, 0, sizeof(s));
 
-    s.version = 1;
+    s.version = 2;
     s.selectedScene = selectedScene;
     memcpy(s.scenes, scenes, sizeof(scenes));
 }
 
 void loadScenes() {
     static SceneSaved saved;
+    static SceneSavedV1 old;
 
     memset(scenes, 0, sizeof(scenes));
     selectedScene = 0;
     sceneQueued = false;
 
-    if (prefs.getBytesLength("scenes") == sizeof(saved) &&
+    size_t len = prefs.getBytesLength("scenes");
+
+    if (len == sizeof(saved) &&
         prefs.getBytes("scenes", &saved, sizeof(saved)) == sizeof(saved) &&
-        saved.version == 1 &&
+        saved.version == 2 &&
         saved.selectedScene < NUM_SCENES) {
 
         memcpy(scenes, saved.scenes, sizeof(scenes));
         selectedScene = saved.selectedScene;
 
-        // Reject invalid assignments rather than indexing outside a bank.
+    } else if (
+        len == sizeof(old) &&
+        prefs.getBytes("scenes", &old, sizeof(old)) == sizeof(old) &&
+        old.version == 1 &&
+        old.selectedScene < NUM_SCENES) {
+
+        // Migrate the previous scene format.
+        selectedScene = old.selectedScene;
+
         for (int i = 0; i < NUM_SCENES; i++) {
-            if (scenes[i].bass > NUM_PATTERNS) scenes[i].bass = 0;
-            if (scenes[i].drums > NUM_PATTERNS) scenes[i].drums = 0;
-            if (scenes[i].chords > NUM_PATTERNS) scenes[i].chords = 0;
+            scenes[i].bass = old.scenes[i].bass;
+            scenes[i].drums = old.scenes[i].drums;
+            scenes[i].chords = old.scenes[i].chords;
+            scenes[i].repeats = 1;
         }
 
-        Serial.println("Scenes loaded from flash.");
+        Serial.println("Migrated old scenes.");
+    }
+
+    for (int i = 0; i < NUM_SCENES; i++) {
+        if (scenes[i].bass > NUM_PATTERNS) scenes[i].bass = 0;
+        if (scenes[i].drums > NUM_PATTERNS) scenes[i].drums = 0;
+        if (scenes[i].chords > NUM_PATTERNS) scenes[i].chords = 0;
+
+        if (scenes[i].repeats < 1 || scenes[i].repeats > 16) {
+            scenes[i].repeats = 1;
+        }
     }
 
     captureScenes(lastSeenScene);
@@ -1077,7 +1119,8 @@ void restartInternalClock() {
     esp_timer_start_periodic(internalClockTimer, interval);
 }
 
-void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEvent startEvent, ButtonEvent sel, ButtonEvent e2) {
+void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent,
+											 ButtonEvent startEvent, ButtonEvent sel, ButtonEvent e2) {
 
 	// menu screen
 	if (currentScreen == SCREEN_MENU) {
@@ -1104,9 +1147,36 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEven
 		// Scene controls
 		if (currentScreen == SCREEN_SCENES) {
 
-			// Encoder 2 push cycles Bass -> Drums -> Chords.
+			// Accent + Encoder 1 push toggles song mode.
+			static bool songComboLatched = false;
+
+			bool songComboDown =
+				accentButton.stableState == LOW &&
+				encoder1Button.stableState == LOW;
+
+			if (songComboDown) {
+
+				if (!songComboLatched) {
+					songComboLatched = true;
+					toggleSongMode();
+				}
+
+				return;
+			}
+
+			if (songComboLatched) {
+
+				if (accentButton.stableState == HIGH &&
+						encoder1Button.stableState == HIGH) {
+					songComboLatched = false;
+				}
+
+				return;
+			}			
+
+			// Encoder 2 push cycles Bass -> Drums -> Chords -> Repeats.
 			if (e2 == BTN_PRESSED) {
-        selectedScenePart = (selectedScenePart + 1) % 3;
+        selectedScenePart = (selectedScenePart + 1) % 4;
         displayDirty = true;
 			}
 
@@ -1235,21 +1305,32 @@ void handleMenuEncoders(int32_t d1, int32_t d2) {
 			displayDirty = true;
     }
 
-    if (d2 != 0) {
+		if (d2 != 0) {
 			Scene& s = scenes[selectedScene];
-			uint8_t* assignment = nullptr;
 
-			if (selectedScenePart == 0) assignment = &s.bass;
-			else if (selectedScenePart == 1) assignment = &s.drums;
-			else assignment = &s.chords;
+			if (selectedScenePart == 3) {
 
-			// Rotate through --, P01, P02 ... P16.
-			int value = (*assignment + 17 + (d2 % 17)) % 17;
-			*assignment = value;
+        s.repeats = constrain(
+															(int)s.repeats + d2,
+															1,
+															16
+															);
+
+			} else {
+
+        uint8_t* assignment = nullptr;
+
+        if (selectedScenePart == 0) assignment = &s.bass;
+        else if (selectedScenePart == 1) assignment = &s.drums;
+        else assignment = &s.chords;
+
+        int value = (*assignment + 17 + (d2 % 17)) % 17;
+        *assignment = value;
+			}
 
 			displayDirty = true;
-    }
-	}	
+		}
+	}
 
 	if (currentScreen == SCREEN_DRUM) {
 
@@ -1361,7 +1442,7 @@ void handleMenuEncoders(int32_t d1, int32_t d2) {
 	}	
 }
 
- ButtonEvent updateButton(Button& b) {
+ButtonEvent updateButton(Button& b) {
 
 	bool reading = digitalRead(b.pin);
 
@@ -1379,7 +1460,7 @@ void handleMenuEncoders(int32_t d1, int32_t d2) {
 	return BTN_NONE;
 }
 
-void toggleInternalRun();   // defined below
+	void toggleInternalRun();   // defined below
 
 void switchPattern(uint8_t n) {
 	
@@ -1407,7 +1488,7 @@ void switchPatternNow() {
 	displayDirty = true;
 }
 
-void confirmPatternSelect() {
+ void confirmPatternSelect() {
 
 	patternSelectMode = false;
 
@@ -1449,7 +1530,7 @@ void switchChordPatternNow() {
     displayDirty = true;
 }
 
-void confirmChordPatternSelect() {
+ void confirmChordPatternSelect() {
 
     chordPatternSelectMode = false;
 
@@ -1472,7 +1553,7 @@ void switchDrumPattern(uint8_t n) {
     drumAccent = drumAccentBank[n];		
 }
 
-void switchDrumPatternNow() {
+ void switchDrumPatternNow() {
 
 	drumPatternSelectMode = false;
 	drumPatternQueued = false;          // an immediate switch overrides any queued one
@@ -1484,7 +1565,7 @@ void switchDrumPatternNow() {
 	displayDirty = true;
 }
 
-void confirmDrumPatternSelect() {
+ void confirmDrumPatternSelect() {
     drumPatternSelectMode = false;
 
     if (midiRunning) {
@@ -1494,6 +1575,60 @@ void confirmDrumPatternSelect() {
         switchDrumPattern(pendingDrumPattern);
         drumPatternQueued = false;
     }
+    displayDirty = true;
+}
+
+int8_t findFirstAssignedScene() {
+    for (uint8_t i = 0; i < NUM_SCENES; i++) {
+        if (sceneHasAssignments(i)) return i;
+    }
+
+    return -1;
+}
+
+int8_t findNextAssignedScene(uint8_t current) {
+    for (uint8_t offset = 1; offset <= NUM_SCENES; offset++) {
+        uint8_t n = (current + offset) % NUM_SCENES;
+
+        if (sceneHasAssignments(n)) return n;
+    }
+
+    return -1;
+}
+
+void toggleSongMode() {
+
+    // Same combo cancels a queued start or exits active song mode.
+    if (songMode || songStartQueued) {
+
+        songMode = false;
+        songStartQueued = false;
+        songRepeatsDone = 0;
+
+        sceneQueued = false;
+
+        Serial.println("Song mode stopped.");
+        displayDirty = true;
+        return;
+    }
+
+    // Don't queue a song if every scene is empty.
+    if (findFirstAssignedScene() < 0) {
+        Serial.println("No assigned scenes.");
+        displayDirty = true;
+        return;
+    }
+
+    // Start at the next complete pattern boundary.
+    songStartQueued = true;
+
+    // Song mode takes ownership of scene and pattern changes.
+    sceneQueued = false;
+    patternQueued = false;
+    drumPatternQueued = false;
+    chordPatternQueued = false;
+
+    Serial.println("Song mode queued.");
     displayDirty = true;
 }
 
@@ -1551,26 +1686,31 @@ void launchSceneImmediately(uint8_t n) {
 }
 
 void requestSceneLaunch(bool immediate) {
-    if (!sceneHasAssignments(selectedScene)) {
-        displayDirty = true;
-        return;
-    }
 
-    if (!midiRunning || immediate) {
-        sceneQueued = false;
-        launchSceneImmediately(selectedScene);
-    } else {
-        // Capture the selected scene now; the user can continue browsing.
-        queuedScene = selectedScene;
-        sceneQueued = true;
+	if (songMode || songStartQueued) {
+    return;
+	}
+	
+	if (!sceneHasAssignments(selectedScene)) {
+		displayDirty = true;
+		return;
+	}
 
-        // The scene will take control of all three pattern selections.
-        patternQueued = false;
-        drumPatternQueued = false;
-        chordPatternQueued = false;
-    }
+	if (!midiRunning || immediate) {
+		sceneQueued = false;
+		launchSceneImmediately(selectedScene);
+	} else {
+		// Capture the selected scene now; the user can continue browsing.
+		queuedScene = selectedScene;
+		sceneQueued = true;
 
-    displayDirty = true;
+		// The scene will take control of all three pattern selections.
+		patternQueued = false;
+		drumPatternQueued = false;
+		chordPatternQueued = false;
+	}
+
+	displayDirty = true;
 }
 
 void updateButtons() {
@@ -1977,33 +2117,91 @@ void sequencerPulse() {
 
         bool sceneApplied = false;
 
-        if (currentStep + 1 >= loopLength) {
-            currentStep = 0;
+				if (currentStep + 1 >= loopLength) {
 
-            // A queued scene takes priority over individual pattern queues.
-            if (sceneQueued) {
-                uint8_t n = queuedScene;
-                sceneQueued = false;
-                applyScenePatterns(n);
+					currentStep = 0;
+
+					// A queued song starts at this pattern boundary.
+					if (songStartQueued) {
+
+						songStartQueued = false;
+
+						int8_t first = findFirstAssignedScene();
+
+						if (first >= 0) {
+							songMode = true;
+							songScene = first;
+							selectedScene = first;
+							songRepeatsDone = 0;
+
+							applyScenePatterns(songScene);
+							sceneApplied = true;
+
+							Serial.printf(
+														"Song started at scene %d\n",
+														songScene + 1
+														);
+						}
+
+					} else if (songMode) {
+
+						// We have completed one full repeat of this scene.
+						songRepeatsDone++;
+
+						uint8_t targetRepeats = scenes[songScene].repeats;
+
+						if (songRepeatsDone >= targetRepeats) {
+
+							int8_t next = findNextAssignedScene(songScene);
+
+							if (next >= 0) {
+
+                songScene = next;
+                selectedScene = next;
+                songRepeatsDone = 0;
+
+                applyScenePatterns(songScene);
                 sceneApplied = true;
 
-            } else if (patternQueued) {
-                patternQueued = false;
-                switchPattern(queuedPattern);
-            }
+                Serial.printf(
+															"Song advancing to scene %d\n",
+															songScene + 1
+															);
 
-        } else {
-            currentStep++;
-        }
+							} else {
+                songMode = false;
+							}
+						}
+
+					} else if (sceneQueued) {
+
+						uint8_t n = queuedScene;
+						sceneQueued = false;
+
+						applyScenePatterns(n);
+						sceneApplied = true;
+
+					} else if (patternQueued) {
+
+						patternQueued = false;
+						switchPattern(queuedPattern);
+					}
+
+				} else {
+
+					currentStep++;
+				}				
 
         // Retain the existing independent pattern queues when no scene
         // was applied at this boundary.
-        if (!sceneApplied && currentStep % 16 == 0 && drumPatternQueued) {
+				if (!songMode && !songStartQueued &&
+						!sceneApplied && currentStep % 16 == 0 && drumPatternQueued) {
             drumPatternQueued = false;
             switchDrumPattern(queuedDrumPattern);
         }
 
-        if (!sceneApplied && currentStep % 16 == 0 && chordPatternQueued) {
+				if (!songMode && !songStartQueued &&
+						!sceneApplied && currentStep % 16 == 0 && chordPatternQueued) {					
             chordPatternQueued = false;
             switchChordPattern(queuedChordPattern);
         }
@@ -2899,11 +3097,17 @@ void drawMenuScreen() {
     display.print("SCENE ");
     display.print(selectedScene + 1);
 
-    if (sceneQueued) {
-        display.setCursor(72, 14);
-        display.print("QUEUED ");
-        display.print(queuedScene + 1);
-    }
+		if (songStartQueued) {
+			display.setCursor(78, 14);
+			display.print("SONG Q");
+		} else if (songMode) {
+			display.setCursor(78, 14);
+			display.print("SONG ON");
+		} else if (sceneQueued) {
+			display.setCursor(72, 14);
+			display.print("QUEUED ");
+			display.print(queuedScene + 1);
+		}		
 
     display.setCursor(0, 26);
     display.print(selectedScenePart == 0 ? ">" : " ");
@@ -2935,9 +3139,11 @@ void drawMenuScreen() {
         display.print(s.chords);
     }
 
-    display.setCursor(0, 57);
-    display.print("PAT:PLAY  ACC+PAT:NOW");		
-		
+		display.setCursor(0, 57);
+		display.print(selectedScenePart == 3 ? ">" : " ");
+		display.print("REPEATS: ");
+		display.print(s.repeats);
+ 
 	} else {		// draw drum screen
 
 		if (drumPatternSelectMode) {
@@ -3137,7 +3343,7 @@ void updateDisplay() {
 
 void toggleInternalRun() {
 
-	if (syncMode != SYNC_INTERNAL) {
+    if (syncMode != SYNC_INTERNAL) {
         return;
     }
 
@@ -3145,16 +3351,32 @@ void toggleInternalRun() {
         // Start from step 1.
         clockCount = 0;
         currentStep = 0;
+
+        // If song mode is queued, launch it immediately.
+        if (songStartQueued) {
+            songStartQueued = false;
+            songMode = true;
+
+            songScene = findFirstAssignedScene();
+            selectedScene = songScene;
+            songRepeatsDone = 0;
+
+            applyScenePatterns(songScene);
+        }
+
         midiRunning = true;
-				midiOutRealtime(0xFA);          // Start
+        midiOutRealtime(0xFA);          // Start
         triggerSequencerStep();
         restartInternalClock();
+
     } else {
         midiRunning = false;
+
         if (esp_timer_is_active(internalClockTimer)) {
             esp_timer_stop(internalClockTimer);
         }
-				midiOutRealtime(0xFC);          // Stop
+
+        midiOutRealtime(0xFC);          // Stop
         stopSequencerNote();
     }
 
