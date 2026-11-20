@@ -22,6 +22,9 @@
 // for saving/reloading settings across boots
 #include <Preferences.h>
 
+// bass synth level
+volatile float bassLevel = 1.0f;
+
 // modified / saved indicator
 uint32_t saveFeedbackUntil = 0;
 bool saveSucceeded = false;
@@ -274,11 +277,21 @@ struct SavedStateV1 {
     Step    pattern[NUM_STEPS];
 };
 
+struct FxSavedV1 {
+    uint8_t version;
+    float timeMs;
+    float feedback;
+    float mix;
+};
+
 struct FxSaved {
     uint8_t version;
-    float   timeMs;
-    float   feedback;
-    float   mix;
+    float timeMs;
+    float feedback;
+    float mix;
+    float bassLevel;
+    float drumLevel;
+    float chordLevel;
 };
 
 struct DrumSaved {
@@ -621,26 +634,61 @@ FxSaved lastSavedFx;
 FxSaved captureFx() {
     FxSaved f;
     memset(&f, 0, sizeof(f));
-    f.version = 1;
+
+    f.version = 2;
     f.timeMs = delayMs;
     f.feedback = delayFeedback;
     f.mix = delayMix;
+
+    f.bassLevel = bassLevel;
+    f.drumLevel = drumLevel;
+    f.chordLevel = chordLevel;
+
     return f;
 }
 
 void loadFx() {
     FxSaved f;
-    if (prefs.getBytesLength("fx") == sizeof(f) &&
+    FxSavedV1 old;
+
+    size_t len = prefs.getBytesLength("fx");
+
+    if (len == sizeof(f) &&
         prefs.getBytes("fx", &f, sizeof(f)) == sizeof(f) &&
-        f.version == 1 &&
+        f.version == 2 &&
         f.timeMs >= 40.0f && f.timeMs <= 740.0f &&
         f.feedback >= 0.0f && f.feedback <= 1.0f &&
-        f.mix >= 0.0f && f.mix <= 1.0f) {
+        f.mix >= 0.0f && f.mix <= 1.0f &&
+        f.bassLevel >= 0.0f && f.bassLevel <= 1.0f &&
+        f.drumLevel >= 0.0f && f.drumLevel <= 1.0f &&
+        f.chordLevel >= 0.0f && f.chordLevel <= 1.0f) {
 
         delayMs = f.timeMs;
         delayFeedback = f.feedback;
         delayMix = f.mix;
+
+        bassLevel = f.bassLevel;
+        drumLevel = f.drumLevel;
+        chordLevel = f.chordLevel;
+
+    } else if (
+        len == sizeof(old) &&
+        prefs.getBytes("fx", &old, sizeof(old)) == sizeof(old) &&
+        old.version == 1 &&
+        old.timeMs >= 40.0f && old.timeMs <= 740.0f &&
+        old.feedback >= 0.0f && old.feedback <= 1.0f &&
+        old.mix >= 0.0f && old.mix <= 1.0f) {
+
+        // Migrate the old FX settings.
+        delayMs = old.timeMs;
+        delayFeedback = old.feedback;
+        delayMix = old.mix;
+
+        // Drum and chord levels were previously stored
+        // in their respective saved structures.
+        bassLevel = 1.0f;
     }
+
     lastSeenFx = captureFx();
     lastSavedFx = lastSeenFx;
 }
@@ -874,11 +922,12 @@ void saveAllToFlash() {
     static DrumSaved nowDrum;
     static ChordSaved nowChord;
 		static SceneSaved nowScenes;
+		static FxSaved nowFx;
 
     now = captureState();
     captureDrum(nowDrum);
     captureChords(nowChord);
-    FxSaved nowFx = captureFx();
+    nowFx = captureFx();
 		captureScenes(nowScenes);		
 
     prefs.putBytes("state", &now, sizeof(now));
@@ -923,6 +972,29 @@ void updateEncoder() {
 
 	int32_t d1 = takeEncoderDetents(enc1);
 	int32_t d2 = takeEncoderDetents(enc2);
+
+	// Encoder 2 held + turned always controls internal tempo,
+	// regardless of the current screen.
+	if (d2 != 0 && encoder2Button.stableState == LOW) {
+
+    encoder2Turned = true;
+
+    if (syncMode == SYNC_INTERNAL) {
+			internalBpm = constrain(
+															internalBpm + d2, MIN_BPM, MAX_BPM
+															);
+
+			if (midiRunning) {
+				restartInternalClock();
+			}
+
+			displayDirty = true;
+    }
+
+    // Do not let the screen-specific encoder handler
+    // interpret this rotation as another control.
+    d2 = 0;
+	}	
 
 	if (currentScreen != SCREEN_SYNTH) {
 		handleMenuEncoders(d1, d2);
@@ -1118,16 +1190,23 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEven
         }
 
         displayDirty = true;
-			}
+				
+			} else if (!chordPatternSelectMode) {
 
-			// Only allow editing when not selecting a pattern.
-			else if (!chordPatternSelectMode && sel == BTN_PRESSED) {
+				if (sel == BTN_PRESSED) {
 
-        uint8_t& cell =
-					chordPattern[chordCursor / 16][chordCursor % 16];
+					uint8_t& cell =
+						chordPattern[chordCursor / 16][chordCursor % 16];
 
-        cell = cell ? 0 : 1;
-        displayDirty = true;
+					cell = cell ? 0 : 1;
+					displayDirty = true;
+				}
+
+				if (e2 == BTN_PRESSED) {
+					chordCursor = (chordCursor + 16) % 64;
+					displayDirty = true;
+				}
+				
 			}
 		}
 	}
@@ -1214,39 +1293,71 @@ void handleMenuEncoders(int32_t d1, int32_t d2) {
 			displayDirty = true;
     }
 
+		if (d2 != 0) {
+			uint8_t& n =
+        chordNotes[chordCursor / 16][chordCursor % 16];
+
+			n = constrain((int)n + d2, 24, 96);
+
+			displayDirty = true;
+		}
+	}
+
+	if (currentScreen == SCREEN_FX) {
+
+    if (d1 != 0) {
+			fxIndex = (fxIndex + 7 + (d1 % 7)) % 7;
+			displayDirty = true;
+    }
+
     if (d2 != 0) {
+			switch (fxIndex) {
 
-			if (encoder2Button.stableState == LOW) {
+			case 0:
+				driveAmount = constrain(
+																driveAmount + d2 * 0.05f, 0.0f, 1.0f
+																);
+				break;
 
-				uint8_t& n =
-					chordNotes[chordCursor / 16][chordCursor % 16];
+			case 1:
+				delayMs = constrain(
+														delayMs + d2 * 10.0f, 40.0f, 740.0f
+														);
+				break;
 
-				n = constrain((int)n + d2, 24, 96);
+			case 2:
+				delayFeedback = constrain(
+																	delayFeedback + d2 * 0.05f, 0.0f, 1.0f
+																	);
+				break;
 
-			} else {
+			case 3:
+				delayMix = constrain(
+														 delayMix + d2 * 0.05f, 0.0f, 1.0f
+														 );
+				break;
 
-				chordLevel =
-					constrain(chordLevel + d2 * 0.05f, 0.0f, 1.0f);
+			case 4:
+				bassLevel = constrain(
+															bassLevel + d2 * 0.05f, 0.0f, 1.0f
+															);
+				break;
+
+			case 5:
+				drumLevel = constrain(
+															drumLevel + d2 * 0.05f, 0.0f, 1.0f
+															);
+				break;
+
+			case 6:
+				chordLevel = constrain(
+															 chordLevel + d2 * 0.05f, 0.0f, 1.0f
+															 );
+				break;
 			}
 
 			displayDirty = true;
     }
-	}
-
-	if (currentScreen == SCREEN_FX) {
-		if (d1 != 0) {
-			fxIndex = (fxIndex + 4 + (d1 % 4)) % 4;
-			displayDirty = true;
-		}
-		if (d2 != 0) {
-			switch (fxIndex) {
-			case 0: driveAmount    = constrain(driveAmount    + d2 * 0.05f, 0.0f, 1.0f); break;
-			case 1: delayMs        = constrain(delayMs        + d2 * 10.0f, 40.0f, 740.0f); break;
-			case 2: delayFeedback  = constrain(delayFeedback  + d2 * 0.05f, 0.0f, 1.0f); break;
-			case 3: delayMix       = constrain(delayMix       + d2 * 0.05f, 0.0f, 1.0f); break;
-			}
-			displayDirty = true;
-		}
 	}	
 }
 
@@ -2001,6 +2112,8 @@ void audioTask(void* parameter) {
   bool ohChoked = false;
   float hatLp = 0, snareLp = 0;
   float smDrumLevel = 0.0f;
+	// smoothed bass level
+	float smBassLevel = 1.0f;
 
   // ---- Chord voices ----
   float chordPhase[4] = {0, 0, 0, 0};     // 0..1
@@ -2035,7 +2148,8 @@ void audioTask(void* parameter) {
 		uint8_t blockDrumMask;
 		uint8_t blockDrumAccentMask;		
 		float blockDrumLevel;
-		uint8_t blockChordMask; uint8_t blockChordNotes[4]; float blockChordLevel;		
+		uint8_t blockChordMask; uint8_t blockChordNotes[4]; float blockChordLevel;
+		float blockBassLevel;		
 
     portENTER_CRITICAL(&synthMux);
 
@@ -2066,7 +2180,9 @@ void audioTask(void* parameter) {
 
     blockDelayMs  = delayMs;
     blockDelayFb  = delayFeedback;
-    blockDelayMix = delayMix;		
+    blockDelayMix = delayMix;
+
+		blockBassLevel = bassLevel;
 
     portEXIT_CRITICAL(&synthMux);
 
@@ -2077,7 +2193,10 @@ void audioTask(void* parameter) {
     if (blockDrumMask & 4) { chEnv = 1.0f; ohChoked = true;
                              voiceAcc[2] = (blockDrumAccentMask & 4) ? DRUM_ACCENT_MUL : 1.0f; }
     if (blockDrumMask & 8) { ohEnv = 1.0f; ohChoked = false;
-                             voiceAcc[3] = (blockDrumAccentMask & 8) ? DRUM_ACCENT_MUL : 1.0f; }		
+                             voiceAcc[3] = (blockDrumAccentMask & 8) ? DRUM_ACCENT_MUL : 1.0f; }
+
+		smBassLevel += potSmoothCoeff * (blockBassLevel - smBassLevel);
+		const float bassGain = smBassLevel;		
 
     smDrumLevel += potSmoothCoeff * (blockDrumLevel - smDrumLevel);
     const float drumGain = smDrumLevel * 0.6f;
@@ -2223,8 +2342,7 @@ void audioTask(void* parameter) {
             filteredSample = fastTanh(filteredSample * driveGain) * driveNorm;
         }				
 
-				sample += filteredSample * currentAmplitude;
-				//				sample = getOscillatorSample() * currentAmplitude;
+				sample += filteredSample * currentAmplitude * bassGain;
 
       }
 
@@ -2670,7 +2788,7 @@ void drawLaneGrid(uint8_t grid[4][16], uint8_t cursor) {
     for (int r = 0; r < 4; r++) {
         for (int c = 0; c < 16; c++) {
             int x = 8 + c * 7;
-            int y = 38 + r * 6;
+            int y = 27 + r * 8;
             if (grid[r][c]) display.fillRect(x, y, 5, 4, SSD1306_WHITE);
             else display.drawPixel(x + 2, y + 2, SSD1306_WHITE);
             if (r * 16 + c == cursor) {
@@ -2679,7 +2797,7 @@ void drawLaneGrid(uint8_t grid[4][16], uint8_t cursor) {
         }
     }
     if (midiRunning) {
-        display.drawFastHLine(8 + (currentStep % 16) * 7, 35, 5, SSD1306_WHITE);
+        display.drawFastHLine(8 + (currentStep % 16) * 7, 24, 5, SSD1306_WHITE);
     }
 }
 
@@ -2689,7 +2807,7 @@ void drawMenuScreen() {
 
 	if (currentScreen == SCREEN_MENU) {
 		const char* items[5] = {
-			"Synth", "FX", "Drum", "Chords", "Scenes"
+			"Synth", "Mixer", "Drum", "Chords", "Scenes"
 		};
 
 		for (int i = 0; i < 5; i++) {		
@@ -2698,28 +2816,56 @@ void drawMenuScreen() {
 			display.print(items[i]);
 		}
 	} else if (currentScreen == SCREEN_FX) {
-        display.setCursor(0, 14);
-        display.print("FX");
 
-        const char* names[4] = { "Drive", "Time", "Fdbk", "Mix" };
-        float values[4] = {
-            driveAmount,
-            (delayMs - 40.0f) / 700.0f,
-            delayFeedback,
-            delayMix
-        };
+    display.setCursor(0, 14);
+    display.print("MIXER");
 
-        for (int i = 0; i < 4; i++) {
-            int y = 24 + i * 10;
-            display.setCursor(0, y);
-            display.print(i == fxIndex ? ">" : " ");
-            display.print(names[i]);
-            display.drawRect(42, y, 60, 7, SSD1306_WHITE);
-            display.fillRect(42, y, (int)(values[i] * 60.0f), 7, SSD1306_WHITE);
-        }
+    const char* names[7] = {
+			"Drive", "Time", "Fdbk", "Mix",
+			"Bass", "Drums", "Chords"
+    };
 
-        display.setCursor(106, 24 + 10);
-        display.print((int)delayMs / 10);   // time in tens of ms		
+    float values[7] = {
+			driveAmount,
+			(delayMs - 40.0f) / 700.0f,
+			delayFeedback,
+			delayMix,
+			bassLevel,
+			drumLevel,
+			chordLevel
+    };
+
+    // Four rows fit on the display.
+    // Keep the selected item visible at the bottom if needed.
+    int firstItem = fxIndex >= 4 ? fxIndex - 3 : 0;
+
+    for (int row = 0; row < 4; row++) {
+			int i = firstItem + row;
+			if (i >= 7) break;
+
+			int y = 24 + row * 10;
+
+			display.setCursor(0, y);
+			display.print(i == fxIndex ? ">" : " ");
+			display.print(names[i]);
+
+			display.drawRect(42, y, 60, 7, SSD1306_WHITE);
+
+			int barWidth = constrain(
+															 (int)(values[i] * 60.0f), 0, 60
+															 );
+
+			display.fillRect(42, y, barWidth, 7, SSD1306_WHITE);
+
+			display.setCursor(106, y);
+
+			if (i == 1) {
+				display.print((int)delayMs / 10);
+			} else {
+				display.print((int)(values[i] * 100.0f));
+			}
+    }
+		
 	} else if (currentScreen == SCREEN_CHORDS) {
 
 		if (chordPatternSelectMode) {
@@ -2738,10 +2884,10 @@ void drawMenuScreen() {
 		display.setCursor(50, 14);
 		display.print(label);
 
-		display.setCursor(8, 24);
-		display.print("> Level");
-		display.drawRect(58, 24, 56, 8, SSD1306_WHITE);
-		display.fillRect(58, 24, (int)(chordLevel * 56.0f), 8, SSD1306_WHITE);
+		/* display.setCursor(8, 24); */
+		/* display.print("> Level"); */
+		/* display.drawRect(58, 24, 56, 8, SSD1306_WHITE); */
+		/* display.fillRect(58, 24, (int)(chordLevel * 56.0f), 8, SSD1306_WHITE); */
 
 		drawLaneGrid(chordPattern, chordCursor);
 
@@ -2818,16 +2964,16 @@ void drawMenuScreen() {
 			display.print("ACC");
 		}
 
-		display.setCursor(8, 24);
-		display.print("> Level");
-		display.drawRect(58, 24, 56, 8, SSD1306_WHITE);
-		display.fillRect(58, 24, (int)(drumLevel * 56.0f), 8, SSD1306_WHITE);
+		/* display.setCursor(8, 24); */
+		/* display.print("> Level"); */
+		/* display.drawRect(58, 24, 56, 8, SSD1306_WHITE); */
+		/* display.fillRect(58, 24, (int)(drumLevel * 56.0f), 8, SSD1306_WHITE); */
 
 		// 4 x 16 pattern grid with a playhead tick
 		for (int r = 0; r < 4; r++) {
 			for (int c = 0; c < 16; c++) {
 				int x = 8 + c * 7;
-				int y = 38 + r * 6;
+				int y = 27 + r * 8;
 				if (drumPattern[r][c]) display.fillRect(x, y, 5, 4, SSD1306_WHITE);
 				else display.drawPixel(x + 2, y + 2, SSD1306_WHITE);
 				if (r * 16 + c == drumCursor) {
@@ -2836,7 +2982,7 @@ void drawMenuScreen() {
 			}
 		}
 		if (midiRunning) {
-			display.drawFastHLine(8 + (currentStep % 16) * 7, 35, 5, SSD1306_WHITE);
+			display.drawFastHLine(8 + (currentStep % 16) * 7, 24, 5, SSD1306_WHITE);
 		}
 	}
 }
