@@ -1,23 +1,31 @@
 #include <Arduino.h>
 #include <math.h>
 
+// usb midi host
 #include <ESP32_Host_MIDI.h>
 #include <USBConnection.h>
 
+// i2s for audio out
 #include "driver/i2s_std.h"
 
+// i2c for oled, ads1115 adc (pots)
 #include <Wire.h>
 #include <Adafruit_ADS1X15.h>
 
+// libraries for small 0.96" oled
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
+// timer for internal clock generation
 #include "esp_timer.h"
 
+// for saving/reloading settings across boots
 #include <Preferences.h>
 
+// pin our run/stop toggle switch is connected to
 #define RUN_SWITCH_PIN 40
 
+// available screens
 enum Screen {
     SCREEN_SYNTH, SCREEN_MENU, SCREEN_FX,
     SCREEN_DRUM, SCREEN_CHORDS, SCREEN_SCENES
@@ -25,12 +33,13 @@ enum Screen {
 
 // current screen
 Screen currentScreen = SCREEN_MENU;
-// currently highlighted menu index
+
+// currently highlighted menu index on menu screen
 // 0 synth, 1 FX, 2 drum, 3 chords, 4 scenes
 uint8_t menuIndex = 0;                  
 
-// drive amount for bass synth
-volatile float driveAmount = 0.0f;      // 0..1
+// current drive amount for bass synth
+volatile float driveAmount = 0.0f;      // 0.0f - 1.0f
 
 // global delay effect state
 volatile float delayMs       = 300.0f;   // 40..740
@@ -38,20 +47,21 @@ volatile float delayFeedback = 0.4f;     // 0..1 (scaled to 0..0.85 in the audio
 volatile float delayMix      = 0.0f;     // 0..1
 uint8_t fxIndex = 0;                     // 0 drive, 1 time, 2 feedback, 3 mix
 
-// keep track of pattern queuing state for pattern switching at end of pattern
+// keep track of pattern queuing state for pattern switching at end of current pattern playback
 volatile bool patternQueued = false;
 // what pattern to play next
 uint8_t queuedPattern = 0;
 
+// drum pattern queuing
 volatile bool drumPatternQueued = false;
 uint8_t queuedDrumPattern = 0;
 
-// midi output pin definition
+// din midi output pin definition
 #define MIDI_TX_PIN 41
 
 // midi output channel
 #define MIDI_OUT_CHANNEL 1          // 1-16
-// note currently held on the output, -1 = none
+// note currently held on the din midi output, -1 = none
 int midiOutNote = -1;
 
 // number of bass synth patterns
@@ -60,7 +70,7 @@ int midiOutNote = -1;
 // button 3 pin which controls pattern selection for the bass synth
 #define PATTERN_BUTTON_PIN 47
 
-// target phase increment for our slide functionality
+// target phase increment for our pitch slide functionality
 float targetPhaseIncrement = 0.0f;
 // whether we're currently generating audible frequency glide
 bool glideActive = false;
@@ -114,6 +124,7 @@ SyncMode syncMode = SYNC_EXTERNAL;
 int encoderPosition = 0;
 int encoder2Position = 0;
 
+// audio delay effect buffer
 constexpr int DELAY_SIZE = 32768;                 // must be a power of two
 constexpr int DELAY_MASK = DELAY_SIZE - 1;
 static int16_t delayBuf[DELAY_SIZE];              // zero-initialised
@@ -122,7 +133,8 @@ static int16_t delayBuf[DELAY_SIZE];              // zero-initialised
 #define ACCENT_BUTTON_PIN 1
 #define START_BUTTON_PIN  2
 
-// button event
+// button event - update button returns these,
+// you can check if a button was just pressed or released or nothing happened.
 enum ButtonEvent { BTN_NONE, BTN_PRESSED, BTN_RELEASED };
 
 // Button definition
@@ -154,11 +166,11 @@ float internalBpm = 120.0f;
 constexpr float MIN_BPM = 40.0f;
 constexpr float MAX_BPM = 240.0f;
 
-// timer
+// timer for internal clock generation
 esp_timer_handle_t internalClockTimer = nullptr;
 
 // encoder debounce time
-#define ENCODER_DEBOUNCE_MS 50
+#define ENCODER_DEBOUNCE_MS 25
 
 // OLED refresh state
 uint32_t lastDisplayUpdate = 0;
@@ -166,7 +178,7 @@ uint32_t lastDisplayUpdate = 0;
 // MIDI clock / sequencer state (shared between tasks)
 volatile uint8_t clockCount = 0;
 volatile bool midiRunning = false;
-volatile uint8_t currentStep = 0;
+volatile uint8_t currentStep = 0; // bass seq current step
 volatile bool displayDirty = true;
 volatile uint32_t lastClockMicros = 0;
 volatile float externalBpm = 0.0f;
@@ -188,7 +200,7 @@ struct Step {
     bool slide = false;
 };
 
-// patterns data
+// bass synth patterns data
 Step patternBank[NUM_PATTERNS][NUM_STEPS];
 Step* pattern = patternBank[0];          // the pattern currently playing/editing
 uint8_t loopLengths[NUM_PATTERNS];       // loopLength is stored per pattern
@@ -218,7 +230,7 @@ volatile float drumLevel = 0.5f;            // 0..1
 volatile uint8_t drumTriggerMask = 0, drumAccentMask = 0;       // bit 0 kick, 1 snare, 2 closed, 3 open
 uint8_t drumCursor = 0;
 
-// chord synth
+// chord synth sequencer
 uint8_t chordPatternBank[NUM_PATTERNS][4][16] = {};
 uint8_t chordNotesBank[NUM_PATTERNS][4][16] = {};
 
@@ -322,6 +334,8 @@ uint8_t selectedScenePart = 0;  // 0 bass, 1 drums, 2 chords
 
 volatile bool sceneQueued = false;
 volatile uint8_t queuedScene = 0;
+
+// begin functions
 
 void requestSceneLaunch(bool immediate);
 
@@ -1007,8 +1021,10 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEven
 						
 		// Drum screen
 		if (currentScreen == SCREEN_DRUM) {
+
 			static bool accentChord = false;
 
+			// button 3
 			if (patEvent == BTN_PRESSED) {
 				bool accentHeld = (accentButton.stableState == LOW);
 				if (accentHeld) accentChord = true;
@@ -1023,7 +1039,9 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEven
 				}
 				displayDirty = true;
 			}
+			
 			else if (!drumPatternSelectMode) {
+
 				if (sel == BTN_PRESSED) {
 					uint8_t& cell = drumPattern[drumCursor / 16][drumCursor % 16];
 					cell = cell ? 0 : 1;
@@ -1034,6 +1052,12 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEven
 				if (accentEvent == BTN_RELEASED && !accentChord) {
 					uint8_t& a = drumAccent[drumCursor / 16][drumCursor % 16];
 					a = a ? 0 : 1;
+					displayDirty = true;
+				}
+
+				// cursor should jump lanes when encoder button 2 is pressed
+				if (e2 == BTN_PRESSED) {
+					drumCursor = (drumCursor + 64 + (16 % 64)) % 64;
 					displayDirty = true;
 				}
 			}
@@ -3119,9 +3143,7 @@ void setup() {
     .name = "internal_clock"
 	};
 
-	ESP_ERROR_CHECK(
-									esp_timer_create(&timerArgs, &internalClockTimer)
-									);
+	ESP_ERROR_CHECK(esp_timer_create(&timerArgs, &internalClockTimer));
  
 }
 
