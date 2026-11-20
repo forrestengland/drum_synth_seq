@@ -22,6 +22,10 @@
 // for saving/reloading settings across boots
 #include <Preferences.h>
 
+// modified / saved indicator
+uint32_t saveFeedbackUntil = 0;
+bool saveSucceeded = false;
+
 // pin our run/stop toggle switch is connected to
 #define RUN_SWITCH_PIN 40
 
@@ -841,6 +845,27 @@ void loadState() {
     }
 }
 
+bool hasUnsavedChanges() {
+    static SavedState state;
+    static DrumSaved drums;
+    static ChordSaved chords;
+    static FxSaved fx;
+    static SceneSaved scene;
+
+    state = captureState();
+    captureDrum(drums);
+    captureChords(chords);
+    fx = captureFx();
+    captureScenes(scene);
+
+    return
+        memcmp(&state, &lastSavedState, sizeof(state)) != 0 ||
+        memcmp(&drums, &lastSavedDrum, sizeof(drums)) != 0 ||
+        memcmp(&chords, &lastSavedChord, sizeof(chords)) != 0 ||
+        memcmp(&fx, &lastSavedFx, sizeof(fx)) != 0 ||
+        memcmp(&scene, &lastSavedScene, sizeof(scene)) != 0;
+}
+
 void saveAllToFlash() {
 
     // Static storage avoids putting several large pattern structures
@@ -853,7 +878,7 @@ void saveAllToFlash() {
     now = captureState();
     captureDrum(nowDrum);
     captureChords(nowChord);
-    static FxSaved nowFx = captureFx();
+    FxSaved nowFx = captureFx();
 		captureScenes(nowScenes);		
 
     prefs.putBytes("state", &now, sizeof(now));
@@ -875,8 +900,12 @@ void saveAllToFlash() {
     lastSavedDrum = nowDrum;
     lastSavedChord = nowChord;
     lastSavedFx = nowFx;
+		lastSavedScene = nowScenes;
 
-    Serial.println("Manual save complete.");
+		saveSucceeded = true;
+		saveFeedbackUntil = millis() + 1500;
+
+    Serial.println("Manual save complete.");		
 }
 
 // Returns detents since last call and clears the counter.
@@ -982,7 +1011,7 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEven
 	if (currentScreen == SCREEN_MENU) {
 
 		// encoder one pressed or button 1 pressed, switch screen to selection
-		if (sel == BTN_PRESSED || startEvent == BTN_PRESSED) {
+		if (sel == BTN_RELEASED || startEvent == BTN_RELEASED) {
 			if (menuIndex == 0)      currentScreen = SCREEN_SYNTH;
 			else if (menuIndex == 1) currentScreen = SCREEN_FX;
 			else if (menuIndex == 2) currentScreen = SCREEN_DRUM;
@@ -994,7 +1023,7 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEven
 	} else { // other than menu screen or synth screen
 
 		// first button pressed - return to menu
-		if (startEvent == BTN_PRESSED) {
+		if (startEvent == BTN_RELEASED) {
 			currentScreen = SCREEN_MENU;
 			displayDirty = true;
 			return;
@@ -1009,7 +1038,7 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEven
         displayDirty = true;
 			}
 
-			if (patEvent == BTN_PRESSED) {
+			if (patEvent == BTN_RELEASED) {
         bool accentHeld = (accentButton.stableState == LOW);
 
         // PATTERN = queue while running; ACCENT + PATTERN = immediate.
@@ -1025,7 +1054,7 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEven
 			static bool accentChord = false;
 
 			// button 3
-			if (patEvent == BTN_PRESSED) {
+			if (patEvent == BTN_RELEASED) {
 				bool accentHeld = (accentButton.stableState == LOW);
 				if (accentHeld) accentChord = true;
 
@@ -1068,7 +1097,7 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent, ButtonEven
 		// Chord sequencer controls
 		if (currentScreen == SCREEN_CHORDS) {
 
-			if (patEvent == BTN_PRESSED) {
+			if (patEvent == BTN_RELEASED) {
 
         bool accentHeld = (accentButton.stableState == LOW);
 
@@ -1483,7 +1512,7 @@ void updateButtons() {
 		return;
 	}
 
-	if (patEvent == BTN_PRESSED) {	// if pattern button was just pressed
+	if (patEvent == BTN_RELEASED) {	// if pattern button was just pressed
 
 		bool accentHeld = (accentButton.stableState == LOW); // find out if accent button is being held
 
@@ -2837,6 +2866,15 @@ void updateDisplay() {
 
     display.setCursor(0, 0);
     display.print("EE303+");
+
+		if (hasUnsavedChanges()) {
+			display.setCursor(40, 0);
+			display.print("MOD");
+		} else if (saveSucceeded &&
+							 (int32_t)(saveFeedbackUntil - millis()) > 0) {
+			display.setCursor(40, 0);
+			display.print("OK");
+		}		
 
 		display.setCursor(66, 0);
 
