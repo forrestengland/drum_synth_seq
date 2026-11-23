@@ -35,15 +35,21 @@ bool saveSucceeded = false;
 // available screens
 enum Screen {
     SCREEN_SYNTH, SCREEN_MENU, SCREEN_FX,
-    SCREEN_DRUM, SCREEN_CHORDS, SCREEN_SCENES
+    SCREEN_DRUM, SCREEN_CHORDS, SCREEN_SCENES,
+		SCREEN_SONGS
 };
 
 // current screen
 Screen currentScreen = SCREEN_MENU;
 
 // currently highlighted menu index on menu screen
-// 0 synth, 1 FX, 2 drum, 3 chords, 4 scenes
-uint8_t menuIndex = 0;                  
+// 0 synth, 1 FX, 2 drum, 3 chords, 4 scenes, 5 songs
+uint8_t menuIndex = 0;
+
+constexpr uint8_t NUM_SONG_SLOTS = 4;
+
+uint8_t activeSongSlot = 0;    // 0 = Song 1
+uint8_t selectedSongSlot = 0;
 
 // current drive amount for bass synth
 volatile float driveAmount = 0.0f;      // 0.0f - 1.0f
@@ -359,12 +365,6 @@ bool songStartQueued = false;
 uint8_t songScene = 0;
 uint8_t songRepeatsDone = 0;
 
-void toggleSongMode();
-
-// begin functions
-
-void requestSceneLaunch(bool immediate);
-
 // scene saving ----
 struct SceneSavedV1 {
     uint8_t version;
@@ -513,6 +513,24 @@ static const DRAM_ATTR int8_t encoderTable[16] = {
      0,  1, -1,  0
 };
 
+ChordSaved lastSeenChord;
+ChordSaved lastSavedChord;
+
+// begin functions
+
+void toggleSongMode();
+
+// Song 1 deliberately reuses the existing project namespace.
+const char* songNamespace(uint8_t slot) {
+    static const char* names[NUM_SONG_SLOTS] = {
+        "tb303", "song2", "song3", "song4"
+    };
+
+    return names[slot];
+}
+
+void requestSceneLaunch(bool immediate);
+
 void triggerChords(uint8_t step) {
     uint8_t mask = 0;
     for (int i = 0; i < 4; i++) {
@@ -573,79 +591,78 @@ void captureDrum(DrumSaved &d) {
 }
 
 void loadDrums() {
-    // Default groove in pattern 1
-    static const uint8_t groove[4][16] = {
-        {1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0},
-        {0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0},
-        {1,0,1,0, 1,0,0,0, 1,0,1,0, 1,0,0,0},
-        {0,0,0,0, 0,0,1,0, 0,0,0,0, 0,0,1,0},
-    };
-    memcpy(drumPatternBank[0], groove, sizeof(groove));
 
-		static DrumSaved d;
-		static DrumSavedV2 v2;
-		static DrumSavedV1 v1;		
+	memset(drumPatternBank, 0, sizeof(drumPatternBank));
+	memset(drumAccentBank, 0, sizeof(drumAccentBank));
 
- size_t len = prefs.getBytesLength("drums");
-    bool migrated = false;
+	currentDrumPattern = 0;
+	driveAmount = 0.0f;
+	drumLevel = 0.5f;
+	
+	static DrumSaved d;
+	static DrumSavedV2 v2;
+	static DrumSavedV1 v1;		
 
-    if (len == sizeof(d) &&
-        prefs.getBytes("drums", &d, sizeof(d)) == sizeof(d) &&
-        d.version == 3 && d.currentPattern < NUM_PATTERNS &&
-        d.drive >= 0.0f && d.drive <= 1.0f &&
-        d.level >= 0.0f && d.level <= 1.0f) {
+	size_t len = prefs.getBytesLength("drums");
+	bool migrated = false;
 
-        driveAmount = d.drive;
-        drumLevel = d.level;
-        currentDrumPattern = d.currentPattern;
-        for (int p = 0; p < NUM_PATTERNS; p++)
-            for (int r = 0; r < 4; r++)
-                for (int c = 0; c < 16; c++) {
-                    drumPatternBank[p][r][c] = d.pattern[p][r][c] ? 1 : 0;
-                    drumAccentBank[p][r][c]  = d.accent[p][r][c] ? 1 : 0;
-                }
-        Serial.println("Drums loaded from flash.");
+	if (len == sizeof(d) &&
+			prefs.getBytes("drums", &d, sizeof(d)) == sizeof(d) &&
+			d.version == 3 && d.currentPattern < NUM_PATTERNS &&
+			d.drive >= 0.0f && d.drive <= 1.0f &&
+			d.level >= 0.0f && d.level <= 1.0f) {
 
-    } else if (len == sizeof(v2) &&
-               prefs.getBytes("drums", &v2, sizeof(v2)) == sizeof(v2) &&
-               v2.version == 2 &&
-               v2.drive >= 0.0f && v2.drive <= 1.0f &&
-               v2.level >= 0.0f && v2.level <= 1.0f) {
+		driveAmount = d.drive;
+		drumLevel = d.level;
+		currentDrumPattern = d.currentPattern;
+		for (int p = 0; p < NUM_PATTERNS; p++)
+			for (int r = 0; r < 4; r++)
+				for (int c = 0; c < 16; c++) {
+					drumPatternBank[p][r][c] = d.pattern[p][r][c] ? 1 : 0;
+					drumAccentBank[p][r][c]  = d.accent[p][r][c] ? 1 : 0;
+				}
+		Serial.println("Drums loaded from flash.");
 
-        driveAmount = v2.drive;
-        drumLevel = v2.level;
-        for (int r = 0; r < 4; r++)
-            for (int c = 0; c < 16; c++) {
-                drumPatternBank[0][r][c] = v2.pattern[r][c] ? 1 : 0;
-                drumAccentBank[0][r][c]  = v2.accent[r][c] ? 1 : 0;
-            }
-        migrated = true;
-        Serial.println("Migrated v2 drums into slot 1.");
+	} else if (len == sizeof(v2) &&
+						 prefs.getBytes("drums", &v2, sizeof(v2)) == sizeof(v2) &&
+						 v2.version == 2 &&
+						 v2.drive >= 0.0f && v2.drive <= 1.0f &&
+						 v2.level >= 0.0f && v2.level <= 1.0f) {
 
-    } else if (len == sizeof(v1) &&
-               prefs.getBytes("drums", &v1, sizeof(v1)) == sizeof(v1) &&
-               v1.version == 1 &&
-               v1.drive >= 0.0f && v1.drive <= 1.0f &&
-               v1.level >= 0.0f && v1.level <= 1.0f) {
+		driveAmount = v2.drive;
+		drumLevel = v2.level;
+		for (int r = 0; r < 4; r++)
+			for (int c = 0; c < 16; c++) {
+				drumPatternBank[0][r][c] = v2.pattern[r][c] ? 1 : 0;
+				drumAccentBank[0][r][c]  = v2.accent[r][c] ? 1 : 0;
+			}
+		migrated = true;
+		Serial.println("Migrated v2 drums into slot 1.");
 
-        driveAmount = v1.drive;
-        drumLevel = v1.level;
-        for (int r = 0; r < 4; r++)
-            for (int c = 0; c < 16; c++)
-                drumPatternBank[0][r][c] = v1.pattern[r][c] ? 1 : 0;
-        migrated = true;
-        Serial.println("Migrated v1 drums into slot 1.");
-    }
+	} else if (len == sizeof(v1) &&
+						 prefs.getBytes("drums", &v1, sizeof(v1)) == sizeof(v1) &&
+						 v1.version == 1 &&
+						 v1.drive >= 0.0f && v1.drive <= 1.0f &&
+						 v1.level >= 0.0f && v1.level <= 1.0f) {
 
-    drumPattern = drumPatternBank[currentDrumPattern];
-    drumAccent  = drumAccentBank[currentDrumPattern];
+		driveAmount = v1.drive;
+		drumLevel = v1.level;
+		for (int r = 0; r < 4; r++)
+			for (int c = 0; c < 16; c++)
+				drumPatternBank[0][r][c] = v1.pattern[r][c] ? 1 : 0;
+		migrated = true;
+		Serial.println("Migrated v1 drums into slot 1.");
+	}
 
-		captureDrum(lastSeenDrum);
-		lastSavedDrum = lastSeenDrum;		
+	drumPattern = drumPatternBank[currentDrumPattern];
+	drumAccent  = drumAccentBank[currentDrumPattern];
 
-    if (migrated) {
-        prefs.putBytes("drums", &lastSavedDrum, sizeof(lastSavedDrum));
-    }
+	captureDrum(lastSeenDrum);
+	lastSavedDrum = lastSeenDrum;		
+
+	if (migrated) {
+		prefs.putBytes("drums", &lastSavedDrum, sizeof(lastSavedDrum));
+	}
 }
 
 FxSaved lastSeenFx;
@@ -668,53 +685,59 @@ FxSaved captureFx() {
 }
 
 void loadFx() {
-    FxSaved f;
-    FxSavedV1 old;
 
-    size_t len = prefs.getBytesLength("fx");
+	delayMs = 300.0f;
+	delayFeedback = 0.4f;
+	delayMix = 0.0f;
 
-    if (len == sizeof(f) &&
-        prefs.getBytes("fx", &f, sizeof(f)) == sizeof(f) &&
-        f.version == 2 &&
-        f.timeMs >= 40.0f && f.timeMs <= 740.0f &&
-        f.feedback >= 0.0f && f.feedback <= 1.0f &&
-        f.mix >= 0.0f && f.mix <= 1.0f &&
-        f.bassLevel >= 0.0f && f.bassLevel <= 1.0f &&
-        f.drumLevel >= 0.0f && f.drumLevel <= 1.0f &&
-        f.chordLevel >= 0.0f && f.chordLevel <= 1.0f) {
+	bassLevel = 1.0f;
+	drumLevel = 0.5f;
+	chordLevel = 0.5f;	
 
-        delayMs = f.timeMs;
-        delayFeedback = f.feedback;
-        delayMix = f.mix;
+	FxSaved f;
+	FxSavedV1 old;
 
-        bassLevel = f.bassLevel;
-        drumLevel = f.drumLevel;
-        chordLevel = f.chordLevel;
+	size_t len = prefs.getBytesLength("fx");
 
-    } else if (
-        len == sizeof(old) &&
-        prefs.getBytes("fx", &old, sizeof(old)) == sizeof(old) &&
-        old.version == 1 &&
-        old.timeMs >= 40.0f && old.timeMs <= 740.0f &&
-        old.feedback >= 0.0f && old.feedback <= 1.0f &&
-        old.mix >= 0.0f && old.mix <= 1.0f) {
+	if (len == sizeof(f) &&
+			prefs.getBytes("fx", &f, sizeof(f)) == sizeof(f) &&
+			f.version == 2 &&
+			f.timeMs >= 40.0f && f.timeMs <= 740.0f &&
+			f.feedback >= 0.0f && f.feedback <= 1.0f &&
+			f.mix >= 0.0f && f.mix <= 1.0f &&
+			f.bassLevel >= 0.0f && f.bassLevel <= 1.0f &&
+			f.drumLevel >= 0.0f && f.drumLevel <= 1.0f &&
+			f.chordLevel >= 0.0f && f.chordLevel <= 1.0f) {
 
-        // Migrate the old FX settings.
-        delayMs = old.timeMs;
-        delayFeedback = old.feedback;
-        delayMix = old.mix;
+		delayMs = f.timeMs;
+		delayFeedback = f.feedback;
+		delayMix = f.mix;
 
-        // Drum and chord levels were previously stored
-        // in their respective saved structures.
-        bassLevel = 1.0f;
-    }
+		bassLevel = f.bassLevel;
+		drumLevel = f.drumLevel;
+		chordLevel = f.chordLevel;
 
-    lastSeenFx = captureFx();
-    lastSavedFx = lastSeenFx;
+	} else if (
+						 len == sizeof(old) &&
+						 prefs.getBytes("fx", &old, sizeof(old)) == sizeof(old) &&
+						 old.version == 1 &&
+						 old.timeMs >= 40.0f && old.timeMs <= 740.0f &&
+						 old.feedback >= 0.0f && old.feedback <= 1.0f &&
+						 old.mix >= 0.0f && old.mix <= 1.0f) {
+
+		// Migrate the old FX settings.
+		delayMs = old.timeMs;
+		delayFeedback = old.feedback;
+		delayMix = old.mix;
+
+		// Drum and chord levels were previously stored
+		// in their respective saved structures.
+		bassLevel = 1.0f;
+	}
+
+	lastSeenFx = captureFx();
+	lastSavedFx = lastSeenFx;
 }
-
-ChordSaved lastSeenChord;
-ChordSaved lastSavedChord;
 
 void captureChords(ChordSaved& c) {
 
@@ -730,68 +753,70 @@ void captureChords(ChordSaved& c) {
 
 void loadChords() {
 
-    static ChordSaved c;
-    static ChordSavedV2 old;
+	chordLevel = 0.5f;	
 
-    // Default notes: A minor 7, one pitch per lane.
-    const uint8_t defaults[4] = { 45, 48, 52, 55 };
+	static ChordSaved c;
+	static ChordSavedV2 old;
 
-    for (int p = 0; p < NUM_PATTERNS; p++) {
-        for (int v = 0; v < 4; v++) {
-            for (int s = 0; s < 16; s++) {
-                chordNotesBank[p][v][s] = defaults[v];
-                chordPatternBank[p][v][s] = 0;
-            }
-        }
-    }
+	// Default notes: A minor 7, one pitch per lane.
+	const uint8_t defaults[4] = { 45, 48, 52, 55 };
 
-    currentChordPattern = 0;
+	for (int p = 0; p < NUM_PATTERNS; p++) {
+		for (int v = 0; v < 4; v++) {
+			for (int s = 0; s < 16; s++) {
+				chordNotesBank[p][v][s] = defaults[v];
+				chordPatternBank[p][v][s] = 0;
+			}
+		}
+	}
 
-    size_t len = prefs.getBytesLength("chords");
-    bool migrated = false;
+	currentChordPattern = 0;
 
-    if (len == sizeof(c) &&
-        prefs.getBytes("chords", &c, sizeof(c)) == sizeof(c) &&
-        c.version == 3 &&
-        c.currentPattern < NUM_PATTERNS &&
-        c.level >= 0.0f && c.level <= 1.0f) {
+	size_t len = prefs.getBytesLength("chords");
+	bool migrated = false;
 
-        chordLevel = c.level;
-        currentChordPattern = c.currentPattern;
+	if (len == sizeof(c) &&
+			prefs.getBytes("chords", &c, sizeof(c)) == sizeof(c) &&
+			c.version == 3 &&
+			c.currentPattern < NUM_PATTERNS &&
+			c.level >= 0.0f && c.level <= 1.0f) {
 
-        memcpy(chordNotesBank, c.notes, sizeof(chordNotesBank));
-        memcpy(chordPatternBank, c.pattern, sizeof(chordPatternBank));
+		chordLevel = c.level;
+		currentChordPattern = c.currentPattern;
 
-        Serial.println("Chord patterns loaded from flash.");
+		memcpy(chordNotesBank, c.notes, sizeof(chordNotesBank));
+		memcpy(chordPatternBank, c.pattern, sizeof(chordPatternBank));
 
-    } else if (
-        len == sizeof(old) &&
-        prefs.getBytes("chords", &old, sizeof(old)) == sizeof(old) &&
-        old.version == 2 &&
-        old.level >= 0.0f && old.level <= 1.0f) {
+		Serial.println("Chord patterns loaded from flash.");
 
-        chordLevel = old.level;
+	} else if (
+						 len == sizeof(old) &&
+						 prefs.getBytes("chords", &old, sizeof(old)) == sizeof(old) &&
+						 old.version == 2 &&
+						 old.level >= 0.0f && old.level <= 1.0f) {
 
-        // Migrate the old single pattern into pattern 1.
-        memcpy(chordNotesBank[0], old.notes, sizeof(old.notes));
-        memcpy(chordPatternBank[0], old.pattern, sizeof(old.pattern));
+		chordLevel = old.level;
 
-        migrated = true;
+		// Migrate the old single pattern into pattern 1.
+		memcpy(chordNotesBank[0], old.notes, sizeof(old.notes));
+		memcpy(chordPatternBank[0], old.pattern, sizeof(old.pattern));
 
-        Serial.println("Migrated old chords into pattern 1.");
-    }
+		migrated = true;
 
-    switchChordPattern(currentChordPattern);
+		Serial.println("Migrated old chords into pattern 1.");
+	}
 
-    lastSeenChord = {};
-    lastSavedChord = {};
+	switchChordPattern(currentChordPattern);
 
-    captureChords(lastSeenChord);
-    lastSavedChord = lastSeenChord;
+	lastSeenChord = {};
+	lastSavedChord = {};
 
-    if (migrated) {
-        prefs.putBytes("chords", &lastSavedChord, sizeof(lastSavedChord));
-    }
+	captureChords(lastSeenChord);
+	lastSavedChord = lastSeenChord;
+
+	if (migrated) {
+		prefs.putBytes("chords", &lastSavedChord, sizeof(lastSavedChord));
+	}
 }
 
 void captureScenes(SceneSaved& s) {
@@ -868,71 +893,162 @@ SavedState captureState() {
 
 void loadState() {
 
-	for (int p = 0; p < NUM_PATTERNS; p++) loopLengths[p] = NUM_STEPS;
+	// Start from clean project defaults before loading a slot.
+	currentPattern = 0;
+	internalBpm = 120.0f;
 
-    prefs.begin("tb303", false);
-    size_t len = prefs.getBytesLength("state");
+	for (int p = 0; p < NUM_PATTERNS; p++) {
+    loopLengths[p] = NUM_STEPS;
 
-    SavedState s;
-    SavedStateV1 old;
+    for (int s = 0; s < NUM_STEPS; s++) {
+			patternBank[p][s] = Step{};
+    }
+	}
 
-    if (len == sizeof(s) &&
-        prefs.getBytes("state", &s, sizeof(s)) == sizeof(s) &&
-        s.version == SAVE_VERSION &&
-        s.currentPattern < NUM_PATTERNS &&
-        s.internalBpm >= MIN_BPM && s.internalBpm <= MAX_BPM) {
+	pattern = patternBank[0];
+	loopLength = NUM_STEPS;
 
-        for (int p = 0; p < NUM_PATTERNS; p++) {
-            loopLengths[p] = (s.loopLengths[p] >= 1 && s.loopLengths[p] <= NUM_STEPS)
-                                 ? s.loopLengths[p] : NUM_STEPS;
-        }
-        memcpy(patternBank, s.patterns, sizeof(patternBank));
-        internalBpm = s.internalBpm;
-        currentPattern = s.currentPattern;
-        Serial.println("Patterns loaded from flash.");
+	prefs.begin(songNamespace(activeSongSlot), false);	
 
-    } else if (len == sizeof(old) &&
-               prefs.getBytes("state", &old, sizeof(old)) == sizeof(old) &&
-               old.version == 1 &&
-               old.loopLength >= 1 && old.loopLength <= NUM_STEPS &&
-               old.internalBpm >= MIN_BPM && old.internalBpm <= MAX_BPM) {
+	size_t len = prefs.getBytesLength("state");
 
-        // Keep the existing pattern as pattern 1.
-        memcpy(patternBank[0], old.pattern, sizeof(old.pattern));
-        loopLengths[0] = old.loopLength;
-        internalBpm = old.internalBpm;
-        currentPattern = 0;
-        Serial.println("Migrated v1 pattern into slot 1.");
+	SavedState s;
+	SavedStateV1 old;
+
+	if (len == sizeof(s) &&
+			prefs.getBytes("state", &s, sizeof(s)) == sizeof(s) &&
+			s.version == SAVE_VERSION &&
+			s.currentPattern < NUM_PATTERNS &&
+			s.internalBpm >= MIN_BPM && s.internalBpm <= MAX_BPM) {
+
+		for (int p = 0; p < NUM_PATTERNS; p++) {
+			loopLengths[p] = (s.loopLengths[p] >= 1 && s.loopLengths[p] <= NUM_STEPS)
+				? s.loopLengths[p] : NUM_STEPS;
+		}
+		memcpy(patternBank, s.patterns, sizeof(patternBank));
+		internalBpm = s.internalBpm;
+		currentPattern = s.currentPattern;
+		Serial.println("Patterns loaded from flash.");
+
+	} else if (len == sizeof(old) &&
+						 prefs.getBytes("state", &old, sizeof(old)) == sizeof(old) &&
+						 old.version == 1 &&
+						 old.loopLength >= 1 && old.loopLength <= NUM_STEPS &&
+						 old.internalBpm >= MIN_BPM && old.internalBpm <= MAX_BPM) {
+
+		// Keep the existing pattern as pattern 1.
+		memcpy(patternBank[0], old.pattern, sizeof(old.pattern));
+		loopLengths[0] = old.loopLength;
+		internalBpm = old.internalBpm;
+		currentPattern = 0;
+		Serial.println("Migrated v1 pattern into slot 1.");
+	}
+
+	pattern = patternBank[currentPattern];
+	loopLength = loopLengths[currentPattern];
+
+	Serial.println("DEBUG: before loadDrums");
+	loadDrums();
+
+	Serial.println("DEBUG: before loadChords");
+	loadChords();
+
+	Serial.println("DEBUG: before loadFx");
+	loadFx();
+
+	Serial.println("DEBUG: before loadScenes");		
+	loadScenes();
+
+	Serial.println("DEBUG: before captureState");
+	lastSeenState = captureState();
+
+	Serial.println("DEBUG: before lastSavedState");
+	lastSavedState = lastSeenState;
+
+	Serial.println("DEBUG: loadState complete");		
+
+
+	// Write the new format immediately after a migration.
+	if (len == sizeof(old)) {
+		prefs.putBytes("state", &lastSavedState, sizeof(lastSavedState));
+	}
+}
+
+void loadActiveSongSlot() {
+    Preferences meta;
+
+    if (meta.begin("tbmeta", true)) {
+        activeSongSlot = meta.getUChar("active", 0);
+        meta.end();
     }
 
-    pattern = patternBank[currentPattern];
-    loopLength = loopLengths[currentPattern];
-
-		Serial.println("DEBUG: before loadDrums");
-		loadDrums();
-
-		Serial.println("DEBUG: before loadChords");
-		loadChords();
-
-		Serial.println("DEBUG: before loadFx");
-		loadFx();
-
-		Serial.println("DEBUG: before loadScenes");		
-		loadScenes();
-
-		Serial.println("DEBUG: before captureState");
-		lastSeenState = captureState();
-
-		Serial.println("DEBUG: before lastSavedState");
-		lastSavedState = lastSeenState;
-
-		Serial.println("DEBUG: loadState complete");		
-
-
-    // Write the new format immediately after a migration.
-    if (len == sizeof(old)) {
-        prefs.putBytes("state", &lastSavedState, sizeof(lastSavedState));
+    if (activeSongSlot >= NUM_SONG_SLOTS) {
+        activeSongSlot = 0;
     }
+
+    selectedSongSlot = activeSongSlot;
+}
+
+void saveActiveSongSlot() {
+    Preferences meta;
+
+    if (meta.begin("tbmeta", false)) {
+        meta.putUChar("active", activeSongSlot);
+        meta.end();
+    }
+}
+
+void loadSongSlot(uint8_t slot) {
+
+    if (slot >= NUM_SONG_SLOTS) {
+        return;
+    }
+
+    // Avoid changing project data while playback is running.
+    if (midiRunning) {
+        Serial.println("Stop transport before changing songs.");
+        displayDirty = true;
+        return;
+    }
+
+    Serial.printf("Loading Song %d\n", slot + 1);
+
+    stopSequencerNote();
+
+    // Clear playback and selection state.
+    songMode = false;
+    songStartQueued = false;
+    songScene = 0;
+    songRepeatsDone = 0;
+
+    sceneQueued = false;
+    patternQueued = false;
+    drumPatternQueued = false;
+    chordPatternQueued = false;
+
+    patternSelectMode = false;
+    drumPatternSelectMode = false;
+    chordPatternSelectMode = false;
+
+    selectedStep = 0;
+    currentStep = 0;
+    clockCount = 0;
+
+    // Close the old project's Preferences namespace.
+    prefs.end();
+
+    activeSongSlot = slot;
+    selectedSongSlot = slot;
+
+    saveActiveSongSlot();
+
+    // Load the new project's five data records.
+    loadState();
+
+    currentScreen = SCREEN_SYNTH;
+
+    saveSucceeded = false;
+    displayDirty = true;
 }
 
 bool hasUnsavedChanges() {
@@ -1131,9 +1247,14 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent,
 			else if (menuIndex == 1) currentScreen = SCREEN_FX;
 			else if (menuIndex == 2) currentScreen = SCREEN_DRUM;
 			else if (menuIndex == 3) currentScreen = SCREEN_CHORDS;
-			else currentScreen = SCREEN_SCENES;
+			else if (menuIndex == 4) currentScreen = SCREEN_SCENES;
+			else {
+        selectedSongSlot = activeSongSlot;
+        currentScreen = SCREEN_SONGS;
+			}
+
 			displayDirty = true;
-		}
+		}		
 			
 	} else { // other than menu screen or synth screen
 
@@ -1143,6 +1264,16 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent,
 			displayDirty = true;
 			return;
 		}
+
+		// Song slot selection.
+		if (currentScreen == SCREEN_SONGS) {
+
+			if (sel == BTN_RELEASED) {
+        loadSongSlot(selectedSongSlot);
+			}
+
+			return;
+		}		
 
 		// Scene controls
 		if (currentScreen == SCREEN_SCENES) {
@@ -1291,8 +1422,17 @@ void handleMenuButtons(ButtonEvent patEvent, ButtonEvent accentEvent,
 void handleMenuEncoders(int32_t d1, int32_t d2) {
 
 	if (currentScreen == SCREEN_MENU && d1 != 0) {
-		menuIndex = (menuIndex + 5 + (d1 % 5)) % 5;
-		displayDirty = true;
+    menuIndex = (menuIndex + 6 + (d1 % 6)) % 6;
+    displayDirty = true;
+	}
+
+	if (currentScreen == SCREEN_SONGS && d1 != 0) {
+    selectedSongSlot =
+			(selectedSongSlot + NUM_SONG_SLOTS +
+			 (d1 % NUM_SONG_SLOTS)) % NUM_SONG_SLOTS;
+
+    displayDirty = true;
+    return;
 	}
 
 	if (currentScreen == SCREEN_SCENES) {
@@ -3004,16 +3144,49 @@ void drawMenuScreen() {
 	display.setCursor(0, 12);
 
 	if (currentScreen == SCREEN_MENU) {
-		const char* items[5] = {
-			"Synth", "Mixer", "Drum", "Chords", "Scenes"
-		};
 
-		for (int i = 0; i < 5; i++) {		
-			display.setCursor(8, 10 + i * 11);
+    const char* items[6] = {
+			"Synth", "Mixer", "Drum",
+			"Chords", "Scenes", "Songs"
+    };
+
+    // Five visible rows, scrolling to keep the selection visible.
+    int firstItem = menuIndex >= 5 ? menuIndex - 4 : 0;
+
+    for (int row = 0; row < 5; row++) {
+			int i = firstItem + row;
+			if (i >= 6) break;
+
+			display.setCursor(8, 10 + row * 11);
 			display.print(i == menuIndex ? "> " : "  ");
 			display.print(items[i]);
-		}
-	} else if (currentScreen == SCREEN_FX) {
+    }
+
+	} else if (currentScreen == SCREEN_SONGS) {
+
+    display.setCursor(0, 14);
+    display.print("SONG SLOTS");
+
+    for (int i = 0; i < NUM_SONG_SLOTS; i++) {
+
+			int y = 25 + i * 9;
+
+			display.setCursor(8, y);
+			display.print(i == selectedSongSlot ? "> " : "  ");
+
+			display.print("Song ");
+			display.print(i + 1);
+
+			if (i == activeSongSlot) {
+				display.setCursor(76, y);
+				display.print("ACTIVE");
+			}
+    }
+
+		//    display.setCursor(8, 59);
+		//    display.print("PUSH: LOAD");
+
+	} else if (currentScreen == SCREEN_FX) {	
 
     display.setCursor(0, 14);
     display.print("MIXER");
@@ -3219,16 +3392,20 @@ void updateDisplay() {
     display.setCursor(0, 0);
     display.print("EE303+");
 
+		display.setCursor(40, 0);
+		display.print("S");
+		display.print(activeSongSlot + 1);
+
 		if (hasUnsavedChanges()) {
-			display.setCursor(40, 0);
+			display.setCursor(52, 0);
 			display.print("MOD");
 		} else if (saveSucceeded &&
 							 (int32_t)(saveFeedbackUntil - millis()) > 0) {
-			display.setCursor(40, 0);
+			display.setCursor(52, 0);
 			display.print("OK");
 		}		
 
-		display.setCursor(66, 0);
+		display.setCursor(78, 0);
 
 		if (syncMode == SYNC_INTERNAL) {
 			display.print("INT");
@@ -3254,14 +3431,14 @@ void updateDisplay() {
 			snprintf(tempoText, sizeof(tempoText), "---");
 		}
 
-		display.setCursor(98, 0);
+		display.setCursor(104, 0);
 		display.print(tempoText);		
 
     // Small indicator: filled when running, outlined when stopped.
     if (midiRunning) {
-        display.fillCircle(60, 4, 2, SSD1306_WHITE);
+        display.fillCircle(72, 4, 2, SSD1306_WHITE);
     } else {
-        display.drawCircle(60, 4, 2, SSD1306_WHITE);
+        display.drawCircle(72, 4, 2, SSD1306_WHITE);
     }
 
     if (currentScreen != SCREEN_SYNTH) {			
@@ -3457,6 +3634,7 @@ void setup() {
 
   Serial.begin(115200);
 
+	loadActiveSongSlot();
 	loadState();
 
   delay(500);
