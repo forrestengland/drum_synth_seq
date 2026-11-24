@@ -125,8 +125,8 @@ enum SyncMode {
 SyncMode syncMode = SYNC_EXTERNAL;
 
 // encoder pin definitions
-#define ENCODER_CLK 14
-#define ENCODER_DT  13
+#define ENCODER_CLK 13
+#define ENCODER_DT  14
 #define ENCODER_SW  15
 
 #define ENCODER2_CLK 18
@@ -2797,6 +2797,7 @@ void updateWaveformSwitch() {
   // GAIN_ONE uses a +/-4.096V measurement range.
   // Convert the reading to a 0.0 - 1.0 range.
   float normalized = raw / 26400.0f;
+	normalized = 1.0 - normalized;
 
   return constrain(normalized, 0.0f, 1.0f);
 }
@@ -2812,22 +2813,22 @@ void updateSynthControls() {
   lastRead = millis();
 
   float pot0 = constrain(
-      ads.readADC_SingleEnded(0) / 26400.0f,
+      1.0 - ads.readADC_SingleEnded(0) / 26400.0f,
       0.0f, 1.0f
   );
 
   float pot1 = constrain(
-      ads.readADC_SingleEnded(1) / 26400.0f,
+      1.0 - ads.readADC_SingleEnded(1) / 26400.0f,
       0.0f, 1.0f
   );
 
   float pot2 = constrain(
-      ads.readADC_SingleEnded(2) / 26400.0f,
+      1.0 - ads.readADC_SingleEnded(2) / 26400.0f,
       0.0f, 1.0f
   );
 
   float pot3 = constrain(
-      ads.readADC_SingleEnded(3) / 26400.0f,
+      1.0 - ads.readADC_SingleEnded(3) / 26400.0f,
       0.0f, 1.0f
   );
 
